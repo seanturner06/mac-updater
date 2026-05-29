@@ -8,6 +8,7 @@
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -64,7 +65,7 @@ fn run_cmd(cmd: &str, args: &[&str]) -> Result<String, String> {
     let output = Command::new(cmd)
         .args(args)
         .output()
-        .map_err(|e| format!("Failed to run {}: {}", cmd, e))?;
+        .map_err(|e| format!("Failed to run {cmd}: {e}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         // Some tools (npm outdated) exit non-zero when items are outdated; treat stdout as truth
@@ -149,14 +150,15 @@ fn run_update_cmd(cmd: &str, args: &[&str]) -> (bool, String) {
             let combined = maybe_append_mas_hint(combine_output(&out.stdout, &out.stderr));
             (out.status.success(), combined.trim().to_string())
         }
-        Err(e) => (false, format!("Failed to run {}: {}", cmd, e)),
+        Err(e) => (false, format!("Failed to run {cmd}: {e}")),
     }
 }
 
 // --- Pure parsers (no I/O) so they can be unit-tested against real CLI output ---
 
 fn parse_brew_outdated(stdout: &str) -> Vec<OutdatedItem> {
-    let parsed: serde_json::Value = serde_json::from_str(stdout).unwrap_or(serde_json::json!({}));
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout).unwrap_or_else(|_| serde_json::json!({}));
     parsed["formulae"]
         .as_array()
         .cloned()
@@ -167,7 +169,10 @@ fn parse_brew_outdated(stdout: &str) -> Vec<OutdatedItem> {
             OutdatedItem {
                 id: name.clone(),
                 name,
-                current: f["installed_versions"][0].as_str().unwrap_or("").to_string(),
+                current: f["installed_versions"][0]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string(),
                 latest: f["current_version"].as_str().unwrap_or("").to_string(),
                 self_updating: false,
                 notes_url: String::new(),
@@ -177,19 +182,21 @@ fn parse_brew_outdated(stdout: &str) -> Vec<OutdatedItem> {
 }
 
 fn parse_cask_names(stdout: &str) -> std::collections::HashSet<String> {
-    let parsed: serde_json::Value = serde_json::from_str(stdout).unwrap_or(serde_json::json!({}));
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout).unwrap_or_else(|_| serde_json::json!({}));
     parsed["casks"]
         .as_array()
         .cloned()
         .unwrap_or_default()
         .iter()
-        .filter_map(|c| c["name"].as_str().map(|s| s.to_string()))
+        .filter_map(|c| c["name"].as_str().map(String::from))
         .collect()
 }
 
 // Parse the greedy cask list, tagging self_updating = present in greedy but not in the normal set.
 fn parse_casks(stdout: &str, normal: &std::collections::HashSet<String>) -> Vec<OutdatedItem> {
-    let parsed: serde_json::Value = serde_json::from_str(stdout).unwrap_or(serde_json::json!({}));
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout).unwrap_or_else(|_| serde_json::json!({}));
     parsed["casks"]
         .as_array()
         .cloned()
@@ -201,7 +208,10 @@ fn parse_casks(stdout: &str, normal: &std::collections::HashSet<String>) -> Vec<
             OutdatedItem {
                 id: name.clone(),
                 name,
-                current: c["installed_versions"][0].as_str().unwrap_or("").to_string(),
+                current: c["installed_versions"][0]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string(),
                 latest: c["current_version"].as_str().unwrap_or("").to_string(),
                 self_updating,
                 notes_url: String::new(),
@@ -222,17 +232,17 @@ fn parse_mas_outdated(stdout: &str) -> Vec<OutdatedItem> {
             let ws = line.find(char::is_whitespace)?;
             let id = line[..ws].to_string();
             let rest = line[ws..].trim();
-            let (name, current, latest) = match rest.rfind('(') {
-                Some(idx) => {
+            let (name, current, latest) = rest.rfind('(').map_or_else(
+                || (rest.to_string(), String::new(), String::new()),
+                |idx| {
                     let name = rest[..idx].trim().to_string();
-                    let inner = rest[idx..].trim_matches(|c| c == '(' || c == ')');
-                    let mut vers = inner.split("->").map(|s| s.trim());
+                    let inner = rest[idx..].trim_matches(['(', ')']);
+                    let mut vers = inner.split("->").map(str::trim);
                     let current = vers.next().unwrap_or("").to_string();
                     let latest = vers.next().unwrap_or("").to_string();
                     (name, current, latest)
-                }
-                None => (rest.to_string(), String::new(), String::new()),
-            };
+                },
+            );
             Some(OutdatedItem {
                 id,
                 name,
@@ -246,7 +256,8 @@ fn parse_mas_outdated(stdout: &str) -> Vec<OutdatedItem> {
 }
 
 fn parse_npm_outdated(stdout: &str) -> Vec<OutdatedItem> {
-    let parsed: serde_json::Value = serde_json::from_str(stdout).unwrap_or(serde_json::json!({}));
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout).unwrap_or_else(|_| serde_json::json!({}));
     let obj = parsed.as_object().cloned().unwrap_or_default();
     obj.iter()
         .filter_map(|(name, info)| {
@@ -276,10 +287,10 @@ fn parse_npm_outdated(stdout: &str) -> Vec<OutdatedItem> {
 // aren't always valid 3-part semver, so we compare numeric components directly.
 fn version_is_older(installed: &str, latest: &str) -> bool {
     fn parts(s: &str) -> Vec<u64> {
-        s.split(|c: char| c == '.' || c == '-' || c == '+')
+        s.split(['.', '-', '+'])
             .map(|p| {
                 p.chars()
-                    .take_while(|c| c.is_ascii_digit())
+                    .take_while(char::is_ascii_digit)
                     .collect::<String>()
                     .parse::<u64>()
                     .unwrap_or(0)
@@ -352,9 +363,9 @@ fn parse_appcast_notes(xml: &str) -> Option<String> {
 fn parse_cask_tokens(stdout: &str) -> Vec<String> {
     stdout
         .lines()
-        .map(|l| l.trim())
+        .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with("==>") && !l.contains(char::is_whitespace))
-        .map(|l| l.to_string())
+        .map(String::from)
         .collect()
 }
 
@@ -365,7 +376,10 @@ fn parse_cask_tokens(stdout: &str) -> Vec<String> {
 fn is_valid_cask_token(token: &str) -> bool {
     !token.is_empty()
         && token.len() <= 128
-        && token.bytes().next().is_some_and(|b| b.is_ascii_alphanumeric())
+        && token
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphanumeric())
         && token
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'@' | b'.' | b'_' | b'+'))
@@ -389,9 +403,7 @@ fn url_host(url: &str) -> Option<String> {
     let rest = url
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))?;
-    let end = rest
-        .find(|c: char| matches!(c, '/' | '?' | '#'))
-        .unwrap_or(rest.len());
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let authority = &rest[..end];
     // Strip any "user:pass@" prefix.
     let host_port = authority.rsplit('@').next().unwrap_or(authority);
@@ -414,6 +426,10 @@ fn url_host(url: &str) -> Option<String> {
 // Mitigates SSRF from a hostile local app that points its SUFeedURL at internal infrastructure
 // (e.g. 169.254.169.254 cloud-metadata, 192.168/16 routers, localhost services). DNS rebinding
 // can bypass an IP-literal check; we accept that as a known limitation.
+// `.local` / `.internal` are mDNS / private hostname suffixes (RFC 6762), not file extensions —
+// clippy's case_sensitive_file_extension_comparisons false-positives here. Callers pass a
+// lowercased host from url_host(), so a plain ends_with is correct.
+#[allow(clippy::case_sensitive_file_extension_comparisons)]
 fn is_local_or_private_host(host: &str) -> bool {
     if host == "localhost"
         || host.ends_with(".local")
@@ -452,10 +468,7 @@ fn is_safe_feed_url(url: &str) -> bool {
     if url.chars().any(|c| c.is_control() || c == ' ') {
         return false;
     }
-    match url_host(url) {
-        Some(host) => !is_local_or_private_host(&host),
-        None => false,
-    }
+    url_host(url).is_some_and(|host| !is_local_or_private_host(&host))
 }
 
 // Mac App Store ADAM IDs are numeric.
@@ -477,15 +490,16 @@ fn is_valid_npm_package(name: &str) -> bool {
     }
     // Scoped packages are "@scope/name"; allow that single leading '@'.
     let body = name.strip_prefix('@').unwrap_or(name);
-    body.bytes()
-        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_' | b'.' | b'/'))
+    body.bytes().all(|b| {
+        b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_' | b'.' | b'/')
+    })
 }
 
 // Homebrew's bulk cask metadata is a JWS envelope: { "payload": "<json string>", "signatures": ... }.
 // The cask array lives inside the payload string.
 fn extract_jws_payload(jws: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(jws).ok()?;
-    v["payload"].as_str().map(|s| s.to_string())
+    v["payload"].as_str().map(String::from)
 }
 
 // Build a lowercased ".app filename" -> cask token index from the cask array JSON, so an installed
@@ -495,22 +509,19 @@ fn build_cask_app_index(payload_json: &str) -> HashMap<String, String> {
     let casks: Vec<serde_json::Value> = serde_json::from_str(payload_json).unwrap_or_default();
     let mut idx: HashMap<String, String> = HashMap::new();
     for cask in &casks {
-        let token = match cask["token"].as_str() {
-            Some(t) => t,
-            None => continue,
+        let Some(token) = cask["token"].as_str() else {
+            continue;
         };
-        let artifacts = match cask["artifacts"].as_array() {
-            Some(a) => a,
-            None => continue,
+        let Some(artifacts) = cask["artifacts"].as_array() else {
+            continue;
         };
         for art in artifacts {
             if let Some(apps) = art["app"].as_array() {
                 for app in apps.iter().filter_map(|a| a.as_str()) {
                     let key = app.to_lowercase();
-                    let replace = match idx.get(&key) {
-                        None => true,
-                        Some(existing) => existing.contains('@') && !token.contains('@'),
-                    };
+                    let replace = idx
+                        .get(&key)
+                        .is_none_or(|existing| existing.contains('@') && !token.contains('@'));
                     if replace {
                         idx.insert(key, token.to_string());
                     }
@@ -536,10 +547,10 @@ fn check_brew() -> CategoryStatus {
 }
 
 fn normal_cask_names() -> std::collections::HashSet<String> {
-    match run_cmd("brew", &["outdated", "--cask", "--json=v2"]) {
-        Ok(stdout) => parse_cask_names(&stdout),
-        Err(_) => std::collections::HashSet::new(),
-    }
+    run_cmd("brew", &["outdated", "--cask", "--json=v2"]).map_or_else(
+        |_| std::collections::HashSet::new(),
+        |s| parse_cask_names(&s),
+    )
 }
 
 // Always runs --greedy to get the full set (including self-updating casks); parse_casks tags each.
@@ -634,6 +645,9 @@ fn fetch_url(url: &str) -> Option<String> {
 // --- Detect updates for apps that ship a Sparkle appcast (the "Latest" approach) ---
 // These apps update themselves, so this is detection-only; the frontend shows them without a
 // checkbox. Feeds are fetched in parallel since each is a network round-trip.
+// The handles `.collect::<Vec<_>>()` below is intentional: without it, spawn+join interleaves
+// and the network fetches run serially instead of in parallel.
+#[allow(clippy::needless_collect)]
 fn check_sparkle() -> CategoryStatus {
     let feeds: Vec<(String, String, String)> = list_applications()
         .iter()
@@ -644,7 +658,8 @@ fn check_sparkle() -> CategoryStatus {
             if !is_safe_feed_url(&feed) {
                 return None;
             }
-            let current = read_plist_string(&info, "CFBundleShortVersionString").unwrap_or_default();
+            let current =
+                read_plist_string(&info, "CFBundleShortVersionString").unwrap_or_default();
             let name = path.file_stem()?.to_str()?.to_string();
             Some((name, feed, current))
         })
@@ -708,10 +723,15 @@ async fn check_outdated() -> Vec<CategoryStatus> {
     let mas = tauri::async_runtime::spawn_blocking(check_mas);
     let npm = tauri::async_runtime::spawn_blocking(check_npm);
     vec![
-        brew.await.unwrap_or_else(|_| failed_category("Homebrew", "brew")),
-        casks.await.unwrap_or_else(|_| failed_category("Applications", "cask")),
-        mas.await.unwrap_or_else(|_| failed_category("App Store", "mas")),
-        npm.await.unwrap_or_else(|_| failed_category("npm globals", "npm")),
+        brew.await
+            .unwrap_or_else(|_| failed_category("Homebrew", "brew")),
+        casks
+            .await
+            .unwrap_or_else(|_| failed_category("Applications", "cask")),
+        mas.await
+            .unwrap_or_else(|_| failed_category("App Store", "mas")),
+        npm.await
+            .unwrap_or_else(|_| failed_category("npm globals", "npm")),
     ]
 }
 
@@ -741,16 +761,18 @@ async fn search_casks(query: String) -> Vec<CaskSuggestion> {
         let installed: std::collections::HashSet<String> = run_cmd("brew", &["list", "--cask"])
             .map(|s| parse_cask_tokens(&s).into_iter().collect())
             .unwrap_or_default();
-        match run_cmd("brew", &["search", "--cask", query.trim()]) {
-            Ok(out) => parse_cask_tokens(&out)
-                .into_iter()
-                .map(|token| CaskSuggestion {
-                    installed: installed.contains(&token),
-                    token,
-                })
-                .collect(),
-            Err(_) => vec![],
-        }
+        run_cmd("brew", &["search", "--cask", query.trim()]).map_or_else(
+            |_| vec![],
+            |out| {
+                parse_cask_tokens(&out)
+                    .into_iter()
+                    .map(|token| CaskSuggestion {
+                        installed: installed.contains(&token),
+                        token,
+                    })
+                    .collect()
+            },
+        )
     })
     .await
     .unwrap_or_default()
@@ -823,6 +845,8 @@ fn badge_title(count: u32) -> Option<String> {
     }
 }
 
+// AppHandle is taken by value to match the Tauri command convention; it's a cheap Arc clone.
+#[allow(clippy::needless_pass_by_value)]
 #[tauri::command]
 fn set_badge(app: tauri::AppHandle, count: u32) {
     if let Some(tray) = app.tray_by_id("main-tray") {
@@ -896,7 +920,7 @@ async fn suggest_adoptions() -> Vec<AdoptableApp> {
                 });
             }
         }
-        out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        out.sort_by_key(|a| a.name.to_lowercase());
         out
     })
     .await
@@ -923,7 +947,7 @@ fn adopt_one(token: &str) -> UpdateResult {
         };
     }
     let args = adopt_args(token);
-    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let (success, output) = run_update_cmd("brew", &arg_refs);
     UpdateResult {
         kind: "cask".into(),
@@ -994,9 +1018,10 @@ fn build_update_command(kind: &str, id: &str) -> Option<(&'static str, Vec<Strin
             Some(("brew", vec!["upgrade".into(), "--cask".into(), id.into()]))
         }
         "mas" if is_numeric_id(id) => Some(("mas", vec!["upgrade".into(), id.into()])),
-        "npm" if is_valid_npm_package(id) => {
-            Some(("npm", vec!["install".into(), "-g".into(), format!("{}@latest", id)]))
-        }
+        "npm" if is_valid_npm_package(id) => Some((
+            "npm",
+            vec!["install".into(), "-g".into(), format!("{}@latest", id)],
+        )),
         _ => None,
     }
 }
@@ -1004,16 +1029,19 @@ fn build_update_command(kind: &str, id: &str) -> Option<(&'static str, Vec<Strin
 // --- Upgrade only the items the user selected, returning a result per item ---
 #[tauri::command]
 async fn run_selected_updates(selections: Vec<UpdateSelection>) -> Vec<UpdateResult> {
-    tauri::async_runtime::spawn_blocking(move || run_selected_updates_blocking(selections))
+    tauri::async_runtime::spawn_blocking(move || run_selected_updates_blocking(&selections))
         .await
         .unwrap_or_default()
 }
 
-fn run_selected_updates_blocking(selections: Vec<UpdateSelection>) -> Vec<UpdateResult> {
+fn run_selected_updates_blocking(selections: &[UpdateSelection]) -> Vec<UpdateResult> {
     let mut results = Vec::new();
 
     // Refresh Homebrew's metadata once up front if any brew/cask item is selected.
-    if selections.iter().any(|s| s.kind == "brew" || s.kind == "cask") {
+    if selections
+        .iter()
+        .any(|s| s.kind == "brew" || s.kind == "cask")
+    {
         let (success, output) = run_update_cmd("brew", &["update"]);
         results.push(UpdateResult {
             kind: "brew".into(),
@@ -1023,20 +1051,17 @@ fn run_selected_updates_blocking(selections: Vec<UpdateSelection>) -> Vec<Update
         });
     }
 
-    for sel in &selections {
-        let (cmd, args) = match build_update_command(&sel.kind, &sel.id) {
-            Some(c) => c,
-            None => {
-                results.push(UpdateResult {
-                    kind: sel.kind.clone(),
-                    name: sel.name.clone(),
-                    success: false,
-                    output: format!("unsupported or invalid update: {} / {}", sel.kind, sel.id),
-                });
-                continue;
-            }
+    for sel in selections {
+        let Some((cmd, args)) = build_update_command(&sel.kind, &sel.id) else {
+            results.push(UpdateResult {
+                kind: sel.kind.clone(),
+                name: sel.name.clone(),
+                success: false,
+                output: format!("unsupported or invalid update: {} / {}", sel.kind, sel.id),
+            });
+            continue;
         };
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let (success, output) = run_update_cmd(cmd, &arg_refs);
         results.push(UpdateResult {
             kind: sel.kind.clone(),
@@ -1065,7 +1090,10 @@ fn list_applications() -> Vec<PathBuf> {
     if let Ok(entries) = std::fs::read_dir("/Applications") {
         for e in entries.flatten() {
             let p = e.path();
-            if p.extension().and_then(|s| s.to_str()) == Some("app") {
+            if p.extension()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.eq_ignore_ascii_case("app"))
+            {
                 apps.push(p);
             }
         }
@@ -1126,14 +1154,15 @@ fn inspect_app(path: &Path) -> AppSig {
         authority = a;
     }
 
-    let mut notarized = false;
-    if let Ok(out) = Command::new("spctl")
+    let notarized = if let Ok(out) = Command::new("spctl")
         .args(["--assess", "--type", "execute", "-v", path_str])
         .output()
     {
         let text = combine_output(&out.stdout, &out.stderr);
-        notarized = parse_notarized(out.status.success(), &text);
-    }
+        parse_notarized(out.status.success(), &text)
+    } else {
+        false
+    };
 
     AppSig {
         name,
@@ -1212,7 +1241,7 @@ async fn verify_signatures(app: tauri::AppHandle) -> Vec<UpdateResult> {
     // recover instead of panicking on a previous panic.
     let guard = signing_store_lock()
         .lock()
-        .unwrap_or_else(|p| p.into_inner());
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut store = load_signing_store();
     let mut results = Vec::new();
     for sig in &sigs {
@@ -1226,20 +1255,21 @@ async fn verify_signatures(app: tauri::AppHandle) -> Vec<UpdateResult> {
 
         let mut out = String::new();
         if changed {
-            out.push_str(&format!(
-                "⚠ Developer certificate CHANGED: was Team {}, now {}. A different publisher signed this version — possible hijacked release. Verify before trusting.\n",
-                prev.clone().unwrap_or_default(),
-                sig.team_id.clone().unwrap_or_default()
-            ));
+            let was = prev.clone().unwrap_or_default();
+            let now = sig.team_id.clone().unwrap_or_default();
+            let _ = writeln!(
+                out,
+                "⚠ Developer certificate CHANGED: was Team {was}, now {now}. A different publisher signed this version — possible hijacked release. Verify before trusting."
+            );
         }
         if !sig.signed {
             out.push_str("Not code-signed.\n");
         }
         if let Some(a) = &sig.authority {
-            out.push_str(&format!("Signer: {}\n", a));
+            let _ = writeln!(out, "Signer: {a}");
         }
         if let Some(t) = &sig.team_id {
-            out.push_str(&format!("Team ID: {}\n", t));
+            let _ = writeln!(out, "Team ID: {t}");
         }
         out.push_str(if sig.notarized {
             "Notarized by Apple: yes"
@@ -1263,17 +1293,17 @@ async fn verify_signatures(app: tauri::AppHandle) -> Vec<UpdateResult> {
 }
 
 // --- Launchd schedule management ---
-fn valid_schedule_time(hour: u32, minute: u32) -> bool {
+const fn valid_schedule_time(hour: u32, minute: u32) -> bool {
     hour <= 23 && minute <= 59
 }
 
-fn plist_path() -> std::path::PathBuf {
+fn plist_path() -> PathBuf {
     let mut p = dirs::home_dir().expect("home dir");
     p.push("Library/LaunchAgents/com.freshet.daily.plist");
     p
 }
 
-fn script_path() -> std::path::PathBuf {
+fn script_path() -> PathBuf {
     let mut p = dirs::home_dir().expect("home dir");
     p.push(".freshet/run.sh");
     p
@@ -1317,6 +1347,7 @@ fn install_schedule(hour: u32, minute: u32) -> Result<(), String> {
     }
     write_run_script()?;
     let script = script_path();
+    let home = dirs::home_dir().ok_or_else(|| "could not resolve home directory".to_string())?;
     let plist = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -1326,35 +1357,33 @@ fn install_schedule(hour: u32, minute: u32) -> Result<(), String> {
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>{}</string>
+        <string>{script}</string>
     </array>
     <key>StartCalendarInterval</key>
     <dict>
-        <key>Hour</key><integer>{}</integer>
-        <key>Minute</key><integer>{}</integer>
+        <key>Hour</key><integer>{hour}</integer>
+        <key>Minute</key><integer>{minute}</integer>
     </dict>
-    <key>StandardOutPath</key><string>{}/.freshet/launchd.out.log</string>
-    <key>StandardErrorPath</key><string>{}/.freshet/launchd.err.log</string>
+    <key>StandardOutPath</key><string>{home}/.freshet/launchd.out.log</string>
+    <key>StandardErrorPath</key><string>{home}/.freshet/launchd.err.log</string>
 </dict>
 </plist>
 "#,
-        script.display(),
-        hour,
-        minute,
-        dirs::home_dir().unwrap().display(),
-        dirs::home_dir().unwrap().display(),
+        script = script.display(),
+        home = home.display(),
     );
     let p = plist_path();
     if let Some(parent) = p.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     std::fs::write(&p, plist).map_err(|e| e.to_string())?;
+    let p_str = p
+        .to_str()
+        .ok_or_else(|| "plist path is not valid UTF-8".to_string())?;
     // Reload: unload first (ignore errors) then load
-    let _ = Command::new("launchctl")
-        .args(["unload", p.to_str().unwrap()])
-        .status();
+    let _ = Command::new("launchctl").args(["unload", p_str]).status();
     Command::new("launchctl")
-        .args(["load", p.to_str().unwrap()])
+        .args(["load", p_str])
         .status()
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -1364,9 +1393,9 @@ fn install_schedule(hour: u32, minute: u32) -> Result<(), String> {
 fn uninstall_schedule() -> Result<(), String> {
     let p = plist_path();
     if p.exists() {
-        let _ = Command::new("launchctl")
-            .args(["unload", p.to_str().unwrap()])
-            .status();
+        if let Some(p_str) = p.to_str() {
+            let _ = Command::new("launchctl").args(["unload", p_str]).status();
+        }
         std::fs::remove_file(&p).map_err(|e| e.to_string())?;
     }
     Ok(())
@@ -1385,11 +1414,15 @@ fn main() {
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&quit])?;
 
+            let icon = app
+                .default_window_icon()
+                .ok_or("no default window icon")?
+                .clone();
             let _tray = TrayIconBuilder::with_id("main-tray")
-                .icon(app.default_window_icon().unwrap().clone())
+                .icon(icon)
                 .icon_as_template(true)
                 .menu(&menu)
-                .menu_on_left_click(false)
+                .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| {
                     if event.id.as_ref() == "quit" {
                         app.exit(0);
@@ -1438,6 +1471,7 @@ fn main() {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::needless_raw_string_hashes)]
 mod tests {
     use super::*;
 
@@ -1452,7 +1486,11 @@ mod tests {
         }"#;
         let items = parse_npm_outdated(json);
         let names: Vec<&str> = items.iter().map(|i| i.name.as_str()).collect();
-        assert_eq!(names, vec!["typescript"], "only the genuinely-behind package is kept");
+        assert_eq!(
+            names,
+            vec!["typescript"],
+            "only the genuinely-behind package is kept"
+        );
         assert_eq!(items[0].current, "5.0.0");
         assert_eq!(items[0].latest, "5.8.0");
     }
@@ -1502,7 +1540,10 @@ mod tests {
         let firefox = items.iter().find(|i| i.name == "firefox").unwrap();
         let chrome = items.iter().find(|i| i.name == "google-chrome").unwrap();
         assert!(!firefox.self_updating, "in normal set => not self-updating");
-        assert!(chrome.self_updating, "greedy-only => self-updating (hidden by default)");
+        assert!(
+            chrome.self_updating,
+            "greedy-only => self-updating (hidden by default)"
+        );
     }
 
     // codesign parsing against real `codesign -dvv` output (Google Chrome).
@@ -1531,7 +1572,10 @@ mod tests {
     fn notarized_requires_accepted_and_notarized() {
         let accepted = "/Applications/OBS.app: accepted\nsource=Notarized Developer ID\n";
         assert!(parse_notarized(true, accepted));
-        assert!(!parse_notarized(false, accepted), "rejected status => not notarized");
+        assert!(
+            !parse_notarized(false, accepted),
+            "rejected status => not notarized"
+        );
         assert!(
             !parse_notarized(true, "/Applications/X.app: accepted\nsource=Unnotarized"),
             "accepted but not notarized => false"
@@ -1543,7 +1587,10 @@ mod tests {
     fn cert_change_detection() {
         assert!(cert_changed(Some("AAA"), Some("BBB")));
         assert!(!cert_changed(Some("AAA"), Some("AAA")));
-        assert!(!cert_changed(None, Some("AAA")), "first sighting is not a change");
+        assert!(
+            !cert_changed(None, Some("AAA")),
+            "first sighting is not a change"
+        );
         assert!(!cert_changed(Some("AAA"), None));
     }
 
@@ -1555,7 +1602,10 @@ mod tests {
         );
         assert_eq!(
             build_update_command("cask", "firefox"),
-            Some(("brew", vec!["upgrade".into(), "--cask".into(), "firefox".into()]))
+            Some((
+                "brew",
+                vec!["upgrade".into(), "--cask".into(), "firefox".into()]
+            ))
         );
         assert_eq!(
             build_update_command("mas", "462058435"),
@@ -1563,17 +1613,26 @@ mod tests {
         );
         assert_eq!(
             build_update_command("npm", "typescript"),
-            Some(("npm", vec!["install".into(), "-g".into(), "typescript@latest".into()]))
+            Some((
+                "npm",
+                vec!["install".into(), "-g".into(), "typescript@latest".into()]
+            ))
         );
         assert_eq!(
             build_update_command("npm", "@scope/pkg"),
-            Some(("npm", vec!["install".into(), "-g".into(), "@scope/pkg@latest".into()]))
+            Some((
+                "npm",
+                vec!["install".into(), "-g".into(), "@scope/pkg@latest".into()]
+            ))
         );
         assert_eq!(build_update_command("bogus", "x"), None);
         // crafted ids must be rejected (no flag / install-spec injection)
         assert_eq!(build_update_command("brew", "--force"), None);
         assert_eq!(build_update_command("mas", "not-a-number"), None);
-        assert_eq!(build_update_command("npm", "https://evil.example/x.tgz"), None);
+        assert_eq!(
+            build_update_command("npm", "https://evil.example/x.tgz"),
+            None
+        );
         assert_eq!(build_update_command("npm", "-g"), None);
     }
 
@@ -1635,7 +1694,10 @@ mod tests {
     #[test]
     fn appcast_release_notes_link() {
         let xml = r#"<item><sparkle:releaseNotesLink>https://obsproject.com/notes.html</sparkle:releaseNotesLink></item>"#;
-        assert_eq!(parse_appcast_notes(xml).as_deref(), Some("https://obsproject.com/notes.html"));
+        assert_eq!(
+            parse_appcast_notes(xml).as_deref(),
+            Some("https://obsproject.com/notes.html")
+        );
         assert_eq!(parse_appcast_notes("<item></item>"), None);
         // a non-http notes link is rejected
         let bad = r#"<sparkle:releaseNotesLink>file:///etc/passwd</sparkle:releaseNotesLink>"#;
@@ -1657,7 +1719,10 @@ mod tests {
         );
         // brew list --cask form (no header) and a prose line are handled too
         let listed = "sublime-text\nintellij-idea-ce\nIf you meant a formula...\n";
-        assert_eq!(parse_cask_tokens(listed), vec!["sublime-text", "intellij-idea-ce"]);
+        assert_eq!(
+            parse_cask_tokens(listed),
+            vec!["sublime-text", "intellij-idea-ce"]
+        );
         assert!(parse_cask_tokens("").is_empty());
     }
 
@@ -1666,7 +1731,10 @@ mod tests {
         assert!(is_valid_cask_token("google-chrome"));
         assert!(is_valid_cask_token("google-chrome@beta"));
         assert!(is_valid_cask_token("1password"));
-        assert!(!is_valid_cask_token("--force"), "leading dash = flag injection");
+        assert!(
+            !is_valid_cask_token("--force"),
+            "leading dash = flag injection"
+        );
         assert!(!is_valid_cask_token(""), "empty");
         assert!(!is_valid_cask_token("a b"), "space");
         assert!(!is_valid_cask_token("a/../b"), "slash/path chars");
@@ -1732,14 +1800,18 @@ mod tests {
         ]"#;
         let idx = build_cask_app_index(payload);
         assert_eq!(idx.get("foo.app").map(String::as_str), Some("foo"));
-        assert_eq!(idx.get("google chrome.app").map(String::as_str), Some("google-chrome"));
+        assert_eq!(
+            idx.get("google chrome.app").map(String::as_str),
+            Some("google-chrome")
+        );
         assert_eq!(idx.get("slack.app").map(String::as_str), Some("slack"));
         assert_eq!(idx.get("missing.app"), None);
     }
 
     #[test]
     fn mas_hint_only_on_that_error() {
-        let with_err = maybe_append_mas_hint("Error: No downloads initiated for ADAM ID 462058435.".into());
+        let with_err =
+            maybe_append_mas_hint("Error: No downloads initiated for ADAM ID 462058435.".into());
         assert!(with_err.contains("different Apple ID"));
         let clean = maybe_append_mas_hint("Installing Microsoft Excel... done".into());
         assert_eq!(clean, "Installing Microsoft Excel... done");
@@ -1772,11 +1844,15 @@ mod tests {
 
     #[test]
     fn casks_empty_normal_set_all_self_updating() {
-        let greedy = r#"{"casks":[{"name":"firefox","installed_versions":["1"],"current_version":"2"}]}"#;
+        let greedy =
+            r#"{"casks":[{"name":"firefox","installed_versions":["1"],"current_version":"2"}]}"#;
         let none = std::collections::HashSet::new();
         assert!(parse_casks(greedy, &none)[0].self_updating);
         assert!(parse_casks("garbage", &none).is_empty());
-        assert_eq!(parse_cask_names(r#"{"casks":[{"name":"a"},{"name":"b"}]}"#).len(), 2);
+        assert_eq!(
+            parse_cask_names(r#"{"casks":[{"name":"a"},{"name":"b"}]}"#).len(),
+            2
+        );
         assert!(parse_cask_names("nope").is_empty());
     }
 
@@ -1865,15 +1941,33 @@ mod tests {
 
     #[test]
     fn url_host_extracts_hostname() {
-        assert_eq!(url_host("https://example.com/path").as_deref(), Some("example.com"));
-        assert_eq!(url_host("https://Example.COM").as_deref(), Some("example.com"));
-        assert_eq!(url_host("http://example.com:8080/x").as_deref(), Some("example.com"));
-        assert_eq!(url_host("https://user:pass@example.com/x").as_deref(), Some("example.com"));
+        assert_eq!(
+            url_host("https://example.com/path").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(
+            url_host("https://Example.COM").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(
+            url_host("http://example.com:8080/x").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(
+            url_host("https://user:pass@example.com/x").as_deref(),
+            Some("example.com")
+        );
         assert_eq!(url_host("https://[::1]:443/x").as_deref(), Some("::1"));
         assert_eq!(url_host("https://[fe80::1]/x").as_deref(), Some("fe80::1"));
         // Path / query / fragment terminate the host.
-        assert_eq!(url_host("https://example.com?q=1").as_deref(), Some("example.com"));
-        assert_eq!(url_host("https://example.com#frag").as_deref(), Some("example.com"));
+        assert_eq!(
+            url_host("https://example.com?q=1").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(
+            url_host("https://example.com#frag").as_deref(),
+            Some("example.com")
+        );
         // Non-http(s) and malformed cases.
         assert_eq!(url_host("file:///etc/passwd"), None);
         assert_eq!(url_host("https://"), None);
@@ -1906,30 +2000,51 @@ mod tests {
         assert!(!is_local_or_private_host("example.com"));
         assert!(!is_local_or_private_host("github.com"));
         assert!(!is_local_or_private_host("8.8.8.8"));
-        assert!(!is_local_or_private_host("172.32.0.1"), "just outside private range");
-        assert!(!is_local_or_private_host("100.63.255.255"), "just outside CGNAT");
-        assert!(!is_local_or_private_host("100.128.0.1"), "just outside CGNAT");
-        assert!(!is_local_or_private_host("2606:4700:4700::1111"), "Cloudflare v6");
+        assert!(
+            !is_local_or_private_host("172.32.0.1"),
+            "just outside private range"
+        );
+        assert!(
+            !is_local_or_private_host("100.63.255.255"),
+            "just outside CGNAT"
+        );
+        assert!(
+            !is_local_or_private_host("100.128.0.1"),
+            "just outside CGNAT"
+        );
+        assert!(
+            !is_local_or_private_host("2606:4700:4700::1111"),
+            "Cloudflare v6"
+        );
     }
 
     #[test]
     fn feed_url_requires_https_and_public_host() {
-        assert!(is_safe_feed_url("https://obsproject.com/osx_update/updates.xml"));
+        assert!(is_safe_feed_url(
+            "https://obsproject.com/osx_update/updates.xml"
+        ));
         // http is rejected outright — Sparkle 2 requires https; older feeds can MITM us.
-        assert!(!is_safe_feed_url("http://obsproject.com/osx_update/updates.xml"));
+        assert!(!is_safe_feed_url(
+            "http://obsproject.com/osx_update/updates.xml"
+        ));
         assert!(!is_safe_feed_url("file:///etc/passwd"));
         assert!(!is_safe_feed_url("javascript:alert(1)"));
         // SSRF-style hostile feeds.
         assert!(!is_safe_feed_url("https://localhost/x.xml"));
         assert!(!is_safe_feed_url("https://127.0.0.1/x.xml"));
         assert!(!is_safe_feed_url("https://192.168.1.1/x.xml"));
-        assert!(!is_safe_feed_url("https://169.254.169.254/latest/meta-data/"));
+        assert!(!is_safe_feed_url(
+            "https://169.254.169.254/latest/meta-data/"
+        ));
         assert!(!is_safe_feed_url("https://[::1]/x.xml"));
         assert!(!is_safe_feed_url("https://router.local/x.xml"));
         // Junk.
         assert!(!is_safe_feed_url(""));
         assert!(!is_safe_feed_url("https://e.com/ x"));
-        assert!(!is_safe_feed_url(&format!("https://e.com/{}", "a".repeat(2050))));
+        assert!(!is_safe_feed_url(&format!(
+            "https://e.com/{}",
+            "a".repeat(2050)
+        )));
     }
 
     #[test]

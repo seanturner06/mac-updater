@@ -15,3 +15,35 @@ serde_json = "1"
 semver = "1"
 tokio = { version = "1", features = ["full"] }
 dirs = "5"
+
+[lints.rust]
+unsafe_code = "deny"              # drop/loosen if you do FFI
+rust_2018_idioms = { level = "warn", priority = -1 }
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+trivial_casts = "warn"
+trivial_numeric_casts = "warn"
+# missing_docs left off — too heavy for an app; add back if this is a library
+
+[lints.clippy]
+all      = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery  = { level = "warn", priority = -1 }
+# `cargo` group removed — it's for published crates, not apps
+
+# Noisy pedantic lints allowed back
+missing_errors_doc       = "allow"
+missing_panics_doc       = "allow"
+module_name_repetitions  = "allow"
+must_use_candidate       = "allow"
+items_after_statements   = "allow"
+similar_names            = "allow"
+too_many_lines           = "allow"
+cast_precision_loss      = "allow"
+cast_possible_truncation = "allow"
+doc_markdown             = "allow"
+
+# Hand-picked stricter lints
+unwrap_used = "warn"
+todo        = "warn"
+dbg_macro   = "warn"
