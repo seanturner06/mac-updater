@@ -1,0 +1,293 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Freshet — keep your Mac apps and dev tools fresh</title>
+    <meta
+      name="description"
+      content="Freshet finds and updates everything Homebrew, the Mac App Store, npm, and Sparkle know about — Homebrew formulae and casks, App Store apps, global npm packages, and more. Local-first. Calm by design."
+    />
+    <meta property="og:title" content="Freshet — keep your Mac apps and dev tools fresh" />
+    <meta
+      property="og:description"
+      content="One calm menu-bar app for every update: Homebrew, casks, the Mac App Store, npm globals, and Sparkle. Local-first, open source, notarized."
+    />
+    <meta property="og:type" content="website" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="bg-orbs" aria-hidden="true"></div>
+
+    <header class="nav">
+      <a class="wordmark" href="#top">Freshet</a>
+      <nav class="nav-links">
+        <a href="#how">How it works</a>
+        <a href="#features">Features</a>
+        <a href="#pricing">Pricing</a>
+        <a class="nav-cta" href="#waitlist">Get early access</a>
+      </nav>
+    </header>
+
+    <main id="top">
+      <!-- ───────────────── hero ───────────────── -->
+      <section class="hero">
+        <div class="hero-copy">
+          <span class="eyebrow">macOS menu-bar app · for developers</span>
+          <h1>
+            Keep every app and<br />dev tool <span class="accent">fresh.</span>
+          </h1>
+          <p class="lede">
+            One quiet menu-bar app that finds and updates everything
+            <strong>Homebrew</strong>, the <strong>Mac App Store</strong>,
+            <strong>npm</strong>, and <strong>Sparkle</strong> already know about —
+            formulae, casks, App Store apps, and your global npm packages. No version
+            database to rot. No cloud account. No noise.
+          </p>
+
+          <form class="waitlist-form" id="hero-form" action="https://formspree.io/f/YOUR_FORM_ID" method="POST">
+            <input
+              type="email"
+              name="email"
+              required
+              placeholder="you@example.com"
+              aria-label="Email address"
+            />
+            <button type="submit">Get early access</button>
+          </form>
+          <p class="form-note" id="hero-note">
+            Join the waitlist — first builds going out soon. No spam, ever.
+          </p>
+
+          <ul class="trust-row">
+            <li>Local-first</li>
+            <li>Open source core</li>
+            <li>Notarized &amp; signed</li>
+            <li>No tracking</li>
+          </ul>
+        </div>
+
+        <!-- faux app window, built in CSS to mirror the real product -->
+        <div class="app-shot" aria-hidden="true">
+          <div class="app-win">
+            <div class="aw-header">
+              <div class="aw-title-wrap">
+                <span class="aw-dot"></span>
+                <div>
+                  <div class="aw-title">Freshet</div>
+                  <div class="aw-sub">7 updates available</div>
+                </div>
+              </div>
+              <div class="aw-icons"><span>⟳</span><span>⚙</span></div>
+            </div>
+            <div class="aw-body">
+              <div class="aw-cat">
+                <span class="aw-chev">▾</span><span class="aw-cat-name">Homebrew</span>
+                <span class="aw-pill">2</span>
+              </div>
+              <div class="aw-item"><span class="aw-check on"></span><span class="aw-app">ripgrep</span><span class="aw-ver"><s>14.1.0</s> → 14.1.1</span></div>
+              <div class="aw-item"><span class="aw-check on"></span><span class="aw-app">fd</span><span class="aw-ver"><s>9.0.0</s> → 10.1.0</span></div>
+              <div class="aw-cat">
+                <span class="aw-chev">▾</span><span class="aw-cat-name">Applications</span>
+                <span class="aw-pill">3</span>
+              </div>
+              <div class="aw-item"><span class="aw-check on"></span><span class="aw-app">Visual Studio Code</span><span class="aw-ver"><s>1.89</s> → 1.90</span></div>
+              <div class="aw-item flag"><span class="aw-check"></span><span class="aw-app">iMazing</span><span class="aw-badge">new cert</span></div>
+              <div class="aw-item"><span class="aw-check on"></span><span class="aw-app">Rectangle</span><span class="aw-ver"><s>0.78</s> → 0.79</span></div>
+              <div class="aw-cat">
+                <span class="aw-chev">▾</span><span class="aw-cat-name">npm globals</span>
+                <span class="aw-pill">2</span>
+              </div>
+              <div class="aw-item"><span class="aw-check on"></span><span class="aw-app">typescript</span><span class="aw-ver"><s>5.4.5</s> → 5.5.2</span></div>
+              <div class="aw-item"><span class="aw-check on"></span><span class="aw-app">pnpm</span><span class="aw-ver"><s>9.1</s> → 9.4</span></div>
+            </div>
+            <div class="aw-foot"><span class="aw-foot-btn">Update 6 selected</span></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ───────────────── sources strip ───────────────── -->
+      <section class="sources">
+        <p class="sources-label">One app, every source</p>
+        <div class="source-pills">
+          <span>Homebrew formulae</span>
+          <span>Homebrew casks</span>
+          <span>Mac App Store</span>
+          <span>npm globals</span>
+          <span>Sparkle apps</span>
+          <span class="soon">GitHub Releases · soon</span>
+        </div>
+      </section>
+
+      <!-- ───────────────── how it works ───────────────── -->
+      <section id="how" class="how">
+        <h2>Updates without the babysitting</h2>
+        <div class="how-grid">
+          <div class="how-step">
+            <span class="how-num">01</span>
+            <h3>It checks every source at once</h3>
+            <p>
+              Homebrew, casks, the App Store, and your global npm packages — scanned in
+              parallel the moment you open it. The menu-bar icon tells you the count at a
+              glance.
+            </p>
+          </div>
+          <div class="how-step">
+            <span class="how-num">02</span>
+            <h3>You choose what updates</h3>
+            <p>
+              Tick the ones you want, or update everything. Skip a version you're not
+              ready for. Prefer to just be told? Flip on notify-only and Freshet never
+              touches a thing.
+            </p>
+          </div>
+          <div class="how-step">
+            <span class="how-num">03</span>
+            <h3>It runs and shows its work</h3>
+            <p>
+              Real Homebrew output, surfaced cleanly — so when something needs your
+              attention, you see exactly what and why instead of a silent failure.
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ───────────────── features ───────────────── -->
+      <section id="features" class="features">
+        <h2>Built for people who actually <span class="accent">read</span> their changelogs</h2>
+        <div class="feature-grid">
+          <article class="feature-card">
+            <h3>Your whole dev toolchain</h3>
+            <p>
+              The only updater that tracks your <strong>global npm packages</strong>
+              alongside your apps. typescript, pnpm, the CLI tools you forget you
+              installed — all current, all in one place.
+            </p>
+          </article>
+          <article class="feature-card">
+            <h3>Knows when the signer changes</h3>
+            <p>
+              Freshet flags any app suddenly signed by a <strong>new developer
+              certificate</strong> — the quiet signal of a hijacked update. Nobody else
+              surfaces this. It's the difference between updating and getting owned.
+            </p>
+          </article>
+          <article class="feature-card">
+            <h3>Tell me, don't touch it</h3>
+            <p>
+              <strong>Notify-only mode</strong> for the security-conscious: see what's
+              outdated without ever handing a tool the keys to install. Your Mac, your
+              call.
+            </p>
+          </article>
+          <article class="feature-card">
+            <h3>Bring loose apps into Homebrew</h3>
+            <p>
+              <strong>Guided adoption</strong> finds apps you installed by hand and pulls
+              them under Homebrew — so they update with everything else from then on.
+            </p>
+          </article>
+          <article class="feature-card">
+            <h3>One-click rollback <span class="tag">soon</span></h3>
+            <p>
+              Freshet snapshots an app before it swaps it. A bad update is one click away
+              from being undone — the safety net auto-updaters never give you.
+            </p>
+          </article>
+          <article class="feature-card">
+            <h3>Calm by design</h3>
+            <p>
+              No dashboard of a thousand options. No 150&nbsp;MB of Electron sitting in
+              your menu bar. A small, quiet tool that does one thing and gets out of your
+              way.
+            </p>
+          </article>
+        </div>
+      </section>
+
+      <!-- ───────────────── trust / philosophy ───────────────── -->
+      <section class="philosophy">
+        <h2>The version database is someone else's problem — on purpose.</h2>
+        <p>
+          The last great Mac updater died maintaining a private catalog of a hundred
+          thousand apps by hand. Freshet doesn't. It leans on the registries the
+          community already keeps current — Homebrew Cask, the App Store, npm — so it
+          never goes stale and never asks you to trust a catalog you can't see. The core
+          is <strong>open source</strong>, the binary is <strong>notarized and
+          signed</strong>, and nothing about your machine leaves it.
+        </p>
+      </section>
+
+      <!-- ───────────────── pricing ───────────────── -->
+      <section id="pricing" class="pricing">
+        <h2>Simple, honest pricing</h2>
+        <p class="pricing-sub">Free does the job. Pro does it for you, safely.</p>
+        <div class="price-grid">
+          <div class="price-card">
+            <h3>Free</h3>
+            <p class="price"><span>$0</span></p>
+            <p class="price-tag">The open-source core</p>
+            <ul>
+              <li>Every source: brew, casks, App Store, npm, Sparkle</li>
+              <li>Update manually, one click</li>
+              <li>Notify-only mode</li>
+              <li>Skip a version</li>
+              <li>Guided Homebrew adoption</li>
+            </ul>
+          </div>
+          <div class="price-card featured">
+            <span class="price-flag">Most popular</span>
+            <h3>Pro</h3>
+            <p class="price"><span>$29</span>/year</p>
+            <p class="price-tag">The autopilot &amp; safety net</p>
+            <ul>
+              <li>Everything in Free</li>
+              <li>Scheduled, unattended auto-updates</li>
+              <li>One-click rollback</li>
+              <li>Update-health warnings before you install</li>
+              <li>New-developer-certificate alerts</li>
+              <li>Sync across your Macs</li>
+            </ul>
+          </div>
+          <div class="price-card">
+            <h3>Team</h3>
+            <p class="price"><span>$5</span>/seat/mo</p>
+            <p class="price-tag">For the whole fleet</p>
+            <ul>
+              <li>Everything in Pro</li>
+              <li>Central update policy</li>
+              <li>Fleet overview</li>
+              <li>Update-health data API</li>
+            </ul>
+          </div>
+        </div>
+        <p class="pricing-foot">Pricing shown is planned for launch and may change. Early-access members get founder pricing.</p>
+      </section>
+
+      <!-- ───────────────── final CTA ───────────────── -->
+      <section id="waitlist" class="cta">
+        <h2>Be first on the fresh list.</h2>
+        <p>Early builds are going out to the waitlist now. Get in before launch.</p>
+        <form class="waitlist-form big" id="cta-form" action="https://formspree.io/f/YOUR_FORM_ID" method="POST">
+          <input
+            type="email"
+            name="email"
+            required
+            placeholder="you@example.com"
+            aria-label="Email address"
+          />
+          <button type="submit">Get early access</button>
+        </form>
+        <p class="form-note" id="cta-note">No spam. One email when it's ready.</p>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <span class="wordmark small">Freshet</span>
+      <span class="footer-tag">Keep your Mac fresh.</span>
+      <span class="footer-copy">© 2026 Freshet</span>
+    </footer>
+
+    <script src="./main.js"></script>
+  </body>
+</html>
