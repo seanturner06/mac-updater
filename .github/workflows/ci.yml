@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel in-flight runs for the same ref when a new push lands.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust (fmt + clippy + test)
+    # macOS-native: matches the target Freshet ships to and avoids the Linux-only
+    # GTK/WebKitGTK build deps that Tauri pulls in on Ubuntu.
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: src-tauri
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: cargo test
+        run: cargo test --all-features
+
+  web:
+    name: Web (lint + tsc + test + type-coverage)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: ESLint
+        run: pnpm lint
+
+      - name: TypeScript type-check
+        run: pnpm exec tsc --noEmit
+
+      - name: Vitest
+        run: pnpm test
+
+      - name: type-coverage
+        run: pnpm type-coverage
+
+  audit:
+    name: cargo-audit
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: src-tauri
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: cargo audit
+        # RUSTSEC-2024-0429 (glib 0.18.5 unsoundness) lives in the Linux-only
+        # GTK/WebKitGTK chain that Tauri pulls in on Ubuntu builds. Freshet ships
+        # macOS-only and `cargo tree --target aarch64-apple-darwin` confirms glib
+        # is not in the Mac dep tree. Remove this ignore when we add a Linux target.
+        run: cargo audit --ignore RUSTSEC-2024-0429
