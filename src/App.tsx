@@ -18,7 +18,11 @@ import "./App.css";
 const IGNORE_STORE = "freshet.skipped";
 function loadIgnored(): Set<string> {
   try {
-    return new Set(JSON.parse(localStorage.getItem(IGNORE_STORE) ?? "[]"));
+    const parsed: unknown = JSON.parse(localStorage.getItem(IGNORE_STORE) ?? "[]");
+    if (Array.isArray(parsed)) {
+      return new Set((parsed as unknown[]).filter((v): v is string => typeof v === "string"));
+    }
+    return new Set();
   } catch {
     return new Set();
   }
@@ -71,8 +75,8 @@ export default function App() {
   const [batchAdopting, setBatchAdopting] = useState(false);
 
   useEffect(() => {
-    checkNow();
-    invoke<boolean>("is_schedule_installed").then(setScheduleEnabled);
+    void checkNow();
+    void invoke<boolean>("is_schedule_installed").then(setScheduleEnabled);
   }, []);
 
   // Scan for adoptable apps each time the adopt panel opens.
@@ -80,10 +84,14 @@ export default function App() {
     if (!showAdopt) return;
     setAdoptSelected({});
     setSuggestLoading(true);
-    invoke<AdoptableApp[]>("suggest_adoptions")
+    void invoke<AdoptableApp[]>("suggest_adoptions")
       .then(setSuggestions)
-      .catch(() => setSuggestions([]))
-      .finally(() => setSuggestLoading(false));
+      .catch(() => {
+        setSuggestions([]);
+      })
+      .finally(() => {
+        setSuggestLoading(false);
+      });
   }, [showAdopt]);
 
   function persistIgnored(next: Set<string>) {
@@ -156,7 +164,7 @@ export default function App() {
   async function verifySignatures() {
     setVerifying(true);
     setVerifyProgress({ done: 0, total: 0 });
-    let unlisten = () => {};
+    let unlisten: (() => void) | null = null;
     try {
       unlisten = await listen<{ done: number; total: number }>(
         "verify-progress",
@@ -169,7 +177,7 @@ export default function App() {
       const res = await invoke<UpdateResult[]>("verify_signatures");
       showResults("Signature check", res);
     } finally {
-      unlisten();
+      unlisten?.();
       setVerifying(false);
     }
   }
@@ -261,7 +269,7 @@ export default function App() {
 
   // Keep the menu-bar badge in sync with the visible update count.
   useEffect(() => {
-    invoke("set_badge", { count: totalOutdated });
+    void invoke("set_badge", { count: totalOutdated });
   }, [totalOutdated]);
 
   return (
@@ -364,7 +372,7 @@ export default function App() {
                             onClick={(e) => {
                               e.preventDefault();
                               e.stopPropagation();
-                              invoke("open_url", { url: item.notes_url });
+                              void invoke("open_url", { url: item.notes_url });
                             }}
                           >
                             ↗
@@ -543,7 +551,7 @@ export default function App() {
               disabled={verifying}
               onClick={() => {
                 setShowSettings(false);
-                verifySignatures();
+                void verifySignatures();
               }}
             >
               <span>{verifying ? "Verifying signatures…" : "Verify app signatures"}</span>
@@ -647,7 +655,7 @@ function AdoptPanel({
       return;
     }
     setInfoOpen(token);
-    if (!infoData[token]) {
+    if (!(token in infoData)) {
       setInfoLoading(token);
       try {
         const info = await invoke<CaskInfo | null>("cask_info", { token });
@@ -684,7 +692,7 @@ function AdoptPanel({
             <input
               type="checkbox"
               className="check"
-              checked={!!adoptSelected[s.token]}
+              checked={adoptSelected[s.token] ?? false}
               onChange={() => onToggleSelect(s.token)}
               disabled={batchAdopting}
             />
@@ -823,7 +831,7 @@ function ResultsPanel({
 
       <div className="results-body">
         {results.map((r, i) => {
-          const open = !!openLogs[i];
+          const open = openLogs[i] ?? false;
           return (
             <div key={i} className={`result-row ${r.success ? "ok" : "fail"}`}>
               <button
