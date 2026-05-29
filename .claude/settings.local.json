@@ -33,7 +33,9 @@
       "Bash(npx vite *)",
       "Bash(python3 -)",
       "Bash(cd *)",
-      "WebSearch"
+      "WebSearch",
+      "Bash(pnpm test *)",
+      "Bash(npx vitest *)"
     ]
   }
 }

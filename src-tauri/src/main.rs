@@ -382,6 +382,82 @@ fn is_safe_url(url: &str) -> bool {
         && url.chars().all(|c| !c.is_control() && c != ' ')
 }
 
+// Pull the host out of an http(s) URL (no scheme, no port, no path, no userinfo). Returns
+// None for anything that doesn't look like an http(s) URL with a non-empty host. Hand-rolled
+// because std doesn't ship a URL parser and a dep just for this is overkill.
+fn url_host(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let end = rest
+        .find(|c: char| matches!(c, '/' | '?' | '#'))
+        .unwrap_or(rest.len());
+    let authority = &rest[..end];
+    // Strip any "user:pass@" prefix.
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    // IPv6 literals look like "[::1]" or "[fe80::1]:443".
+    let host = if let Some(stripped) = host_port.strip_prefix('[') {
+        let close = stripped.find(']')?;
+        &stripped[..close]
+    } else {
+        // IPv4 / DNS — strip the optional ":port".
+        host_port.split(':').next().unwrap_or(host_port)
+    };
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_lowercase())
+    }
+}
+
+// Hostnames and IP ranges we refuse to talk to when fetching app-supplied URLs (Sparkle feeds).
+// Mitigates SSRF from a hostile local app that points its SUFeedURL at internal infrastructure
+// (e.g. 169.254.169.254 cloud-metadata, 192.168/16 routers, localhost services). DNS rebinding
+// can bypass an IP-literal check; we accept that as a known limitation.
+fn is_local_or_private_host(host: &str) -> bool {
+    if host == "localhost"
+        || host.ends_with(".local")
+        || host.ends_with(".localhost")
+        || host.ends_with(".internal")
+    {
+        return true;
+    }
+    if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+        return ip.is_private()
+            || ip.is_loopback()
+            || ip.is_link_local()
+            || ip.is_unspecified()
+            || ip.is_broadcast()
+            // Carrier-grade NAT (RFC 6598) — not in std's helpers.
+            || (ip.octets()[0] == 100 && (ip.octets()[1] & 0xc0) == 64);
+    }
+    if let Ok(ip) = host.parse::<std::net::Ipv6Addr>() {
+        let first = ip.segments()[0];
+        return ip.is_loopback()
+            || ip.is_unspecified()
+            // Unique-local fc00::/7
+            || (first & 0xfe00) == 0xfc00
+            // Link-local fe80::/10
+            || (first & 0xffc0) == 0xfe80;
+    }
+    false
+}
+
+// Stricter than is_safe_url: used for app-supplied Sparkle feed URLs that we (Freshet, not the
+// user's browser) will fetch over the network. https only and no internal/private hosts.
+fn is_safe_feed_url(url: &str) -> bool {
+    if !url.starts_with("https://") || url.len() > 2048 {
+        return false;
+    }
+    if url.chars().any(|c| c.is_control() || c == ' ') {
+        return false;
+    }
+    match url_host(url) {
+        Some(host) => !is_local_or_private_host(&host),
+        None => false,
+    }
+}
+
 // Mac App Store ADAM IDs are numeric.
 fn is_numeric_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 20 && id.bytes().all(|b| b.is_ascii_digit())
@@ -564,6 +640,10 @@ fn check_sparkle() -> CategoryStatus {
         .filter_map(|path| {
             let info = format!("{}/Contents/Info", path.to_str()?);
             let feed = read_plist_string(&info, "SUFeedURL")?;
+            // Don't follow a hostile app's appcast into private/loopback hosts.
+            if !is_safe_feed_url(&feed) {
+                return None;
+            }
             let current = read_plist_string(&info, "CFBundleShortVersionString").unwrap_or_default();
             let name = path.file_stem()?.to_str()?.to_string();
             Some((name, feed, current))
@@ -750,13 +830,28 @@ fn set_badge(app: tauri::AppHandle, count: u32) {
     }
 }
 
+// `brew --cache` shells out and is stable for the life of the process, so memoize it.
+// Returning &'static Path so callers don't have to clone for the common read-only use.
+fn brew_cache_dir() -> Option<&'static Path> {
+    static CACHE: OnceLock<Option<PathBuf>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let out = Command::new("brew").arg("--cache").output().ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            let base = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if base.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(base))
+            }
+        })
+        .as_deref()
+}
+
 fn cask_jws_path() -> Option<PathBuf> {
-    let out = Command::new("brew").arg("--cache").output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let base = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let mut p = PathBuf::from(base);
+    let mut p = brew_cache_dir()?.to_path_buf();
     p.push("api");
     p.push("cask.jws.json");
     Some(p)
@@ -1068,6 +1163,14 @@ fn save_signing_store(map: &HashMap<String, String>) {
     }
 }
 
+// Serializes the load → mutate → save sequence so two concurrent verify_signatures runs (e.g. a
+// future scheduled background scan racing the manual button) can't lose updates to signing.json.
+// Cross-process races aren't covered — that's a "last writer wins" we accept.
+fn signing_store_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
 #[derive(Clone, Serialize)]
 struct VerifyProgress {
     done: usize,
@@ -1104,6 +1207,12 @@ async fn verify_signatures(app: tauri::AppHandle) -> Vec<UpdateResult> {
         }
     }
 
+    // Held across the load → mutate → save so concurrent verify_signatures runs can't lose
+    // updates. Lock poisoning is harmless here (store is just a serializable HashMap), so
+    // recover instead of panicking on a previous panic.
+    let guard = signing_store_lock()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let mut store = load_signing_store();
     let mut results = Vec::new();
     for sig in &sigs {
@@ -1146,6 +1255,7 @@ async fn verify_signatures(app: tauri::AppHandle) -> Vec<UpdateResult> {
         });
     }
     save_signing_store(&store);
+    drop(guard);
 
     // Flagged apps first (they auto-expand and need attention); verified publishers after.
     results.sort_by_key(|r| r.success);
@@ -1751,6 +1861,75 @@ mod tests {
         let (team, auth) = parse_signing(out);
         assert_eq!(team.as_deref(), Some("ABC123"));
         assert_eq!(auth.as_deref(), Some("Leaf Signer"));
+    }
+
+    #[test]
+    fn url_host_extracts_hostname() {
+        assert_eq!(url_host("https://example.com/path").as_deref(), Some("example.com"));
+        assert_eq!(url_host("https://Example.COM").as_deref(), Some("example.com"));
+        assert_eq!(url_host("http://example.com:8080/x").as_deref(), Some("example.com"));
+        assert_eq!(url_host("https://user:pass@example.com/x").as_deref(), Some("example.com"));
+        assert_eq!(url_host("https://[::1]:443/x").as_deref(), Some("::1"));
+        assert_eq!(url_host("https://[fe80::1]/x").as_deref(), Some("fe80::1"));
+        // Path / query / fragment terminate the host.
+        assert_eq!(url_host("https://example.com?q=1").as_deref(), Some("example.com"));
+        assert_eq!(url_host("https://example.com#frag").as_deref(), Some("example.com"));
+        // Non-http(s) and malformed cases.
+        assert_eq!(url_host("file:///etc/passwd"), None);
+        assert_eq!(url_host("https://"), None);
+        assert_eq!(url_host("https://[unclosed"), None);
+    }
+
+    #[test]
+    fn private_host_rejection() {
+        // Loopback / private / link-local / unspecified / broadcast / CGNAT.
+        assert!(is_local_or_private_host("localhost"));
+        assert!(is_local_or_private_host("foo.local"));
+        assert!(is_local_or_private_host("intranet.internal"));
+        assert!(is_local_or_private_host("box.localhost"));
+        assert!(is_local_or_private_host("127.0.0.1"));
+        assert!(is_local_or_private_host("10.0.0.1"));
+        assert!(is_local_or_private_host("192.168.1.1"));
+        assert!(is_local_or_private_host("172.16.0.1"));
+        assert!(is_local_or_private_host("172.31.255.255"));
+        assert!(is_local_or_private_host("169.254.169.254"), "AWS metadata");
+        assert!(is_local_or_private_host("0.0.0.0"));
+        assert!(is_local_or_private_host("255.255.255.255"));
+        assert!(is_local_or_private_host("100.64.0.1"), "carrier-grade NAT");
+        assert!(is_local_or_private_host("100.127.255.255"), "CGNAT upper");
+        assert!(is_local_or_private_host("::1"));
+        assert!(is_local_or_private_host("::"), "IPv6 unspecified");
+        assert!(is_local_or_private_host("fc00::1"), "ULA");
+        assert!(is_local_or_private_host("fd12:3456:789a::1"), "ULA");
+        assert!(is_local_or_private_host("fe80::1"), "link-local v6");
+        // Public — must NOT be flagged.
+        assert!(!is_local_or_private_host("example.com"));
+        assert!(!is_local_or_private_host("github.com"));
+        assert!(!is_local_or_private_host("8.8.8.8"));
+        assert!(!is_local_or_private_host("172.32.0.1"), "just outside private range");
+        assert!(!is_local_or_private_host("100.63.255.255"), "just outside CGNAT");
+        assert!(!is_local_or_private_host("100.128.0.1"), "just outside CGNAT");
+        assert!(!is_local_or_private_host("2606:4700:4700::1111"), "Cloudflare v6");
+    }
+
+    #[test]
+    fn feed_url_requires_https_and_public_host() {
+        assert!(is_safe_feed_url("https://obsproject.com/osx_update/updates.xml"));
+        // http is rejected outright — Sparkle 2 requires https; older feeds can MITM us.
+        assert!(!is_safe_feed_url("http://obsproject.com/osx_update/updates.xml"));
+        assert!(!is_safe_feed_url("file:///etc/passwd"));
+        assert!(!is_safe_feed_url("javascript:alert(1)"));
+        // SSRF-style hostile feeds.
+        assert!(!is_safe_feed_url("https://localhost/x.xml"));
+        assert!(!is_safe_feed_url("https://127.0.0.1/x.xml"));
+        assert!(!is_safe_feed_url("https://192.168.1.1/x.xml"));
+        assert!(!is_safe_feed_url("https://169.254.169.254/latest/meta-data/"));
+        assert!(!is_safe_feed_url("https://[::1]/x.xml"));
+        assert!(!is_safe_feed_url("https://router.local/x.xml"));
+        // Junk.
+        assert!(!is_safe_feed_url(""));
+        assert!(!is_safe_feed_url("https://e.com/ x"));
+        assert!(!is_safe_feed_url(&format!("https://e.com/{}", "a".repeat(2050))));
     }
 
     #[test]
