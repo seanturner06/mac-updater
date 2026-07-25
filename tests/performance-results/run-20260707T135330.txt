@@ -1,0 +1,209 @@
+Freshet live performance run
+Timestamp: 2026-07-07T13:53:30
+Machine:   Darwin 25.5.0 arm64
+Install phase: YES
+
+Detected outdated at run time:
+  formulae (24): awscli, c-ares, edencommon, fb303, fbthrift, ffmpeg, fizz, folly, gh, git, imagemagick, jpeg-turbo, libevent, libnghttp3, libngtcp2, libtiff, mbedtls@3, openssl@3, python@3.13, sdl3, sqlite, vim, wangle, watchman
+  casks (2): discord, slack
+  npm globals (2): npm, pnpm
+  mas apps (3): 462058435, 462062816, 462054704
+
+========================================================================
+DOWNLOAD PHASE — concurrent `brew fetch` (pool size 6)
+========================================================================
+
+item                         kind     size(MB)   time(s)       MB/s  status
+----------------------------------------------------------------------------------------
+discord                      cask       189.26      6.64      28.49  OK
+slack                        cask       109.72      5.98      18.36  OK
+awscli                       formula      22.56      2.52       8.94  OK
+c-ares                       formula       0.29      1.55       0.19  OK
+edencommon                   formula       0.42      1.59       0.27  OK
+fb303                        formula       0.76      1.57       0.48  OK
+fbthrift                     formula       8.44      1.92       4.40  OK
+ffmpeg                       formula      20.21      2.20       9.17  OK
+fizz                         formula       0.67      1.34       0.50  OK
+folly                        formula       7.37      1.72       4.27  OK
+gh                           formula      12.81      2.20       5.82  OK
+git                          formula      21.98      1.99      11.07  OK
+imagemagick                  formula      10.81      2.04       5.29  OK
+jpeg-turbo                   formula       1.28      1.25       1.02  OK
+libevent                     formula       0.69      1.41       0.49  OK
+libnghttp3                   formula       0.18      1.30       0.14  OK
+libngtcp2                    formula       0.40      1.20       0.34  OK
+libtiff                      formula       1.87      1.26       1.49  OK
+mbedtls@3                    formula       3.56      2.06       1.73  OK
+openssl@3                    formula      10.41      1.53       6.80  OK
+python@3.13                  formula      17.60      1.57      11.18  OK
+sdl3                         formula       1.51      1.33       1.14  OK
+sqlite                       formula       2.34      1.48       1.58  OK
+vim                          formula      13.94      1.53       9.10  OK
+wangle                       formula       0.89      1.21       0.74  OK
+watchman                     formula       3.27      1.26       2.60  OK
+----------------------------------------------------------------------------------------
+
+Items fetched .................. 26 (26 ok, 0 failed)
+New bytes downloaded ........... 463.22 MB
+Batch wall-clock (concurrent) .. 17.80 s
+Sum of per-item fetch time ..... 51.66 s  (what a sequential run would spend downloading)
+Concurrency speedup ............ 2.90x
+AGGREGATE throughput ........... 26.03 MB/s  (new bytes / batch wall-clock)
+Per-stream avg throughput ...... 8.97 MB/s  (new bytes / summed fetch time)
+
+========================================================================
+INSTALL PHASE
+========================================================================
+-> brew upgrade --formula (24 formulae, installing from warmed cache)…
+-> brew upgrade --cask discord slack…
+-> npm update -g…
+-> mas upgrade 462058435…
+-> mas upgrade 462062816…
+-> mas upgrade 462054704…
+
+Step results:
+  [OK ] brew upgrade --formula
+  [OK ] brew upgrade --cask
+  [OK ] npm update -g
+  [FAIL] mas upgrade 462058435  — sudo: a password is required
+  [FAIL] mas upgrade 462062816  — sudo: a password is required
+  [FAIL] mas upgrade 462054704  — sudo: a password is required
+
+Re-checking outdated set to confirm per-item success…
+
+Formulae (24 attempted):
+  [OK ] awscli
+  [OK ] c-ares
+  [OK ] edencommon
+  [OK ] fb303
+  [OK ] fbthrift
+  [OK ] ffmpeg
+  [OK ] fizz
+  [OK ] folly
+  [OK ] gh
+  [OK ] git
+  [OK ] imagemagick
+  [OK ] jpeg-turbo
+  [OK ] libevent
+  [OK ] libnghttp3
+  [OK ] libngtcp2
+  [OK ] libtiff
+  [OK ] mbedtls@3
+  [OK ] openssl@3
+  [OK ] python@3.13
+  [OK ] sdl3
+  [OK ] sqlite
+  [OK ] vim
+  [OK ] wangle
+  [OK ] watchman
+
+Casks (2 attempted):
+  [OK ] discord
+  [OK ] slack
+
+npm globals (2 attempted):
+  [OK ] npm
+  [OK ] pnpm
+
+mas apps (3 attempted):
+  [FAIL] 462058435 — still outdated after upgrade; sudo: a password is required
+  [FAIL] 462062816 — still outdated after upgrade; sudo: a password is required
+  [FAIL] 462054704 — still outdated after upgrade; sudo: a password is required
+
+INSTALL SUCCESS RATE ........... 28/31 (90%)
+
+========================================================================
+ANALYSIS & NOTES (methodology + requirement mapping)
+========================================================================
+Required metric                         Result
+--------------------------------------  --------------------------------
+Download throughput, per update         see per-item MB/s column above
+Download throughput, aggregate          26.03 MB/s (463.22 MB / 17.80 s wall)
+Total download time (concurrent batch)  17.80 s wall-clock
+Sequential-equivalent download time     51.66 s (sum of per-item fetch time)
+Concurrency speedup                     2.90x
+Per-update success/failure + reason     download 26/26 OK; install per-item above
+Overall install success rate            28/31 (90%)
+
+CONCURRENCY (Workstream-2 defect fixed)
+  The product code previously downloaded selected updates one at a time (each
+  `brew upgrade <item>` downloads then installs, serially). The fix adds a
+  concurrent pre-fetch: prefetch_selected() runs `brew fetch` for all selected
+  formulae/casks in a bounded parallel pool (chunks of 6) BEFORE the serialized
+  install loop, so the network transfers overlap. This harness exercises that same
+  design and measured a 2.90x wall-clock reduction on the download portion
+  (17.80 s vs 51.66 s) for this machine's 26 outdated brew items (463 MB). The
+  subsequent `brew upgrade` then installs from the warmed cache with no
+  re-download.
+
+PASSWORD HANDLING (Workstream-2 requirement) — observed behavior
+  The 24 formulae, 2 casks, and 2 npm globals installed WITHOUT elevation and all
+  succeeded. The 3 Mac App Store apps require elevation and were reported as clean,
+  ISOLATED failures ("sudo: a password is required") — they did NOT block or fail
+  any of the non-privileged updates. That matches the requirement: "proceed to
+  update everything that does not require a password, and cleanly skip the ones
+  that do," with a specific reason recorded per skipped item.
+
+  Root cause of the mas failures (worth noting for the product): SUDO_ASKPASS was
+  exported (the same GUI-dialog helper the app uses), but `mas` invokes `sudo`
+  WITHOUT the `-A` flag, so sudo does not consult the askpass helper and, with no
+  TTY in a spawned process, fails with "a password is required". Homebrew, by
+  contrast, honors SUDO_ASKPASS. Net effect is still correct (privileged items
+  skip cleanly, everything else proceeds), but the native password dialog will not
+  appear for mas upgrades. Options for the product: (a) surface a clear "sign in to
+  the App Store / this app needs admin — update via the App Store app" hint for
+  mas elevation failures (Freshet already has maybe_append_mas_hint for the
+  different-Apple-ID case; a sudo-required hint could join it), or (b) run mas
+  under `sudo -A` explicitly when elevation is expected. No code change was made
+  here beyond the concurrency fix; this is recorded as a finding.
+
+METHODOLOGY
+  - "Outdated" was detected live at run time from `brew outdated --json=v2`,
+    `npm outdated -g --json`, and `mas outdated` — no hardcoded/mocked targets.
+  - Download bytes are measured from the actual artifact landing in Homebrew's
+    cache (brew --cache path, size delta vs. pre-fetch). Items already fully cached
+    contribute 0 new bytes and are excluded from throughput.
+  - Per-item fetch duration times each `brew fetch` subprocess; batch wall-clock is
+    the real span from first fetch start to last fetch finish under a 6-way pool.
+  - Per-item install success is confirmed by re-running the outdated checks after
+    the install phase and diffing: an item absent from the post-run outdated set
+    succeeded; one still present failed (reason from the step's captured output).
+  - Harness: tests/performance-harness.py (re-runnable; `--no-install` for a
+    download-only measurement). Mirrors the app's operations and prefetch pool size.
+
+========================================================================
+ADDENDUM — where the 17.80 s actually went (post-run analysis)
+========================================================================
+17.80 s wall for 463 MB is ~26 MB/s aggregate, which is only ~one big stream's
+worth (discord alone hit 28.5 MB/s) — the 6-way pool did NOT multiply bandwidth.
+Investigated; the wall-clock was dominated by tool overhead, not the network:
+
+  - `brew --cache <item>` costs ~1.1 s each (it resolves the formula's metadata,
+    not mere process startup — `brew --version` is 0.07 s). This harness ran ONE
+    such probe per item BEFORE each timed fetch, inside the worker: 26 × 1.1 s
+    ≈ 28 s of metadata work over 6 workers ≈ ~5 s of wall-clock that was neither
+    network nor counted in the per-item fetch column. Pure measurement overhead.
+  - The 24 formulae are OVERHEAD-bound, not bandwidth-bound: a 0.3 MB formula
+    showing ~1.5 s is ~1.2 s brew/Ruby resolution + ~0.3 s transfer. Spawning 26
+    separate `brew fetch` processes pays that fixed cost 26 times.
+  - The two casks are 65% of the bytes (299/463 MB) and gate the floor at ~6.6 s
+    regardless of pool size. Single-stream ceiling ~28 MB/s (~228 Mbit/s) — link
+    or ghcr/CDN per-connection cap, not a concurrency failure.
+
+Environment fact discovered afterward: Homebrew 6.0.8 sets
+HOMEBREW_DOWNLOAD_CONCURRENCY = 16 — brew already downloads 16-way concurrently
+WITHIN a single command. A batched `brew fetch git gh vim sqlite openssl@3`
+completed in 1.12 s (one metadata load) vs ~7.5 s as five separate processes.
+
+CODE UPDATED AS A RESULT
+  prefetch_selected() was rewritten from "one `brew fetch` process per token
+  (chunks of 6)" to "one batched `brew fetch` per kind" (formulae in one call,
+  casks in another, the two overlapping on separate threads). This loads metadata
+  once per kind and hands the actual parallelism to brew's native 16-way
+  downloader instead of fighting it with an external thread pool — removing the
+  per-token startup tax that inflated this run. Verified: tests still pass.
+
+  NOTE: a clean re-measurement would require clearing the brew cache (everything
+  is installed/cached now), so the numbers above stand as the recorded live run;
+  the code change is validated by the batched-vs-per-process timing (1.12 s vs
+  ~7.5 s) and the confirmed concurrency setting.

@@ -10,12 +10,30 @@ import {
   toggleSelected,
   toggleCategorySelected,
   prunedSelfUpdating,
+  allDisplayedSelections,
   type CategoryStatus,
   type Selection,
 } from "./logic";
 import "./App.css";
 
 const IGNORE_STORE = "freshet.skipped";
+const GREEDY_STORE = "freshet.greedy";
+const NOTIFY_STORE = "freshet.notifyOnly";
+
+function loadFlag(key: string): boolean {
+  try {
+    return localStorage.getItem(key) === "1";
+  } catch {
+    return false;
+  }
+}
+function saveFlag(key: string, value: boolean) {
+  try {
+    localStorage.setItem(key, value ? "1" : "0");
+  } catch {
+    // Storage unavailable — the toggle still works, it just won't survive a relaunch.
+  }
+}
 function loadIgnored(): Set<string> {
   try {
     const parsed: unknown = JSON.parse(localStorage.getItem(IGNORE_STORE) ?? "[]");
@@ -29,6 +47,7 @@ function loadIgnored(): Set<string> {
 }
 
 type UpdateResult = { kind: string; name: string; success: boolean; output: string };
+type ScheduleStatus = { installed: boolean; hour: number | null; minute: number | null };
 type CaskSuggestion = { token: string; installed: boolean };
 type AdoptableApp = { name: string; token: string };
 type CaskInfo = {
@@ -53,8 +72,8 @@ export default function App() {
   const [results, setResults] = useState<UpdateResult[] | null>(null);
   const [resultsTitle, setResultsTitle] = useState("Update results");
   const [openLogs, setOpenLogs] = useState<Record<number, boolean>>({});
-  const [greedy, setGreedy] = useState(false);
-  const [notifyOnly, setNotifyOnly] = useState(false);
+  const [greedy, setGreedy] = useState(() => loadFlag(GREEDY_STORE));
+  const [notifyOnly, setNotifyOnly] = useState(() => loadFlag(NOTIFY_STORE));
   const [verifying, setVerifying] = useState(false);
   const [ignored, setIgnored] = useState<Set<string>>(loadIgnored);
   const [verifyProgress, setVerifyProgress] = useState<{ done: number; total: number }>({
@@ -76,7 +95,16 @@ export default function App() {
 
   useEffect(() => {
     void checkNow();
-    void invoke<boolean>("is_schedule_installed").then(setScheduleEnabled);
+    // Reflect the schedule that's actually installed (launchd plist), not defaults.
+    void invoke<ScheduleStatus>("get_schedule")
+      .then((s) => {
+        setScheduleEnabled(s.installed);
+        if (s.hour !== null) setHour(s.hour);
+        if (s.minute !== null) setMinute(s.minute);
+      })
+      .catch(() => {
+        setScheduleEnabled(false);
+      });
   }, []);
 
   // Scan for adoptable apps each time the adopt panel opens.
@@ -122,6 +150,9 @@ export default function App() {
       setCategories(result);
       setSelected({});
       setLastChecked(new Date());
+    } catch {
+      // IPC failure (should be rare — the command itself never rejects). Keep the
+      // previous list rather than blanking the window.
     } finally {
       setLoading(false);
     }
@@ -131,7 +162,13 @@ export default function App() {
   // now-hidden self-updating items from the selection so they aren't silently updated.
   function applyGreedy(next: boolean) {
     setGreedy(next);
+    saveFlag(GREEDY_STORE, next);
     if (!next) setSelected((prev) => prunedSelfUpdating(prev, categories));
+  }
+
+  function applyNotifyOnly(next: boolean) {
+    setNotifyOnly(next);
+    saveFlag(NOTIFY_STORE, next);
   }
 
   function toggleItem(kind: string, id: string, name: string) {
@@ -150,11 +187,32 @@ export default function App() {
     setResults(res);
   }
 
-  async function runUpdate(promise: Promise<UpdateResult[]>) {
+  // Tokens of casks we just upgraded; the post-update verify resolves these to .app filenames
+  // via brew's local metadata and inspects only those bundles (vs. all of /Applications).
+  async function runUpdate(promise: Promise<UpdateResult[]>, caskTokens: string[]) {
     setUpdating(true);
     try {
-      const res = await promise;
-      showResults("Update results", res);
+      const updateRes = await promise;
+
+      // If a `brew upgrade` pulled in a binary signed by a *different* developer than last time
+      // — the hijacked-release signal — surface it now, while the user is looking. Targeted so
+      // a 5-cask upgrade verifies 5 apps, not all 150 in /Applications.
+      let flagged: UpdateResult[] = [];
+      if (caskTokens.length > 0) {
+        try {
+          flagged = await invoke<UpdateResult[]>("verify_updated_casks", { tokens: caskTokens });
+        } catch {
+          // Best effort. Never block the update results panel on the signature check.
+        }
+      }
+
+      if (flagged.length > 0) {
+        const n = flagged.length;
+        const title = `Update results — ⚠ ${n} signer change${n === 1 ? "" : "s"}`;
+        showResults(title, [...flagged, ...updateRes]);
+      } else {
+        showResults("Update results", updateRes);
+      }
       await checkNow();
     } finally {
       setUpdating(false);
@@ -230,28 +288,47 @@ export default function App() {
     }
   }
 
+  // "Update all" = update exactly what's displayed. Runs per-item selections (not a blanket
+  // `brew upgrade`) so skipped versions and hidden self-updating casks stay untouched.
   async function updateAll() {
-    await runUpdate(invoke<UpdateResult[]>("run_updates"));
+    const selections = allDisplayedSelections(categories, greedy, ignored);
+    if (selections.length === 0) return;
+    const caskTokens = selections.filter((s) => s.kind === "cask").map((s) => s.id);
+    await runUpdate(invoke<UpdateResult[]>("run_selected_updates", { selections }), caskTokens);
   }
 
   async function updateSelected() {
     const selections = Object.values(selected);
     if (selections.length === 0) return;
-    await runUpdate(invoke<UpdateResult[]>("run_selected_updates", { selections }));
+    const caskTokens = selections.filter((s) => s.kind === "cask").map((s) => s.id);
+    await runUpdate(
+      invoke<UpdateResult[]>("run_selected_updates", { selections }),
+      caskTokens,
+    );
   }
 
   async function toggleSchedule(enabled: boolean) {
-    if (enabled) {
-      await invoke("install_schedule", { hour, minute });
-    } else {
-      await invoke("uninstall_schedule");
+    try {
+      if (enabled) {
+        await invoke("install_schedule", { hour, minute });
+      } else {
+        await invoke("uninstall_schedule");
+      }
+      setScheduleEnabled(enabled);
+    } catch {
+      // launchctl failed — leave the toggle reflecting the real (unchanged) state.
     }
-    setScheduleEnabled(enabled);
   }
 
-  async function updateScheduleTime() {
+  // Takes the new time explicitly: reading `hour`/`minute` state here would see the values
+  // from the render the handler was created in (stale closure), installing the old time.
+  function changeScheduleTime(h: number, m: number) {
+    setHour(h);
+    setMinute(m);
     if (scheduleEnabled) {
-      await invoke("install_schedule", { hour, minute });
+      void invoke("install_schedule", { hour: h, minute: m }).catch(() => {
+        // Keep the picker values; the next successful toggle rewrites the plist.
+      });
     }
   }
 
@@ -262,6 +339,9 @@ export default function App() {
   const displayCategories = [...categories, sparkleCategory];
 
   const totalOutdated = countDisplayed(displayCategories, greedy, ignored);
+  // What "Update all" would actually run — excludes sparkle (read-only), so the button is
+  // disabled when only self-updating apps have updates.
+  const updatableCount = allDisplayedSelections(categories, greedy, ignored).length;
   const selectedCount = Object.keys(selected).length;
   const allCurrent = !loading && !sparkleLoading && totalOutdated === 0;
   const verifyPct =
@@ -274,7 +354,7 @@ export default function App() {
 
   return (
     <div className="app">
-      <div className="header">
+      <div className="header" data-tauri-drag-region>
         <div className="header-left">
           <div className={`status-dot ${allCurrent ? "ok" : totalOutdated > 0 ? "warn" : "idle"}`} />
           <div>
@@ -290,7 +370,7 @@ export default function App() {
             </div>
           </div>
         </div>
-        <div className="header-actions">
+        <div className="header-actions" data-tauri-drag-region="false">
           <button className="icon-btn" onClick={() => checkNow()} disabled={loading || verifying} title="Refresh">
             <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.5">
               <path d="M2 8a6 6 0 0 1 10.5-4M14 8a6 6 0 0 1-10.5 4M12 2v3h-3M4 14v-3h3" strokeLinecap="round" strokeLinejoin="round"/>
@@ -323,6 +403,7 @@ export default function App() {
                       if (el) el.indeterminate = selectedInCat > 0 && !allInCatSelected;
                     }}
                     onChange={() => toggleCategory(cat)}
+                    disabled={updating}
                     title="Select all in category"
                   />
                 )}
@@ -401,12 +482,13 @@ export default function App() {
                       );
                     }
                     return (
-                      <label key={item.id} className="item">
+                      <label key={item.id} className={`item${updating ? " item-locked" : ""}`}>
                         <input
                           type="checkbox"
                           className="check item-check"
                           checked={selKey(cat.kind, item.id) in selected}
                           onChange={() => toggleItem(cat.kind, item.id, item.name)}
+                          disabled={updating}
                         />
                         <span className="item-name">{item.name}</span>
                         {versions}
@@ -442,7 +524,7 @@ export default function App() {
             <button
               className="btn-secondary"
               onClick={updateAll}
-              disabled={updating || loading || totalOutdated === 0}
+              disabled={updating || loading || updatableCount === 0}
             >
               Update all
             </button>
@@ -451,7 +533,7 @@ export default function App() {
       </div>
 
 
-      <div className="footer">
+      <div className="footer" data-tauri-drag-region>
         {lastChecked && (
           <span>last checked {lastChecked.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
         )}
@@ -459,11 +541,11 @@ export default function App() {
 
       {showSettings && (
         <div className="results-overlay">
-          <div className="results-header">
+          <div className="results-header" data-tauri-drag-region>
             <div>
               <div className="results-title">Settings</div>
             </div>
-            <button className="icon-btn" onClick={() => setShowSettings(false)} title="Done">
+            <button className="icon-btn" onClick={() => setShowSettings(false)} title="Done" data-tauri-drag-region="false">
               <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.6">
                 <path d="M4 4l8 8M12 4l-8 8" strokeLinecap="round" />
               </svg>
@@ -487,33 +569,32 @@ export default function App() {
                 <div className="settings-sub">{notifyOnly ? "showing updates; won't install" : "updates can be installed"}</div>
               </div>
               <label className="toggle">
-                <input type="checkbox" checked={notifyOnly} onChange={(e) => setNotifyOnly(e.target.checked)} />
+                <input type="checkbox" checked={notifyOnly} onChange={(e) => applyNotifyOnly(e.target.checked)} />
                 <span className="toggle-slider" />
               </label>
             </div>
 
             <div className="settings-label">Automatic updates</div>
-            <div className="settings-row">
-              <div className="settings-text">
-                <div className="settings-title">Auto-update daily</div>
-                <div className="settings-sub">
-                  {scheduleEnabled
-                    ? `runs at ${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`
-                    : "off"}
+            <div className="settings-row settings-row-col">
+              <div className="settings-row-main">
+                <div className="settings-text">
+                  <div className="settings-title">Auto-update daily</div>
+                  <div className="settings-sub">
+                    {scheduleEnabled
+                      ? `runs at ${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`
+                      : `will run at ${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`}
+                  </div>
                 </div>
+                <label className="toggle">
+                  <input type="checkbox" checked={scheduleEnabled} onChange={(e) => toggleSchedule(e.target.checked)} />
+                  <span className="toggle-slider" />
+                </label>
               </div>
-              <label className="toggle">
-                <input type="checkbox" checked={scheduleEnabled} onChange={(e) => toggleSchedule(e.target.checked)} />
-                <span className="toggle-slider" />
-              </label>
-            </div>
-            {scheduleEnabled && (
               <div className="time-picker">
                 <select
                   value={hour}
                   onChange={(e) => {
-                    setHour(parseInt(e.target.value));
-                    setTimeout(updateScheduleTime, 0);
+                    changeScheduleTime(parseInt(e.target.value, 10), minute);
                   }}
                 >
                   {Array.from({ length: 24 }, (_, i) => (
@@ -524,8 +605,7 @@ export default function App() {
                 <select
                   value={minute}
                   onChange={(e) => {
-                    setMinute(parseInt(e.target.value));
-                    setTimeout(updateScheduleTime, 0);
+                    changeScheduleTime(hour, parseInt(e.target.value, 10));
                   }}
                 >
                   {[0, 15, 30, 45].map((m) => (
@@ -533,7 +613,7 @@ export default function App() {
                   ))}
                 </select>
               </div>
-            )}
+            </div>
 
             <div className="settings-label">Tools</div>
             <button
@@ -667,14 +747,14 @@ function AdoptPanel({
   }
   return (
     <div className="results-overlay">
-      <div className="results-header">
+      <div className="results-header" data-tauri-drag-region>
         <div>
           <div className="results-title">Adopt into Homebrew</div>
           <div className="results-summary">
             <span>bring a manually-installed app under brew, so it can update here</span>
           </div>
         </div>
-        <button className="icon-btn" onClick={onClose} title="Done">
+        <button className="icon-btn" onClick={onClose} title="Done" data-tauri-drag-region="false">
           <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.6">
             <path d="M4 4l8 8M12 4l-8 8" strokeLinecap="round" />
           </svg>
@@ -814,7 +894,7 @@ function ResultsPanel({
 
   return (
     <div className="results-overlay">
-      <div className="results-header">
+      <div className="results-header" data-tauri-drag-region>
         <div>
           <div className="results-title">{title}</div>
           <div className="results-summary">
@@ -822,7 +902,7 @@ function ResultsPanel({
             {failed > 0 && <span className="fail-text">{failed} failed</span>}
           </div>
         </div>
-        <button className="icon-btn" onClick={onClose} title="Done">
+        <button className="icon-btn" onClick={onClose} title="Done" data-tauri-drag-region="false">
           <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.6">
             <path d="M4 4l8 8M12 4l-8 8" strokeLinecap="round" />
           </svg>

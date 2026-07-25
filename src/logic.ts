@@ -52,6 +52,21 @@ export function countDisplayed(
 
 export type Selection = { kind: string; id: string; name: string };
 
+// Every displayed, updatable item as a Selection — what "Update all" actually runs. Read-only
+// kinds (sparkle) are excluded, as are skipped versions and (unless greedy) self-updating casks,
+// so the button matches the visible count instead of blanket-upgrading things the user hid.
+export function allDisplayedSelections(
+  categories: CategoryStatus[],
+  greedy: boolean,
+  ignored: Set<string>
+): Selection[] {
+  return categories
+    .filter((c) => !isReadOnly(c.kind, false))
+    .flatMap((c) =>
+      displayItems(c, greedy, ignored).map((i) => ({ kind: c.kind, id: i.id, name: i.name }))
+    );
+}
+
 // Toggle one item in the selection map (pure — returns a new map).
 export function toggleSelected(
   selected: Record<string, Selection>,

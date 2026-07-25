@@ -47,7 +47,23 @@
       "Bash(cargo fmt *)",
       "Bash(echo \"---exit: $?---\")",
       "Bash(cargo install *)",
-      "Bash(cargo audit *)"
+      "Bash(cargo audit *)",
+      "Bash(grep -n \"^struct UpdateResult\\\\|^#\\\\[derive.*UpdateResult\\\\|^#\\\\[derive.*Serialize.*\\\\]$\" src-tauri/src/main.rs)",
+      "Read(//Users/seanturner/Library/LaunchAgents/**)",
+      "Bash(launchctl list *)",
+      "Bash(cargo update *)",
+      "Bash(python3 -c 'import sys,json; d=json.load\\(sys.stdin\\); print\\(\"formulae:\",[f[\"name\"] for f in d.get\\(\"formulae\",[]\\)]\\); print\\(\"casks:\",[c[\"name\"] for c in d.get\\(\"casks\",[]\\)]\\)')",
+      "Bash(python3 tests/performance-harness.py)",
+      "Bash(brew --version)",
+      "Bash(brew fetch *)",
+      "Bash(brew config *)",
+      "Bash(python3 -c 'import sys,json;d=json.load\\(sys.stdin\\);print\\(\"formulae:\",len\\(d.get\\(\"formulae\",[]\\)\\),\"casks:\",len\\(d.get\\(\"casks\",[]\\)\\)\\)')",
+      "Bash(du -sh \"$\\(brew --cache\\)/downloads\")",
+      "Bash(grep -cE '^\\(awscli|git|openssl@3|python@3.13|ffmpeg\\)$')",
+      "Bash(grep -cE '^\\(discord|slack\\)$')",
+      "Bash(echo \"fmt exit: $?\")",
+      "Bash(pnpm install *)",
+      "Bash(pnpm build *)"
     ]
   }
 }

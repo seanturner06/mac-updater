@@ -9,6 +9,7 @@ import {
   toggleSelected,
   toggleCategorySelected,
   prunedSelfUpdating,
+  allDisplayedSelections,
   type CategoryStatus,
   type OutdatedItem,
   type Selection,
@@ -125,6 +126,30 @@ describe("prunedSelfUpdating", () => {
     const selected = toggleCategorySelected({}, "cask", [item("a"), item("b", true)]);
     const pruned = prunedSelfUpdating(selected, cats);
     expect(Object.keys(pruned)).toEqual(["cask::a"]); // b (self-updating) removed
+  });
+});
+
+describe("allDisplayedSelections", () => {
+  it("collects every visible item across categories as selections", () => {
+    const cats = [cat("brew", [item("wget")]), cat("cask", [item("firefox")])];
+    expect(allDisplayedSelections(cats, false, new Set())).toEqual([
+      { kind: "brew", id: "wget", name: "wget" },
+      { kind: "cask", id: "firefox", name: "firefox" },
+    ]);
+  });
+  it("respects skipped versions — Update all must not upgrade what the user hid", () => {
+    const cats = [cat("cask", [item("a", false, "2.0"), item("b", false, "2.0")])];
+    const ignored = new Set([ignoreKey("cask", "a", "2.0")]);
+    expect(allDisplayedSelections(cats, false, ignored).map((s) => s.id)).toEqual(["b"]);
+  });
+  it("excludes self-updating casks unless greedy, and sparkle always", () => {
+    const cats = [cat("cask", [item("a"), item("b", true)]), cat("sparkle", [item("s")])];
+    expect(allDisplayedSelections(cats, false, new Set()).map((s) => s.id)).toEqual(["a"]);
+    expect(allDisplayedSelections(cats, true, new Set()).map((s) => s.id)).toEqual(["a", "b"]);
+  });
+  it("is empty when nothing is displayed", () => {
+    expect(allDisplayedSelections([], false, new Set())).toEqual([]);
+    expect(allDisplayedSelections([cat("sparkle", [item("s")])], false, new Set())).toEqual([]);
   });
 });
 

@@ -20,6 +20,7 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     Manager,
 };
+use tauri_plugin_positioner::{Position, WindowExt as _};
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 struct OutdatedItem {
@@ -52,7 +53,7 @@ struct UpdateSelection {
     name: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 struct UpdateResult {
     kind: String,
     name: String,
@@ -619,19 +620,27 @@ fn read_plist_string(info_path: &str, key: &str) -> Option<String> {
 }
 
 fn fetch_url(url: &str) -> Option<String> {
-    if !is_safe_url(url) {
+    // https-only and no private/loopback host, enforced again at the fetch boundary (not just at
+    // the caller): a plaintext feed can be MITM'd, and a redirect to http would silently downgrade.
+    if !is_safe_feed_url(url) {
         return None;
     }
     let out = Command::new("curl")
-        // Restrict to http(s) and don't let a redirect escape to file:// or other schemes.
+        // https only, on the initial request AND across every redirect hop — no plaintext fallback,
+        // no escape to file:// or other schemes. TLS cert validation stays on (we never pass -k).
         .args([
             "-sL",
             "--proto",
-            "=http,https",
+            "=https",
             "--proto-redir",
-            "=http,https",
+            "=https",
             "--max-time",
             "8",
+            // Cap the body a hostile feed can make us buffer. Best-effort: curl can only
+            // enforce this when the server declares a Content-Length, but appcasts are tiny
+            // and a well-behaved CDN always sends one.
+            "--max-filesize",
+            "5242880",
             url,
         ])
         .output()
@@ -978,37 +987,6 @@ async fn adopt_casks(tokens: Vec<String>) -> Vec<UpdateResult> {
         .unwrap_or_default()
 }
 
-// --- Run the full upgrade sequence, returning a result per step ---
-#[tauri::command]
-async fn run_updates() -> Vec<UpdateResult> {
-    tauri::async_runtime::spawn_blocking(run_updates_blocking)
-        .await
-        .unwrap_or_default()
-}
-
-fn run_updates_blocking() -> Vec<UpdateResult> {
-    let steps: Vec<(&str, Vec<&str>)> = vec![
-        ("brew", vec!["update"]),
-        ("brew", vec!["upgrade"]),
-        ("brew", vec!["upgrade", "--cask"]),
-        ("brew", vec!["cleanup"]),
-        ("mas", vec!["upgrade"]),
-        ("npm", vec!["update", "-g"]),
-    ];
-    steps
-        .into_iter()
-        .map(|(cmd, args)| {
-            let (success, output) = run_update_cmd(cmd, &args);
-            UpdateResult {
-                kind: cmd.to_string(),
-                name: format!("{} {}", cmd, args.join(" ")),
-                success,
-                output,
-            }
-        })
-        .collect()
-}
-
 // Map a selected item (kind + id) to the command that updates just it. The id is validated per
 // kind so a crafted selection can't inject a flag or an arbitrary install spec. Pure → unit-tested.
 fn build_update_command(kind: &str, id: &str) -> Option<(&'static str, Vec<String>)> {
@@ -1024,6 +1002,54 @@ fn build_update_command(kind: &str, id: &str) -> Option<(&'static str, Vec<Strin
         )),
         _ => None,
     }
+}
+
+// Partition selected updates into the brew formula tokens and cask tokens worth pre-fetching,
+// validating each id the same way the install path does so a crafted token can't reach `brew
+// fetch` either. mas/npm have no fetch-without-install step, so they're skipped (they download
+// inline at install). Pure → unit-tested.
+fn fetch_batches(selections: &[UpdateSelection]) -> (Vec<String>, Vec<String>) {
+    let mut formulae = Vec::new();
+    let mut casks = Vec::new();
+    for s in selections {
+        match s.kind.as_str() {
+            "brew" if is_valid_cask_token(&s.id) => formulae.push(s.id.clone()),
+            "cask" if is_valid_cask_token(&s.id) => casks.push(s.id.clone()),
+            _ => {}
+        }
+    }
+    (formulae, casks)
+}
+
+// Concurrently pre-download the artifacts for the selected brew formulae and casks so the network
+// transfers overlap instead of downloading one-at-a-time inside the serialized install loop.
+// `brew fetch` fills Homebrew's cache without installing; the subsequent `brew upgrade` then
+// installs from cache with no re-download.
+//
+// One batched `brew fetch` PER KIND (not one process per token): Homebrew loads formula metadata
+// once and downloads the whole set concurrently itself (HOMEBREW_DOWNLOAD_CONCURRENCY, 16 by
+// default on brew 4.4+). That avoids paying brew's ~1s/token Ruby+metadata startup 20+ times over
+// and lets brew's own downloader saturate the link — measurably faster than spawning a fetch per
+// token. The two kinds run on their own threads so formula and cask downloads overlap too.
+// Best-effort: a fetch miss just means the upgrade downloads it inline.
+fn prefetch_selected(selections: &[UpdateSelection]) {
+    let (formulae, casks) = fetch_batches(selections);
+    std::thread::scope(|scope| {
+        if !formulae.is_empty() {
+            scope.spawn(|| {
+                let mut args: Vec<&str> = vec!["fetch", "--formula"];
+                args.extend(formulae.iter().map(String::as_str));
+                let _ = run_cmd("brew", &args);
+            });
+        }
+        if !casks.is_empty() {
+            scope.spawn(|| {
+                let mut args: Vec<&str> = vec!["fetch", "--cask"];
+                args.extend(casks.iter().map(String::as_str));
+                let _ = run_cmd("brew", &args);
+            });
+        }
+    });
 }
 
 // --- Upgrade only the items the user selected, returning a result per item ---
@@ -1050,6 +1076,10 @@ fn run_selected_updates_blocking(selections: &[UpdateSelection]) -> Vec<UpdateRe
             output,
         });
     }
+
+    // Warm the download cache for every selected formula/cask concurrently before the serialized
+    // install loop, so the network transfers overlap instead of downloading one at a time.
+    prefetch_selected(selections);
 
     for sel in selections {
         let Some((cmd, args)) = build_update_command(&sel.kind, &sel.id) else {
@@ -1188,7 +1218,10 @@ fn load_signing_store() -> HashMap<String, String> {
 
 fn save_signing_store(map: &HashMap<String, String>) {
     if let (Some(p), Ok(s)) = (signing_store_path(), serde_json::to_string_pretty(map)) {
-        let _ = std::fs::write(p, s);
+        // 0600: this is the trust baseline that signer-drift detection diffs against. A file an
+        // attacker can rewrite lets them pre-seed a hijacker's Team ID and suppress the warning.
+        // The dir is already 0700, but write it owner-only too (defense in depth, not umask-dependent).
+        let _ = write_private(&p, &s, false);
     }
 }
 
@@ -1206,45 +1239,34 @@ struct VerifyProgress {
     total: usize,
 }
 
-#[tauri::command]
-async fn verify_signatures(app: tauri::AppHandle) -> Vec<UpdateResult> {
-    let apps = tauri::async_runtime::spawn_blocking(list_applications)
-        .await
-        .unwrap_or_default();
-
-    let total = apps.len();
-    let done = Arc::new(AtomicUsize::new(0));
-    let _ = app.emit("verify-progress", VerifyProgress { done: 0, total });
-
-    // Each app is inspected on its own blocking thread and emits a progress tick when it finishes,
-    // so the frontend's progress ring reflects real completion.
-    let mut handles = Vec::new();
-    for path in apps {
-        let app = app.clone();
-        let done = done.clone();
-        handles.push(tauri::async_runtime::spawn_blocking(move || {
-            let sig = inspect_app(&path);
-            let d = done.fetch_add(1, Ordering::SeqCst) + 1;
-            let _ = app.emit("verify-progress", VerifyProgress { done: d, total });
-            sig
-        }));
+// Filter the verify_signatures output. When `only_changed` is true, return only entries that
+// were flagged because the *signer changed* — the specific signal a hijacked update produces.
+// Unsigned-but-stable apps stay out of the post-update view (they belong in the full report).
+fn select_verify_results(
+    entries: Vec<(UpdateResult, bool)>,
+    only_changed: bool,
+) -> Vec<UpdateResult> {
+    if only_changed {
+        entries
+            .into_iter()
+            .filter(|(_, c)| *c)
+            .map(|(r, _)| r)
+            .collect()
+    } else {
+        entries.into_iter().map(|(r, _)| r).collect()
     }
-    let mut sigs = Vec::new();
-    for h in handles {
-        if let Ok(sig) = h.await {
-            sigs.push(sig);
-        }
-    }
+}
 
-    // Held across the load → mutate → save so concurrent verify_signatures runs can't lose
-    // updates. Lock poisoning is harmless here (store is just a serializable HashMap), so
-    // recover instead of panicking on a previous panic.
-    let guard = signing_store_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut store = load_signing_store();
-    let mut results = Vec::new();
-    for sig in &sigs {
+// Build (UpdateResult, was_cert_change) entries from inspected signatures, diffing against the
+// caller-provided baseline store (which is mutated in place to record the new Team IDs). The
+// caller is responsible for holding signing_store_lock across load → here → save so two verify
+// runs can't race the signing.json file.
+fn build_verify_entries(
+    sigs: &[AppSig],
+    store: &mut HashMap<String, String>,
+) -> Vec<(UpdateResult, bool)> {
+    let mut entries: Vec<(UpdateResult, bool)> = Vec::new();
+    for sig in sigs {
         let prev = store.get(&sig.name).cloned();
         let changed = cert_changed(prev.as_deref(), sig.team_id.as_deref());
         if let Some(c) = &sig.team_id {
@@ -1277,17 +1299,150 @@ async fn verify_signatures(app: tauri::AppHandle) -> Vec<UpdateResult> {
             "Notarized by Apple: no"
         });
 
-        results.push(UpdateResult {
-            kind: "verify".into(),
-            name: sig.name.clone(),
-            success: ok,
-            output: out.trim().to_string(),
-        });
+        entries.push((
+            UpdateResult {
+                kind: "verify".into(),
+                name: sig.name.clone(),
+                success: ok,
+                output: out.trim().to_string(),
+            },
+            changed,
+        ));
     }
-    save_signing_store(&store);
-    drop(guard);
+    entries
+}
 
+// Resolve a set of cask tokens to the lowercased `.app` filenames they install. The local
+// Homebrew JWS metadata enumerates each cask's `artifacts.app` array; a single token can map to
+// several `.app` bundles. Pure so it's unit-testable against fixture JSON.
+fn resolve_cask_app_filenames(payload_json: &str, tokens: &[String]) -> Vec<String> {
+    let casks: Vec<serde_json::Value> = serde_json::from_str(payload_json).unwrap_or_default();
+    let wanted: std::collections::HashSet<&str> = tokens.iter().map(String::as_str).collect();
+    let mut out = Vec::new();
+    for cask in &casks {
+        let Some(token) = cask["token"].as_str() else {
+            continue;
+        };
+        if !wanted.contains(token) {
+            continue;
+        }
+        let Some(artifacts) = cask["artifacts"].as_array() else {
+            continue;
+        };
+        for art in artifacts {
+            if let Some(apps) = art["app"].as_array() {
+                for app in apps.iter().filter_map(|a| a.as_str()) {
+                    out.push(app.to_lowercase());
+                }
+            }
+        }
+    }
+    out
+}
+
+#[tauri::command]
+async fn verify_signatures(app: tauri::AppHandle, only_changed: Option<bool>) -> Vec<UpdateResult> {
+    let only_changed = only_changed.unwrap_or(false);
+    let apps = tauri::async_runtime::spawn_blocking(list_applications)
+        .await
+        .unwrap_or_default();
+
+    let total = apps.len();
+    let done = Arc::new(AtomicUsize::new(0));
+    let _ = app.emit("verify-progress", VerifyProgress { done: 0, total });
+
+    // Each app is inspected on its own blocking thread and emits a progress tick when it finishes,
+    // so the frontend's progress ring reflects real completion.
+    let mut handles = Vec::new();
+    for path in apps {
+        let app = app.clone();
+        let done = done.clone();
+        handles.push(tauri::async_runtime::spawn_blocking(move || {
+            let sig = inspect_app(&path);
+            let d = done.fetch_add(1, Ordering::SeqCst) + 1;
+            let _ = app.emit("verify-progress", VerifyProgress { done: d, total });
+            sig
+        }));
+    }
+    let mut sigs = Vec::new();
+    for h in handles {
+        if let Ok(sig) = h.await {
+            sigs.push(sig);
+        }
+    }
+
+    // Held across the load → mutate → save so concurrent verify runs can't lose updates.
+    // Lock poisoning is harmless here (store is just a serializable HashMap), so recover
+    // instead of panicking on a previous panic.
+    let entries = {
+        let _guard = signing_store_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut store = load_signing_store();
+        let entries = build_verify_entries(&sigs, &mut store);
+        save_signing_store(&store);
+        entries
+    };
+
+    let mut results = select_verify_results(entries, only_changed);
     // Flagged apps first (they auto-expand and need attention); verified publishers after.
+    results.sort_by_key(|r| r.success);
+    results
+}
+
+// Targeted post-update signature check: inspect only the `.app` bundles owned by the casks
+// that were just upgraded. Returns just the cert-drift entries (the hijack signal). Skips:
+// non-cask updates (formulae, mas, npm have no `.app` bundle to inspect), unknown tokens,
+// and tokens whose `.app` isn't actually installed in /Applications.
+#[tauri::command]
+async fn verify_updated_casks(tokens: Vec<String>) -> Vec<UpdateResult> {
+    tauri::async_runtime::spawn_blocking(move || verify_updated_casks_blocking(&tokens))
+        .await
+        .unwrap_or_default()
+}
+
+fn verify_updated_casks_blocking(tokens: &[String]) -> Vec<UpdateResult> {
+    if tokens.is_empty() {
+        return vec![];
+    }
+    // token → app filename(s) via the local Homebrew cask metadata. No network.
+    let filenames: std::collections::HashSet<String> = cask_jws_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|jws| extract_jws_payload(&jws))
+        .map(|payload| resolve_cask_app_filenames(&payload, tokens))
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    if filenames.is_empty() {
+        return vec![];
+    }
+    // Filter /Applications to just the matching bundles.
+    let paths: Vec<PathBuf> = list_applications()
+        .into_iter()
+        .filter(|p| {
+            p.file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|f| filenames.contains(&f.to_lowercase()))
+        })
+        .collect();
+    if paths.is_empty() {
+        return vec![];
+    }
+    // Targeted check is small (1–5 apps in practice); serial inspection is fine.
+    let sigs: Vec<AppSig> = paths.iter().map(|p| inspect_app(p)).collect();
+
+    let entries = {
+        let _guard = signing_store_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut store = load_signing_store();
+        let entries = build_verify_entries(&sigs, &mut store);
+        save_signing_store(&store);
+        entries
+    };
+
+    // Post-update mode is always only-changed; unsigned-but-stable is for the full inventory report.
+    let mut results = select_verify_results(entries, true);
     results.sort_by_key(|r| r.success);
     results
 }
@@ -1401,14 +1556,53 @@ fn uninstall_schedule() -> Result<(), String> {
     Ok(())
 }
 
+// Read Hour/Minute back out of the launchd plist so the UI reflects the schedule that's
+// actually installed after a relaunch, instead of a hardcoded default. Tolerates whitespace
+// between the <key> and <integer> tags (a hand-edited plist). Pure → unit-tested.
+fn parse_schedule_time(plist: &str) -> Option<(u32, u32)> {
+    fn int_after(plist: &str, key: &str) -> Option<u32> {
+        let marker = format!("<key>{key}</key>");
+        let after = &plist[plist.find(&marker)? + marker.len()..];
+        let open = after.find("<integer>")? + "<integer>".len();
+        let rest = &after[open..];
+        let end = rest.find("</integer>")?;
+        rest[..end].trim().parse().ok()
+    }
+    let hour = int_after(plist, "Hour")?;
+    let minute = int_after(plist, "Minute")?;
+    valid_schedule_time(hour, minute).then_some((hour, minute))
+}
+
+#[derive(Serialize)]
+struct ScheduleStatus {
+    installed: bool,
+    hour: Option<u32>,
+    minute: Option<u32>,
+}
+
 #[tauri::command]
-fn is_schedule_installed() -> bool {
-    plist_path().exists()
+fn get_schedule() -> ScheduleStatus {
+    let p = plist_path();
+    if !p.exists() {
+        return ScheduleStatus {
+            installed: false,
+            hour: None,
+            minute: None,
+        };
+    }
+    let time = std::fs::read_to_string(&p)
+        .ok()
+        .and_then(|s| parse_schedule_time(&s));
+    ScheduleStatus {
+        installed: true,
+        hour: time.map(|(h, _)| h),
+        minute: time.map(|(_, m)| m),
+    }
 }
 
 fn main() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_positioner::init())
         .setup(|app| {
             // Build the menu bar tray
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
@@ -1429,17 +1623,24 @@ fn main() {
                     }
                 })
                 .on_tray_icon_event(|tray, event| {
+                    let app = tray.app_handle();
+                    // Tell the positioner plugin where the tray icon currently is, so the next
+                    // `move_window(Position::TrayCenter)` can anchor accurately.
+                    tauri_plugin_positioner::on_tray_event(app, &event);
                     if let TrayIconEvent::Click {
                         button: MouseButton::Left,
                         button_state: MouseButtonState::Up,
                         ..
                     } = event
                     {
-                        let app = tray.app_handle();
                         if let Some(win) = app.get_webview_window("main") {
                             if win.is_visible().unwrap_or(false) {
                                 let _ = win.hide();
                             } else {
+                                // Anchor under the tray icon on every open. Drags during the
+                                // session don't persist after the window is closed — standard
+                                // menu-bar UX (1Password, Bartender, etc.).
+                                let _ = win.move_window(Position::TrayCenter);
                                 let _ = win.show();
                                 let _ = win.set_focus();
                             }
@@ -1459,12 +1660,12 @@ fn main() {
             set_badge,
             adopt_cask,
             adopt_casks,
-            run_updates,
             run_selected_updates,
             verify_signatures,
+            verify_updated_casks,
             install_schedule,
             uninstall_schedule,
-            is_schedule_installed
+            get_schedule
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1594,6 +1795,94 @@ mod tests {
         assert!(!cert_changed(Some("AAA"), None));
     }
 
+    // Post-update mode (only_changed=true) must surface only signer-drift entries, NOT
+    // unsigned-but-stable apps. The latter are real concerns for the full inventory report
+    // but shouldn't fire on every `brew upgrade` if nothing actually changed.
+    #[test]
+    fn select_verify_results_only_changed_keeps_cert_drift_only() {
+        let stable_ok = UpdateResult {
+            kind: "verify".into(),
+            name: "stable".into(),
+            success: true,
+            output: "Team ID: AAA".into(),
+        };
+        let unsigned_unchanged = UpdateResult {
+            kind: "verify".into(),
+            name: "always-unsigned".into(),
+            success: false,
+            output: "Not code-signed.".into(),
+        };
+        let drifted = UpdateResult {
+            kind: "verify".into(),
+            name: "drifted".into(),
+            success: false,
+            output: "⚠ Developer certificate CHANGED: was Team AAA, now BBB.".into(),
+        };
+        let entries = vec![
+            (stable_ok.clone(), false),
+            (unsigned_unchanged.clone(), false), // unsigned, but cert didn't move => not a hijack signal
+            (drifted.clone(), true),             // the actual drift
+        ];
+        // Default: full report includes everything.
+        let all = select_verify_results(entries.clone(), false);
+        assert_eq!(all, vec![stable_ok, unsigned_unchanged, drifted.clone()]);
+        // Post-update mode: only drift.
+        let filtered = select_verify_results(entries, true);
+        assert_eq!(filtered, vec![drifted]);
+    }
+
+    // The targeted post-update verify needs to map cask tokens → the .app filenames they install,
+    // so it only inspects what was just upgraded. Filenames come back lowercased to match the
+    // case-insensitive filesystem lookup used in /Applications.
+    #[test]
+    fn resolve_cask_apps_maps_tokens_to_app_filenames() {
+        let payload = r#"[
+            {"token":"google-chrome","artifacts":[{"app":["Google Chrome.app"]},{"zap":[{}]}]},
+            {"token":"firefox","artifacts":[{"app":["Firefox.app"]}]},
+            {"token":"docker","artifacts":[{"app":["Docker.app","Docker Desktop.app"]}]},
+            {"token":"slack","artifacts":[{"app":["Slack.app"]}]}
+        ]"#;
+        let mut out =
+            resolve_cask_app_filenames(payload, &["google-chrome".into(), "docker".into()]);
+        out.sort();
+        assert_eq!(
+            out,
+            vec![
+                "docker desktop.app".to_string(),
+                "docker.app".to_string(),
+                "google chrome.app".to_string(),
+            ],
+            "multi-app casks contribute every .app; output is lowercased for case-insensitive lookup"
+        );
+    }
+
+    #[test]
+    fn resolve_cask_apps_skips_unknown_and_no_app_casks() {
+        let payload = r#"[
+            {"token":"good","artifacts":[{"app":["Good.app"]}]},
+            {"token":"no-artifacts"},
+            {"token":"no-app","artifacts":[{"zap":[{}]}]},
+            {"token":"objapp","artifacts":[{"app":[{"target":"x"}]}]}
+        ]"#;
+        // Unknown token → empty (we have nothing to verify, not a crash).
+        assert!(resolve_cask_app_filenames(payload, &["nope".into()]).is_empty());
+        // Known good → one entry.
+        assert_eq!(
+            resolve_cask_app_filenames(payload, &["good".into()]),
+            vec!["good.app".to_string()]
+        );
+        // Cask without an `app` artifact (font-only, qlplugin-only) → no entries; the cask
+        // updated, but there's no .app to verify.
+        assert!(resolve_cask_app_filenames(payload, &["no-app".into()]).is_empty());
+        assert!(resolve_cask_app_filenames(payload, &["no-artifacts".into()]).is_empty());
+        // Non-string app entries are ignored, not errors.
+        assert!(resolve_cask_app_filenames(payload, &["objapp".into()]).is_empty());
+        // Empty token list is a no-op.
+        assert!(resolve_cask_app_filenames(payload, &[]).is_empty());
+        // Malformed JSON → empty.
+        assert!(resolve_cask_app_filenames("not json", &["good".into()]).is_empty());
+    }
+
     #[test]
     fn update_command_mapping() {
         assert_eq!(
@@ -1634,6 +1923,89 @@ mod tests {
             None
         );
         assert_eq!(build_update_command("npm", "-g"), None);
+    }
+
+    // The concurrent pre-fetch partitions selections into formula/cask batches, reusing the same
+    // id validation as the install path so a crafted token can't smuggle a flag into fetch either.
+    #[test]
+    fn fetch_batches_partitions_and_validates() {
+        let sels = vec![
+            UpdateSelection {
+                kind: "brew".into(),
+                id: "wget".into(),
+                name: "wget".into(),
+            },
+            UpdateSelection {
+                kind: "cask".into(),
+                id: "slack".into(),
+                name: "Slack".into(),
+            },
+            // mas/npm have no fetch-without-install step → excluded.
+            UpdateSelection {
+                kind: "mas".into(),
+                id: "462058435".into(),
+                name: "Excel".into(),
+            },
+            UpdateSelection {
+                kind: "npm".into(),
+                id: "typescript".into(),
+                name: "ts".into(),
+            },
+            // crafted ids are rejected (no flag / path injection into fetch).
+            UpdateSelection {
+                kind: "brew".into(),
+                id: "--force".into(),
+                name: "x".into(),
+            },
+            UpdateSelection {
+                kind: "cask".into(),
+                id: "a/../b".into(),
+                name: "y".into(),
+            },
+        ];
+        let (formulae, casks) = fetch_batches(&sels);
+        assert_eq!(formulae, vec!["wget"]);
+        assert_eq!(casks, vec!["slack"]);
+    }
+
+    // Round-trip: the plist install_schedule writes must parse back to the same time, so the
+    // settings UI shows the real installed schedule after a relaunch (not the 10:00 default).
+    #[test]
+    fn schedule_time_parses_from_generated_plist() {
+        let plist = r#"<?xml version="1.0"?>
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.freshet.daily</string>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key><integer>14</integer>
+        <key>Minute</key><integer>45</integer>
+    </dict>
+</dict>
+</plist>"#;
+        assert_eq!(parse_schedule_time(plist), Some((14, 45)));
+        // Whitespace between key and integer (hand-edited plist) still parses.
+        let spaced =
+            "<key>Hour</key>\n  <integer>7</integer>\n<key>Minute</key> <integer>0</integer>";
+        assert_eq!(parse_schedule_time(spaced), Some((7, 0)));
+        // Missing keys, junk values, and out-of-range times are None, not garbage.
+        assert_eq!(
+            parse_schedule_time("<key>Hour</key><integer>9</integer>"),
+            None
+        );
+        assert_eq!(
+            parse_schedule_time(
+                "<key>Hour</key><integer>x</integer><key>Minute</key><integer>0</integer>"
+            ),
+            None
+        );
+        assert_eq!(
+            parse_schedule_time(
+                "<key>Hour</key><integer>24</integer><key>Minute</key><integer>0</integer>"
+            ),
+            None
+        );
+        assert_eq!(parse_schedule_time(""), None);
     }
 
     #[test]
@@ -2062,5 +2434,119 @@ mod tests {
         assert!(!is_safe_url(&format!("https://{}", "a".repeat(2050))));
         assert!(!is_safe_search_query(&"a".repeat(65)));
         assert!(is_safe_search_query("visual studio code"));
+    }
+
+    // Story 2 (manual check resilience): when one source fails, it returns a category with the
+    // error attached and an empty items list — the aggregator doesn't lose the other sources.
+    #[test]
+    fn failed_category_err_carries_error_and_empty_items() {
+        let s = failed_category_err("Homebrew", "brew", "brew not found".into());
+        assert_eq!(s.category, "Homebrew");
+        assert_eq!(s.kind, "brew");
+        assert!(s.items.is_empty());
+        assert_eq!(s.error.as_deref(), Some("brew not found"));
+    }
+
+    // Stories 1 + 8: first sighting writes a baseline silently (no CHANGED warning); a stable
+    // second sighting stays silent; a Team-ID change between sightings fires the hijack message
+    // with both old and new Team IDs and downgrades success.
+    #[test]
+    fn build_verify_entries_baseline_then_drift() {
+        let mut store: HashMap<String, String> = HashMap::new();
+
+        // First sighting — silent adoption.
+        let sigs1 = vec![AppSig {
+            name: "App.app".into(),
+            team_id: Some("AAA".into()),
+            authority: Some("Developer ID Application: Acme (AAA)".into()),
+            signed: true,
+            notarized: true,
+        }];
+        let entries1 = build_verify_entries(&sigs1, &mut store);
+        assert_eq!(entries1.len(), 1);
+        let (r1, changed1) = &entries1[0];
+        assert!(!changed1, "first sighting is not a change");
+        assert!(r1.success, "signed + unchanged = verified");
+        assert!(!r1.output.contains("CHANGED"));
+        assert_eq!(store.get("App.app").map(String::as_str), Some("AAA"));
+
+        // Same Team ID on the next call — quiet.
+        let entries2 = build_verify_entries(&sigs1, &mut store);
+        let (_, changed2) = &entries2[0];
+        assert!(!changed2, "unchanged Team ID is silent");
+
+        // Hijack signal: a different Team ID for the same app.
+        let sigs3 = vec![AppSig {
+            name: "App.app".into(),
+            team_id: Some("BBB".into()),
+            authority: Some("Developer ID Application: Notacme (BBB)".into()),
+            signed: true,
+            notarized: true,
+        }];
+        let entries3 = build_verify_entries(&sigs3, &mut store);
+        let (r3, changed3) = &entries3[0];
+        assert!(changed3, "Team ID drift = change");
+        assert!(!r3.success, "drift downgrades success");
+        assert!(r3.output.contains("CHANGED"));
+        assert!(r3.output.contains("AAA"));
+        assert!(r3.output.contains("BBB"));
+        assert_eq!(store.get("App.app").map(String::as_str), Some("BBB"));
+    }
+
+    // Story 9: unsigned apps are flagged (success=false) in the full inventory, but they are
+    // NOT drift (changed=false) — so the post-update filter (only_changed=true) excludes them.
+    // That keeps the post-update warning channel reserved for actual hijack signals.
+    #[test]
+    fn build_verify_entries_unsigned_is_flagged_but_not_drift() {
+        let mut store = HashMap::new();
+        let sigs = vec![AppSig {
+            name: "Sketchy.app".into(),
+            team_id: None,
+            authority: None,
+            signed: false,
+            notarized: false,
+        }];
+        let entries = build_verify_entries(&sigs, &mut store);
+        let (r, changed) = &entries[0];
+        assert!(!changed, "unsigned-but-stable is not drift");
+        assert!(!r.success, "still flagged in the full report");
+        assert!(r.output.contains("Not code-signed"));
+        // No Team ID to remember, so the store is untouched.
+        assert!(store.is_empty());
+    }
+
+    // Story 20: when an item in a batch can't be mapped to a real command (bogus kind, crafted
+    // id), the batch records a per-item failure and keeps going. With no brew/cask in the
+    // selection list, the `brew update` preamble is skipped too — this test runs entirely
+    // in-process with no subprocess spawns.
+    #[test]
+    fn run_selected_updates_skips_unsupported_and_continues() {
+        let bad = vec![
+            UpdateSelection {
+                kind: "bogus".into(),
+                id: "x".into(),
+                name: "X".into(),
+            },
+            UpdateSelection {
+                kind: "mas".into(),
+                id: "not-numeric".into(),
+                name: "Bad MAS".into(),
+            },
+            UpdateSelection {
+                kind: "npm".into(),
+                id: "-g".into(),
+                name: "Bad NPM".into(),
+            },
+        ];
+        let results = run_selected_updates_blocking(&bad);
+        assert_eq!(results.len(), 3, "every selection contributes a result row");
+        for r in &results {
+            assert!(!r.success);
+            assert!(r.output.contains("unsupported or invalid update"));
+        }
+        // Names round-trip so the UI can attribute each failure.
+        assert_eq!(results[0].name, "X");
+        assert_eq!(results[1].name, "Bad MAS");
+        assert_eq!(results[2].name, "Bad NPM");
     }
 }

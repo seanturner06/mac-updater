@@ -1,0 +1,86 @@
+Freshet live performance run
+Timestamp: 2026-07-07T17:54:24
+Machine:   Darwin 25.5.0 arm64
+Install phase: NO (--no-install)
+
+Explicit target set (--items); outdated detection skipped:
+  formulae (24): awscli, c-ares, edencommon, fb303, fbthrift, ffmpeg, fizz, folly, gh, git, imagemagick, jpeg-turbo, libevent, libnghttp3, libngtcp2, libtiff, mbedtls@3, openssl@3, python@3.13, sdl3, sqlite, vim, wangle, watchman
+  casks (2): discord, slack
+  npm globals (0): -
+  mas apps (0): -
+
+========================================================================
+DOWNLOAD PHASE — batched `brew fetch` per kind (brew's native 16-way concurrency)
+========================================================================
+
+Per-kind `brew fetch` (each a single process, brew parallelizes inside):
+  formula  24 items    8.82 s  OK
+  cask      2 items   11.10 s  OK
+
+item                         kind     size(MB)
+------------------------------------------------
+awscli                       formula      22.56
+c-ares                       formula       0.29
+edencommon                   formula       0.42
+fb303                        formula       0.76
+fbthrift                     formula       8.44
+ffmpeg                       formula      20.21
+fizz                         formula       0.67
+folly                        formula       7.37
+gh                           formula      12.81
+git                          formula      21.98
+imagemagick                  formula      10.81
+jpeg-turbo                   formula       1.28
+libevent                     formula       0.69
+libnghttp3                   formula       0.18
+libngtcp2                    formula       0.40
+libtiff                      formula       1.87
+mbedtls@3                    formula       3.56
+openssl@3                    formula      10.41
+python@3.13                  formula      17.60
+sdl3                         formula       1.51
+sqlite                       formula       2.34
+vim                          formula      13.94
+wangle                       formula       0.89
+watchman                     formula       3.27
+discord                      cask       189.26
+slack                        cask       109.72
+------------------------------------------------
+
+Items ......................... 24 formulae + 2 casks
+New bytes downloaded .......... 463.22 MB
+Batch wall-clock (both kinds concurrent) . 11.11 s
+AGGREGATE throughput .......... 41.69 MB/s  (new bytes / batch wall-clock)
+
+Skipping install phase (--no-install).
+
+========================================================================
+HEAD-TO-HEAD — batched vs. per-item (identical 463.22 MB, cold cache)
+========================================================================
+Both runs fetched the SAME 26 artifacts (24 formulae + discord + slack) with the
+relevant cache files removed first, so this is apples-to-apples on bytes.
+
+  Approach                              Wall-clock   Aggregate throughput
+  ------------------------------------  ----------   --------------------
+  per-item (run-20260707T135330)          17.80 s          26.03 MB/s
+  batched  (this run, shipped code)       11.11 s          41.69 MB/s
+  ------------------------------------  ----------   --------------------
+  improvement                             1.60x faster     1.60x higher
+
+WHY IT'S FASTER — and where the new floor is
+  - The 24 formulae (164 MB) fetched in ONE process in 8.82 s: brew loaded metadata
+    once and downloaded the long tail concurrently (16-way), instead of paying
+    ~1 s of Ruby/metadata startup per token across 24+ separate processes.
+  - The two casks (299 MB = 65% of bytes) fetched in 11.10 s in a second process.
+    That batch is now the CRITICAL PATH — the wall-clock (11.11 s) equals the cask
+    batch, which ran concurrently with the formula batch (8.82 s).
+  - Remaining time is genuine network transfer, not overhead: 299 MB / 11.1 s ≈
+    27 MB/s for the casks, and 41.7 MB/s aggregate across both kind-threads
+    (~350 Mbit/s) — the link / CDN ceiling for this machine right now, not a
+    concurrency defect. Nothing more to squeeze without more/faster streams on the
+    two big casks (which is up to the upstream CDN).
+
+TAKEAWAY
+  The original 17.80 s was inflated by per-item `brew fetch` startup plus the
+  harness's redundant `brew --cache` probe. The shipped prefetch_selected()
+  (batched `brew fetch` per kind) removes both and runs at the network floor.

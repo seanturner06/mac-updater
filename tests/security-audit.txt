@@ -1,0 +1,281 @@
+================================================================================
+FRESHET — SECURITY AUDIT
+================================================================================
+Target:    Freshet, a macOS menu-bar app/dev-tool updater (Tauri 2 + Rust backend)
+Backend:   src-tauri/src/main.rs
+Auditor:   automated deep audit (Claude)
+Date:      2026-07-07
+Scope:     dependency/supply-chain, command injection, download integrity/TLS,
+           signature/checksum verification, tampering/secure-storage/TOCTOU,
+           privileged execution / sudo password handling.
+
+Fixes in this audit are applied to the working tree but NOT committed.
+
+--------------------------------------------------------------------------------
+ARCHITECTURAL NOTE (important for interpreting the findings)
+--------------------------------------------------------------------------------
+Freshet does NOT download-and-execute update artifacts itself. It is an
+orchestrator: it shells out to the platform package managers — `brew` (formulae
++ casks), `mas` (Mac App Store), `npm` (global packages) — and each of those is
+responsible for downloading and integrity-verifying its own artifacts. The one
+place Freshet touches the network directly is fetching Sparkle appcast XML, and
+that path is DETECTION-ONLY: it parses a version string to tell the user an app
+can self-update. It never downloads or runs a DMG/pkg.
+
+Consequently the classic "verify the artifact you just downloaded before you run
+it" surface largely lives inside brew/mas/npm (see Finding 4), and Freshet's own
+risk surface is (a) how it constructs the commands it runs, (b) how it fetches
+Sparkle feeds, (c) how it stores its trust baseline / helper scripts, and (d) how
+it acquires elevation. The audit is organized around those.
+
+================================================================================
+SUMMARY OF FINDINGS
+================================================================================
+ID  Severity   Area                        Status
+--  ---------  --------------------------  ---------------------------------
+F1  HIGH       Dependency / supply-chain   FIXED (dep bump)
+F2  LOW        Dependency (unsound)        FIXED (dep bump)
+F3  INFO       Dependency (unmaintained)   NOT APPLICABLE / ACCEPTED (justified)
+F4  MEDIUM     Download integrity / TLS    FIXED (fetch_url hardened)
+F5  LOW/MED    Tampering / secure storage  FIXED (signing.json now 0600)
+--  ---------  --------------------------  ---------------------------------
+PASS: Command injection (Finding 6), Signature/checksum verification (Finding 4),
+      Privileged execution / sudo password handling (Finding 7), TOCTOU (Finding 5).
+
+================================================================================
+FINDING 1 — HIGH — Vulnerable transitive dependency: quick-xml 0.39.4
+================================================================================
+`cargo audit` reported TWO high-severity (CVSS 7.5) advisories against
+quick-xml 0.39.4, reached transitively via plist -> tauri-utils/tauri-codegen:
+
+  RUSTSEC-2026-0195  Unbounded namespace-declaration allocation in NsReader
+                     -> memory-exhaustion denial of service
+  RUSTSEC-2026-0194  Quadratic run time when checking a start tag for duplicate
+                     attribute names
+  Fixed in: quick-xml >= 0.41.0
+
+WHY IT'S A RISK
+  quick-xml is the XML parser plist uses; plist is used by Tauri to read property
+  lists. A maliciously-crafted XML/plist could exhaust memory or CPU (DoS). In
+  Freshet the practical reachability is low (Freshet parses Sparkle appcast XML
+  with its own hand-rolled string parser, NOT quick-xml, and plist is used by
+  Tauri for the app's own trusted Info.plist) — but it is a live HIGH advisory
+  with a clean fixed version available, so it should not be shipped.
+
+FIX APPLIED
+  Bumped plist 1.9.0 -> 1.10.0, which pulls quick-xml 0.39.4 -> 0.41.0:
+      cargo update -p plist
+  This satisfies plist's `quick-xml = "^0.39.2"` requirement at 0.41.0 and clears
+  both advisories. No source changes required; Cargo.lock updated. Verified: the
+  project still compiles and all 49 unit tests pass after the bump.
+
+RESULT
+  Post-fix `cargo audit` reports 0 vulnerabilities (down from 2).
+
+================================================================================
+FINDING 2 — LOW — Unsound dependency: anyhow 1.0.102
+================================================================================
+  RUSTSEC-2026-0190  Unsoundness in anyhow::Error::downcast_mut()
+  Fixed in: anyhow 1.0.103
+
+WHY IT'S A RISK
+  Unsoundness advisory (not a directly exploitable CVE); anyhow is transitive via
+  Tauri's build tooling. Low real-world impact for this app, but trivially fixable.
+
+FIX APPLIED
+  cargo update -p anyhow   (1.0.102 -> 1.0.103)
+
+================================================================================
+FINDING 3 — INFO — Unmaintained crates in the dependency tree
+================================================================================
+`cargo audit` also lists ~17 informational "unmaintained" warnings. These are NOT
+vulnerabilities and, for the two categories below, are either not compiled on the
+shipping platform or unavoidable transitive build deps.
+
+  (a) LINUX-ONLY, NOT COMPILED ON macOS — verified with:
+        cargo tree --target aarch64-apple-darwin | grep -iE 'atk|gtk|gdk|webkit2gtk'
+        -> 0 matches (these crates never enter the macOS build graph)
+      Affected: atk, atk-sys, gdk, gdk-sys, gdkwayland-sys, gdkx11, gdkx11-sys,
+      gtk, gtk-sys, gtk3-macros (RUSTSEC-2024-041x, gtk-rs GTK3 bindings) and
+      glib RUSTSEC-2024-0429 (unsound VariantStrIter). Freshet ships only on
+      macOS (bundle targets: app, dmg; minimumSystemVersion 11.0). These GTK/GLib
+      crates are pulled by wry/tao only on Linux and are absent from the macOS
+      binary. => NOT APPLICABLE to the shipped product.
+
+  (b) BUILD-TIME / TRANSITIVE, NO KNOWN VULN — proc-macro-error (RUSTSEC-2024-0370)
+      and the unic-* family (RUSTSEC-2025-0075/0080/0081/0098/0100). These are
+      transitive dependencies of Tauri's macro/codegen machinery; "unmaintained"
+      status carries no known exploit. => ACCEPTED, tracked to Tauri upstream.
+
+RECOMMENDATION
+  Keep Tauri current (these clear as Tauri updates its own deps). Optionally add a
+  documented `cargo audit` ignore-list in deny.toml/audit.toml for the (a)/(b)
+  IDs so CI stays green while remaining honest about *why* each is ignored.
+
+================================================================================
+FINDING 4 — MEDIUM — Download integrity / TLS enforcement
+================================================================================
+Two things to verify: (i) Freshet's own network fetch (Sparkle feeds), and
+(ii) the delegated downloads (brew/mas/npm).
+
+(i) Freshet's fetch — `fetch_url()` (used by check_sparkle)
+    BEFORE (issues):
+      - Gated on `is_safe_url()`, which ACCEPTS `http://` as well as https. A
+        plaintext appcast fetch is MITM-able (an attacker on the path can serve a
+        forged "latest version").
+      - curl was invoked with `--proto =http,https` and
+        `--proto-redir =http,https`, i.e. a redirect could DOWNGRADE an https feed
+        to http mid-fetch.
+      Mitigating context: the sole caller (check_sparkle) already pre-validates
+      the feed with `is_safe_feed_url()` (https-only + SSRF host block), so the
+      exposure was defense-in-depth, not a hole in the current call graph.
+
+    FIX APPLIED (src-tauri/src/main.rs, fetch_url):
+      - Guard changed from `is_safe_url` to `is_safe_feed_url` so the fetch
+        boundary ITSELF enforces https + non-private host (not only the caller).
+      - curl tightened to `--proto =https` and `--proto-redir =https`: https only
+        on the initial request AND across every redirect hop. No plaintext
+        fallback, no scheme escape (file://, etc.). TLS certificate validation is
+        left ON (the code never passes `-k`/`--insecure`), and `--max-time 8`
+        bounds hangs.
+
+    NOTE: SSRF defense here is already strong and was left intact — `url_host()`
+    + `is_local_or_private_host()` reject loopback, RFC1918, link-local
+    (169.254/16 incl. cloud metadata), CGNAT (100.64/10), IPv6 ULA/link-local,
+    and .local/.internal/localhost suffixes. Known accepted limitation (documented
+    in-code): DNS rebinding can bypass an IP-literal check.
+
+(ii) Delegated downloads (brew/mas/npm) — verified as adequate:
+    - Homebrew verifies a SHA-256 checksum for every bottle and cask artifact and
+      aborts on mismatch; formula bottles are fetched over https from
+      ghcr.io/GitHub. `open_url`/`fetch` never disable this.
+    - `mas` installs through the Mac App Store, which enforces Apple code signing.
+    - `npm` verifies registry tarball integrity (SRI hashes) over https.
+  Freshet does not weaken any of these (it passes no `--insecure`, no
+  `--no-verify`, no custom CA). => PASS.
+
+================================================================================
+FINDING 5 — LOW/MEDIUM — Tampering: trust baseline written world-readable + TOCTOU
+================================================================================
+SECURE STORAGE (issue found + fixed)
+  ~/.freshet is created 0700 (owner-only) and the helper scripts (askpass.sh,
+  run.sh) are written 0700 via `write_private()`. GOOD. However `signing.json`
+  — the signer-drift TRUST BASELINE that the hijacked-release detector diffs
+  against — was written with plain `std::fs::write`, i.e. default umask perms
+  (typically 0644, world-readable).
+
+  WHY IT'S A RISK
+    The baseline records each app's expected Team ID. An attacker who can write
+    that file could pre-seed a hijacker's Team ID so the "developer certificate
+    CHANGED" warning never fires — silently defeating Freshet's headline security
+    feature. The parent dir being 0700 blocks cross-user access today, but the
+    file itself should not depend on the directory's mode (defense in depth), and
+    0644 needlessly discloses the app inventory to other local users if perms on
+    the dir ever regress.
+
+  FIX APPLIED (src-tauri/src/main.rs, save_signing_store):
+    Now writes via `write_private(&p, &s, false)` => mode 0600 (owner rw only),
+    consistent with the other files under ~/.freshet and independent of umask.
+
+TOCTOU (verify-vs-execute) — assessed, no action needed
+  There is no window where Freshet verifies an artifact and then executes a
+  swapped copy: installation is delegated to brew/mas/npm (atomic within those
+  tools), and Freshet's signature check runs AFTER install, inspecting the bundle
+  actually present in /Applications. The post-update `verify_updated_casks`
+  resolves cask token -> .app filename via brew's LOCAL metadata (no network) and
+  inspects the on-disk bundle. => No TOCTOU exposure in Freshet's own code.
+
+CONCURRENCY (already handled) — `signing_store_lock()` serializes the
+  load->mutate->save of signing.json so two concurrent verify runs can't lose
+  updates; cross-process "last writer wins" is a documented accepted limitation.
+
+================================================================================
+FINDING 6 — PASS — Command injection
+================================================================================
+Every external command is spawned with `std::process::Command::new(cmd).args([...])`,
+i.e. an explicit argv passed directly to execvp — there is NO shell. There is no
+`sh -c`, no string-built command line, and no user/network data is ever
+concatenated into a shell string anywhere in the backend. Verified across all
+call sites: brew (outdated/upgrade/fetch/info/search/list/cache/update/cleanup),
+mas, npm, curl, open, codesign, spctl, defaults, launchctl.
+
+Defense-in-depth input validation at the IPC boundary (webview-supplied values
+are validated BEFORE reaching argv, so a crafted value like a leading "-" can't
+be smuggled in as a flag even absent a shell):
+  - is_valid_cask_token   (alnum + -@._+, must start alnum, <=128)  -> brew/cask
+  - is_numeric_id         (digits only, <=20)                       -> mas
+  - is_valid_npm_package  (npm name rules; rejects flags, urls, git/tarball specs)
+  - is_safe_search_query  (no leading '-', no control chars, <=64)  -> brew search
+  - is_safe_url / is_safe_feed_url                                  -> open/fetch
+  build_update_command() and the new fetch_args() re-validate the id per kind and
+  return None on anything unexpected. All of the above are unit-tested, including
+  explicit flag/URL/path-injection rejection cases.
+
+The generated scheduler script (~/.freshet/run.sh) and launchd plist contain only
+FIXED command sequences plus $HOME — no interpolated user/network input — and are
+written 0700/0600 into owner-only locations.
+
+=> No command-injection vector found.
+
+================================================================================
+FINDING 7 — PASS — Privileged execution & sudo password handling
+================================================================================
+Freshet never runs as root and never stores credentials. When an update needs
+elevation, elevation is acquired via sudo's askpass mechanism:
+
+  - `run_update_cmd()` sets the SUDO_ASKPASS environment variable to a lazily
+    written GUI helper (~/.freshet/askpass.sh, mode 0700). That variable holds the
+    PATH TO THE HELPER, never a password.
+  - The helper runs `osascript ... display dialog ... with hidden answer` and
+    echoes the entered password to STDOUT. sudo reads it from that pipe.
+
+Verified against every requirement:
+  [x] Password is NEVER logged            — it flows helper-stdout -> sudo pipe only;
+                                             it is not part of any captured command
+                                             output (combine_output captures the
+                                             brew/mas/npm child's streams, not the
+                                             askpass child's stdout).
+  [x] Password is NEVER written to disk    — no temp file; osascript returns it in
+                                             memory.
+  [x] Password is NEVER put in an env var  — SUDO_ASKPASS holds a path, not a secret.
+  [x] Password is NEVER on a command line  — sudo consumes it via stdin, never argv.
+  [x] Provided via secure interactive input— native macOS secure-text dialog
+                                             (hidden answer).
+
+Elevation-failure behavior: each selected item is a separate command, and the
+batch loop records a per-item failure and CONTINUES (never aborts the batch) — so
+if the user dismisses the password dialog, the elevation-requiring item fails
+cleanly while non-privileged items still update. (Verified by
+run_selected_updates_blocking + the "skips unsupported and continues" test.)
+
+MINOR / DEFENSE-IN-DEPTH OBSERVATIONS (not fixed — low value, noted for the owner)
+  - tauri-plugin-shell is initialized and tauri.conf.json sets `shell.open=true`,
+    but the "default" capability grants only core:default + start-dragging (NOT
+    shell:allow-execute or shell:allow-open). The frontend therefore cannot invoke
+    the shell plugin; the app uses its own validated `open_url` command instead.
+    Attack surface is effectively closed, but the plugin could be dropped entirely
+    to remove it from the graph.
+  - CSP is locked down (default-src 'self'; connect-src 'self' ipc:). Good. The
+    dev CSP relaxes script-src (unsafe-inline/eval) but applies to dev builds only.
+
+================================================================================
+WHAT WAS CHANGED (working tree, uncommitted)
+================================================================================
+src-tauri/Cargo.lock
+  - plist  1.9.0  -> 1.10.0   (pulls quick-xml 0.39.4 -> 0.41.0)  [F1]
+  - anyhow 1.0.102 -> 1.0.103                                     [F2]
+
+src-tauri/src/main.rs
+  - fetch_url(): guard is_safe_url -> is_safe_feed_url; curl --proto/--proto-redir
+    tightened from =http,https to =https (no plaintext, no downgrade redirects). [F4]
+  - save_signing_store(): std::fs::write -> write_private(.., false) => 0600.      [F5]
+  - (also, for the Workstream-2 concurrency defect: added pure fetch_batches() +
+    prefetch_selected() and a unit test; run_selected_updates_blocking now warms
+    the download cache concurrently — one batched `brew fetch` per kind, letting
+    Homebrew's own 16-way downloader parallelize — before the serialized install.)
+
+VERIFICATION
+  - `cargo audit`: 2 vulnerabilities -> 0. (Remaining entries are informational
+    "unmaintained" warnings; see Finding 3 for why each is N/A or accepted.)
+  - `cargo test`: 49 passed / 0 failed (48 prior + 1 new fetch_args test).
+================================================================================

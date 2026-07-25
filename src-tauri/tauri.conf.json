@@ -45,10 +45,5 @@
     "macOS": {
       "minimumSystemVersion": "11.0"
     }
-  },
-  "plugins": {
-    "shell": {
-      "open": true
-    }
   }
 }
