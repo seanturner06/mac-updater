@@ -251,3 +251,17 @@ If a pull request touches any of the following, it needs security review:
 The repository-level guarantee that backs all of this is that the checks are mechanical:
 `cargo clippy -- -D warnings` at pedantic level, `cargo audit`, and 50 Rust unit tests including
 the adversarial validator cases, all run in CI on every push and pull request.
+
+## Dependency audit exceptions
+
+`pnpm audit` must be clean; anything it flags is fixed or listed here with the reason.
+
+- **GHSA-vfj7-8cjw-p6xm — `braces` ≤ 3.0.3, stack exhaustion on deeply nested patterns.**
+  No patched release exists (3.0.3 is the latest). It's reached only through `type-coverage`
+  (dev/CI only, never shipped), which globs the project's own sources with fixed patterns — the
+  attack needs an attacker-supplied pattern. Ignored via `pnpm.auditConfig.ignoreGhsas` in
+  `package.json`. Revisit if `braces` ships a fix or `type-coverage` changes its glob library.
+
+Transitive dev-tool dependencies with available fixes are pinned to patched floors with scoped
+`pnpm.overrides` (e.g. `"postcss@8": "^8.5.23"`), each limited to the affected major line.
+

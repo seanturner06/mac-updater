@@ -988,10 +988,18 @@ fn save_cached_check(categories: &[CategoryStatus]) {
     }
 }
 
+// The saved list is only worth showing if nothing has changed since: a scheduled run that finished
+// after it was saved has installed some of what it lists. Pure → unit-tested.
+fn cache_is_current(checked_at: u64, last_scheduled_run: Option<u64>) -> bool {
+    last_scheduled_run.is_none_or(|finished| finished < checked_at)
+}
+
 #[tauri::command]
 fn get_cached_check() -> Option<CachedCheck> {
     let text = std::fs::read_to_string(cached_check_path()?).ok()?;
-    serde_json::from_str(&text).ok()
+    let cached: CachedCheck = serde_json::from_str(&text).ok()?;
+    let last_run = get_last_scheduled_run().map(|r| r.finished_at);
+    cache_is_current(cached.checked_at, last_run).then_some(cached)
 }
 
 // --- `brew update`, at most once an hour ---
@@ -2674,7 +2682,10 @@ fn append_history(entries: &[HistoryEntry]) {
 // rows that line up with the selections.
 fn record_manual_history(selections: &[UpdateSelection], results: &[UpdateResult]) {
     let offset = results.len().saturating_sub(selections.len());
-    let versions = get_cached_check()
+    // The versions the user saw when they pressed Update — even if a scheduled run has run since.
+    let versions = cached_check_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| serde_json::from_str::<CachedCheck>(&t).ok())
         .map(|c| versions_of(&c.categories))
         .unwrap_or_default();
     append_history(&history_entries(
@@ -2980,18 +2991,45 @@ fn applescript_string(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
+// Freshet's bundle identifier (tauri.conf.json "identifier").
+const BUNDLE_ID: &str = "com.freshet.app";
+
+// A macOS notification shown as coming from Freshet — its name and icon — even from the headless
+// scheduled run, where no Freshet window or menu-bar app is running. mac-notification-sys posts it
+// on behalf of the installed bundle; if that fails (e.g. a dev build that was never installed),
+// fall back to AppleScript, which macOS labels "Script Editor".
 // FRESHET_NO_NOTIFY lets the integration tests run the real binary without popping banners.
 fn notify(message: &str) {
     if std::env::var_os("FRESHET_NO_NOTIFY").is_some() {
         return;
     }
-    let script = format!(
-        "display notification {} with title \"Freshet\"",
-        applescript_string(message)
-    );
-    let _ = Command::new("/usr/bin/osascript")
-        .args(["-e", &script])
-        .output();
+    if !notify_native(message) {
+        let script = format!(
+            "display notification {} with title \"Freshet\"",
+            applescript_string(message)
+        );
+        let _ = Command::new("/usr/bin/osascript")
+            .args(["-e", &script])
+            .output();
+    }
+}
+
+// True if delivered (or still being delivered after 5s: a synchronous send can block until macOS
+// is done with it, and falling back then would show the message twice).
+fn notify_native(message: &str) -> bool {
+    let message = message.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // Errors only if already set by an earlier notification in this process; harmless.
+        let _ = mac_notification_sys::set_application(BUNDLE_ID);
+        let sent = mac_notification_sys::send_notification("Freshet", None, &message, None);
+        if let Err(e) = &sent {
+            tracing::warn!(error = %e, "native notification failed; falling back to AppleScript");
+        }
+        let _ = tx.send(sent.is_ok());
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap_or(true)
 }
 
 fn unix_now() -> u64 {
@@ -3639,8 +3677,8 @@ mod tests {
 
     #[test]
     fn npm_handles_empty() {
-        assert!(parse_npm_outdated("{}").is_empty());
-        assert!(parse_npm_outdated("not json").is_empty());
+        assert_eq!(parse_npm_outdated("{}"), Vec::<OutdatedItem>::new());
+        assert_eq!(parse_npm_outdated("not json"), Vec::<OutdatedItem>::new());
     }
 
     // mas: the id is followed by multiple spaces and the name contains spaces, so the name must
@@ -4314,7 +4352,7 @@ mod tests {
             parse_cask_tokens(listed),
             vec!["sublime-text", "intellij-idea-ce"]
         );
-        assert!(parse_cask_tokens("").is_empty());
+        assert_eq!(parse_cask_tokens(""), Vec::<String>::new());
     }
 
     #[test]
@@ -4540,8 +4578,11 @@ mod tests {
 
     #[test]
     fn brew_handles_malformed_and_missing() {
-        assert!(parse_brew_outdated("not json").is_empty());
-        assert!(parse_brew_outdated(r#"{"casks":[]}"#).is_empty()); // no formulae key
+        assert_eq!(parse_brew_outdated("not json"), Vec::<OutdatedItem>::new());
+        assert_eq!(
+            parse_brew_outdated(r#"{"casks":[]}"#),
+            Vec::<OutdatedItem>::new()
+        ); // no formulae key
         let items = parse_brew_outdated(r#"{"formulae":[{"name":"x"}]}"#);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].current, "");
@@ -4557,7 +4598,7 @@ mod tests {
             r#"{"casks":[{"name":"firefox","installed_versions":["1"],"current_version":"2"}]}"#;
         let none = std::collections::HashSet::new();
         assert!(parse_casks(greedy, &none)[0].self_updating);
-        assert!(parse_casks("garbage", &none).is_empty());
+        assert_eq!(parse_casks("garbage", &none), Vec::<OutdatedItem>::new());
         assert_eq!(
             parse_cask_names(r#"{"casks":[{"name":"a"},{"name":"b"}]}"#).len(),
             2
@@ -4571,7 +4612,7 @@ mod tests {
         assert_eq!(items[0].id, "123");
         assert_eq!(items[0].name, "Some App");
         assert_eq!(items[0].latest, "");
-        assert!(parse_mas_outdated("462058435").is_empty()); // no whitespace -> can't split
+        assert_eq!(parse_mas_outdated("462058435"), Vec::<OutdatedItem>::new()); // no whitespace -> can't split
         assert_eq!(parse_mas_outdated("\n\n  \n").len(), 0); // blank lines
         let t = parse_mas_outdated("999\tCoolApp (1.0 -> 2.0)"); // tab separator
         assert_eq!(t[0].id, "999");
@@ -4585,8 +4626,8 @@ mod tests {
         let items = parse_npm_outdated(r#"{"weird":{"current":"1.2","latest":"1.3"}}"#);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].name, "weird");
-        assert!(parse_npm_outdated("[1,2,3]").is_empty()); // non-object json
-        assert!(parse_npm_outdated("").is_empty());
+        assert_eq!(parse_npm_outdated("[1,2,3]"), Vec::<OutdatedItem>::new()); // non-object json
+        assert_eq!(parse_npm_outdated(""), Vec::<OutdatedItem>::new());
     }
 
     #[test]
@@ -4767,7 +4808,7 @@ mod tests {
         let s = failed_category_err("Homebrew", "brew", "brew not found".into());
         assert_eq!(s.category, "Homebrew");
         assert_eq!(s.kind, "brew");
-        assert!(s.items.is_empty());
+        assert_eq!(s.items, Vec::<OutdatedItem>::new());
         assert_eq!(s.error.as_deref(), Some("brew not found"));
     }
 
@@ -4888,7 +4929,7 @@ mod tests {
         let apps = parse_cask_apps(json);
         assert_eq!(apps["discord"], ["Discord.app"]);
         assert_eq!(apps["slack"], ["Slack.app"]);
-        assert!(apps["some-pkg"].is_empty());
+        assert_eq!(apps["some-pkg"], Vec::<String>::new());
         assert!(parse_cask_apps("nope").is_empty());
     }
 
@@ -4972,7 +5013,7 @@ mod tests {
         assert!(cask_token_candidates("zoom.us").contains(&"zoom".to_string()));
         assert!(cask_token_candidates("Notepad++")[0].starts_with("notepad-plus-plus"));
         assert!(cask_token_candidates("IntelliJ IDEA CE").contains(&"intellij-idea-ce".to_string()));
-        assert!(cask_token_candidates("  ").is_empty());
+        assert_eq!(cask_token_candidates("  "), Vec::<String>::new());
     }
 
     // Only a cask whose own `app` artifact is this exact bundle counts: a candidate token that
@@ -5061,6 +5102,33 @@ mod tests {
         for a in &found {
             eprintln!("  {} → {}", a.name, a.token);
         }
+    }
+
+    #[test]
+    fn cached_list_is_dropped_after_a_newer_scheduled_run() {
+        assert!(cache_is_current(1000, None), "no scheduled run ever");
+        assert!(
+            cache_is_current(1000, Some(900)),
+            "run finished before the check"
+        );
+        assert!(
+            !cache_is_current(1000, Some(1000)),
+            "same second: assume stale"
+        );
+        assert!(
+            !cache_is_current(1000, Some(1500)),
+            "run finished after: list is stale"
+        );
+    }
+
+    // Real notification through Notification Center, as the scheduled run sends it.
+    //   cargo test -- --ignored native_notification --nocapture
+    #[test]
+    #[ignore = "shows a real notification"]
+    fn native_notification() {
+        assert!(notify_native(
+            "Test notification from Freshet's test suite."
+        ));
     }
 
     #[test]
@@ -5205,7 +5273,7 @@ mod tests {
             }],
         );
         assert_eq!(summary.signer_changed, ["discord"]);
-        assert!(summary.failed.is_empty());
+        assert_eq!(summary.failed, Vec::<String>::new());
     }
 
     // Story 9: unsigned apps are flagged (success=false) in the full inventory, but they are
