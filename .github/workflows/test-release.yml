@@ -1,0 +1,98 @@
+name: Test release (unsigned)
+
+# A build testers can download before Apple signing is set up. Run it from the Actions tab
+# ("Run workflow"). It is NOT signed with an Apple Developer ID or notarized, so macOS warns on
+# first launch; the release notes tell testers how to open it. The self-update archive IS signed
+# with the updater key, so installed test builds update themselves (and verify what they install).
+#
+# Tag `v<version>-unsigned` and name "(unsigned test build)" keep it from being mistaken for, or
+# colliding with, a signed `v<version>` release from release.yml. Tags created by this workflow's
+# GITHUB_TOKEN don't trigger other workflows, so it can't start release.yml either.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write # create the draft release
+
+jobs:
+  macos:
+    name: Build (unsigned) + sign update archive
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Install Rust toolchain (both Mac architectures)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Refuse to build without the updater key
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY is not set; see docs/14-release-signing.md"
+            exit 1
+          fi
+
+      # No APPLE_* variables: no Developer ID signing and no notarization (ad-hoc signed instead).
+      - name: Build and publish draft
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tauriScript: pnpm tauri
+          # signingIdentity "-" = ad-hoc: a complete signature over the whole bundle, just not tied
+          # to an Apple Developer ID. Without it only the executable carries a (linker) signature,
+          # the bundle isn't sealed, and macOS calls a downloaded copy "damaged" with no way to
+          # open it — instead of the "could not verify" warning that Open Anyway gets past.
+          args: '--target universal-apple-darwin --config {"bundle":{"createUpdaterArtifacts":true,"macOS":{"signingIdentity":"-"}}}'
+          includeUpdaterJson: true
+          tagName: v__VERSION__-unsigned
+          releaseName: Freshet v__VERSION__ (unsigned test build)
+          releaseDraft: true
+          # Not a pre-release on purpose: self-update reads GitHub's "latest release", which
+          # skips pre-releases, so testers would never be offered the next test build.
+          prerelease: false
+          releaseBody: |
+            **Unsigned test build.** Not yet signed with an Apple Developer ID, so macOS will warn the first time you open it.
+
+            **To install**
+            1. Download `Freshet_*.dmg` below, open it, and drag Freshet into Applications.
+            2. Open Freshet. macOS says it "could not verify Freshet is free of malware": click **Done**.
+            3. Open **System Settings → Privacy & Security**, scroll down, click **Open Anyway** next to Freshet, then **Open**.
+
+            Or, in Terminal: `xattr -dr com.apple.quarantine /Applications/Freshet.app`
+
+            After that it opens normally, and updates itself. Freshet needs [Homebrew](https://brew.sh) to be useful.
+
+      # Unsigned by Apple doesn't mean unsigned: check the ad-hoc code signature is intact and the
+      # update archive carries its updater signature.
+      - name: Verify the build
+        run: |
+          set -euo pipefail
+          DIR=src-tauri/target/universal-apple-darwin/release/bundle
+          APP=$(find "$DIR/macos" -maxdepth 1 -name '*.app' | head -1)
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          lipo -archs "$APP/Contents/MacOS/freshet"
+          test -s "$DIR/macos/Freshet.app.tar.gz.sig"
+          echo "Update archive signature present"

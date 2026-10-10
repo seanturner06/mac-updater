@@ -1574,6 +1574,42 @@ async fn adopt_casks(tokens: Vec<String>) -> Vec<UpdateResult> {
         .unwrap_or_default()
 }
 
+// mas 7 needs root to install App Store updates and gets it by running `sudo` itself — without
+// `-A`, so it ignores SUDO_ASKPASS and, with no terminal, fails instantly ("a terminal is required
+// to read the password"). Its README's supported route is to start it as root: so Freshet runs
+// `sudo -A <mas> …` itself, and `-A` makes sudo ask through Freshet's native password dialog. The
+// absolute path is needed because sudo replaces PATH with its secure_path (no /opt/homebrew/bin).
+// sudo remembers the password per parent process for a few minutes, so several App Store updates
+// in one run ask once. The headless scheduled run never updates App Store apps, so it never gets
+// here; elsewhere commands pass through unchanged.
+fn with_root_if_needed(cmd: &str, args: Vec<String>) -> (String, Vec<String>) {
+    if cmd != "mas" || HEADLESS.load(Ordering::Relaxed) {
+        return (cmd.to_string(), args);
+    }
+    let path = std::env::var("PATH").unwrap_or_default();
+    match find_in_path("mas", &path) {
+        Some(mas) => sudo_askpass_command(&mas, args),
+        None => (cmd.to_string(), args),
+    }
+}
+
+// `/usr/bin/sudo -A <program> <args…>`. Pure → unit-tested.
+fn sudo_askpass_command(program: &Path, args: Vec<String>) -> (String, Vec<String>) {
+    let mut full = vec!["-A".to_string(), program.to_string_lossy().into_owned()];
+    full.extend(args);
+    ("/usr/bin/sudo".to_string(), full)
+}
+
+// First executable named `name` on a PATH string. Pure apart from the file checks → tested.
+fn find_in_path(name: &str, path: &str) -> Option<PathBuf> {
+    path.split(':')
+        .filter(|d| !d.is_empty())
+        .map(|d| Path::new(d).join(name))
+        .find(|p| {
+            std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
+}
+
 // Map a selected item (kind + id) to the command that updates just it. The id is validated per
 // kind so a crafted selection can't inject a flag or an arbitrary install spec. Pure → unit-tested.
 fn build_update_command(kind: &str, id: &str) -> Option<(&'static str, Vec<String>)> {
@@ -1742,8 +1778,9 @@ fn install_selections(
                 progress(progress_event("Installing", Some(&sel.name), done, total));
                 done += 1;
                 let started = std::time::Instant::now();
+                let (cmd, args) = with_root_if_needed(cmd, args);
                 let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-                let (success, output) = run_update_cmd(cmd, &arg_refs);
+                let (success, output) = run_update_cmd(&cmd, &arg_refs);
                 results[i] = Some(UpdateResult {
                     kind: sel.kind.clone(),
                     name: sel.name.clone(),
@@ -5129,6 +5166,35 @@ mod tests {
         assert!(notify_native(
             "Test notification from Freshet's test suite."
         ));
+    }
+
+    // App Store updates run as `sudo -A <absolute mas> upgrade <id>`, so the password comes from
+    // Freshet's dialog (mas's own sudo call can't use one).
+    #[test]
+    fn app_store_updates_get_root_through_the_askpass_dialog() {
+        let (cmd, args) = sudo_askpass_command(
+            Path::new("/opt/homebrew/bin/mas"),
+            vec!["upgrade".into(), "462058435".into()],
+        );
+        assert_eq!(cmd, "/usr/bin/sudo");
+        assert_eq!(
+            args,
+            ["-A", "/opt/homebrew/bin/mas", "upgrade", "462058435"]
+        );
+    }
+
+    #[test]
+    fn find_in_path_returns_the_first_executable() {
+        let dir = std::env::temp_dir().join(format!("freshet-path-{}", std::process::id()));
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(a.join("tool"), "").unwrap(); // not executable: skipped
+        write_private(&b.join("tool"), "#!/bin/sh\n", true).unwrap();
+        let path = format!("{}:{}", a.display(), b.display());
+        assert_eq!(find_in_path("tool", &path), Some(b.join("tool")));
+        assert_eq!(find_in_path("absent", &path), None);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

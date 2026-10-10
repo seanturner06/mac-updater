@@ -66,6 +66,25 @@ git tag v0.2.0 && git push origin v0.2.0
 
 Review and publish the draft release the workflow creates.
 
+## Unsigned test releases (before you have an Apple Developer account)
+
+`.github/workflows/test-release.yml` builds a test release without Apple signing. Run it from
+GitHub → **Actions** → **Test release (unsigned)** → **Run workflow**. It needs only the
+`TAURI_SIGNING_PRIVATE_KEY` secret.
+
+- Tagged `v<version>-unsigned` and named "(unsigned test build)", created as a **draft**: review
+  it under Releases and click **Publish**. It can't collide with a later signed `v<version>`.
+- **Ad-hoc signed** (`signingIdentity: "-"`), so the bundle is properly sealed. Without that, a
+  downloaded copy is reported as "damaged" and can't be opened at all.
+- Not marked pre-release: self-update follows GitHub's "latest release", which skips
+  pre-releases. Installed test builds therefore update to the next test build — and to the first
+  signed release, which replaces them as "latest".
+- Testers see "Apple could not verify Freshet is free of malware" once. The release notes tell
+  them: click **Done**, then **System Settings → Privacy & Security → Open Anyway**. (On macOS 15
+  and later, right-click → Open no longer bypasses this.)
+
+To ship a new test build, bump the version (see Releasing) and run the workflow again.
+
 ## Verifying a build yourself
 
 ```sh
