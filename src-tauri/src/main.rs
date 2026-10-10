@@ -2,18 +2,21 @@
 // Backend commands for Freshet
 // - check_outdated: queries each package manager for what's outdated
 // - run_updates: invokes the upgrade commands
-// - install_schedule / uninstall_schedule: manages a launchd plist
-// - is_schedule_installed: checks current state
+// - install_schedule / uninstall_schedule / get_schedule: manages the daily launchd job
+// - get_settings / save_settings: ~/.freshet/settings.json, shared with the scheduled run
+// - `freshet --run-scheduled`: the headless run that launchd invokes (see run_scheduled)
 
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::os::unix::fs::PermissionsExt;
+use std::io::{Read as _, Write as _};
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt};
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::OnceLock;
 use tauri::Emitter;
 use tauri::{
     menu::{Menu, MenuItem},
@@ -21,6 +24,10 @@ use tauri::{
     Manager,
 };
 use tauri_plugin_positioner::{Position, WindowExt as _};
+
+mod preverify;
+mod rollback;
+mod vulns;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 struct OutdatedItem {
@@ -46,7 +53,7 @@ struct CategoryStatus {
     error: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
 struct UpdateSelection {
     kind: String,
     id: String,
@@ -59,11 +66,187 @@ struct UpdateResult {
     name: String,
     success: bool,
     output: String,
+    // A follow-up the user can take from the results panel (trust a new signer, roll back).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    action: Option<ResultAction>,
+    // Wall time for this item; batched items share their batch's time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    elapsed_ms: Option<u64>,
+    // Deliberately not attempted (the app was open, or the user stopped the run): neither a
+    // success nor a failure.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    skipped: bool,
 }
 
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ResultAction {
+    // The publisher (Team ID) changed; trusting records `team` as the new baseline for `bundle_id`.
+    TrustSigner {
+        bundle_id: String,
+        team: String,
+    },
+    // A pre-update snapshot of this cask's app exists and can be restored.
+    Rollback {
+        token: String,
+    },
+    // Skipped because the app was open: quit it, then update just this item.
+    QuitAndUpdate {
+        kind: String,
+        id: String,
+        name: String,
+        app: String,
+    },
+}
+
+// --- PATH for child processes ---
+//
+// An app opened from Finder, and a launchd job, start with PATH=/usr/bin:/bin:/usr/sbin:/sbin —
+// no Homebrew, no nvm. Every `brew`/`mas`/`npm` we spawn would then fail with "not found". So at
+// startup, if PATH has no Homebrew prefix on it, ask the user's login shell for its PATH (that's
+// where nvm and brew shellenv put things) and merge it in, plus the known Homebrew prefixes as a
+// fallback if the shell is slow or broken. Launched from a terminal (`pnpm tauri dev`) PATH
+// already has brew on it and none of this runs.
+const BREW_BIN_DIRS: [&str; 3] = ["/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin"];
+const PATH_MARKER: &str = "__FRESHET_PATH__";
+
+fn path_has_brew_prefix(path: &str) -> bool {
+    path.split(':')
+        .any(|d| d == "/opt/homebrew/bin" || d == "/usr/local/bin")
+}
+
+// Interactive shells can print banners, motd, or prompts around our output; take only what's
+// between the two markers.
+fn extract_marked_path(output: &str) -> Option<&str> {
+    let start = output.find(PATH_MARKER)? + PATH_MARKER.len();
+    let len = output[start..].find(PATH_MARKER)?;
+    Some(&output[start..start + len]).filter(|p| !p.is_empty())
+}
+
+// Order-preserving, de-duplicated union; existing entries keep priority over added ones.
+fn merge_path<'a>(current: &'a str, extra: impl IntoIterator<Item = &'a str>) -> String {
+    let mut seen = std::collections::HashSet::new();
+    current
+        .split(':')
+        .chain(extra)
+        .filter(|d| !d.is_empty() && seen.insert(*d))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+fn login_shell_path() -> Option<String> {
+    let shell = std::env::var("SHELL").ok().filter(|s| s.starts_with('/'))?;
+    let script = format!("printf '%s%s%s' {PATH_MARKER} \"$PATH\" {PATH_MARKER}");
+    let mut child = Command::new(shell)
+        .args(["-ilc", &script])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    // A shell rc that hangs (a prompt, a slow plugin manager) must not hang the app.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let mut out = String::new();
+    child.stdout.take()?.read_to_string(&mut out).ok()?;
+    extract_marked_path(&out).map(String::from)
+}
+
+// Must run first thing in main, before any thread exists (set_var is not thread-safe).
+fn augment_path() {
+    let current = std::env::var("PATH").unwrap_or_default();
+    if path_has_brew_prefix(&current) {
+        return;
+    }
+    let shell = login_shell_path().unwrap_or_default();
+    let merged = merge_path(&current, shell.split(':').chain(BREW_BIN_DIRS));
+    std::env::set_var("PATH", merged);
+}
+
+// --- Stopping a running update safely ---
+//
+// The batch is one `brew` process. Killing it outright (what quitting the app used to do) skips
+// Homebrew's cleanup. SIGINT — Ctrl-C — doesn't: brew raises Interrupt, removes a half-poured
+// new version, and its `ensure` relinks the old one (Homebrew install.rb `install_formula`,
+// formula_installer.rb `pour`). So "Stop" waits for the next package boundary and sends SIGINT
+// there; everything already upgraded stays upgraded, the package that was about to start
+// doesn't, and nothing is left half-installed.
+static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+// pid of the update process currently streaming output (0 = none).
+static RUNNING_CHILD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+// SIGINT first. A process can start with SIGINT *ignored* (inherited from whatever launched us,
+// e.g. any background job) and then can't un-ignore it; if it hasn't exited 3s later, send one
+// SIGTERM, which Ruby turns into a SignalException that unwinds through the same cleanup and
+// relink code. One signal only: Homebrew guards its cleanup against a second interrupt.
+fn interrupt_running_child() {
+    let pid = RUNNING_CHILD.load(Ordering::SeqCst);
+    if pid == 0 {
+        return;
+    }
+    // The child leads its own process group (see run_update_cmd_streaming), so `-pid` signals it
+    // and everything it started (curl downloads, installers) — what Ctrl-C does in a terminal —
+    // and nothing is left holding the output pipe open.
+    let signal = move |sig: &str| {
+        tracing::info!(pid, sig, "signalling update process group");
+        let _ = Command::new("/bin/kill")
+            .args([sig, "--", &format!("-{pid}")])
+            .output();
+    };
+    signal("-INT");
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        if RUNNING_CHILD.load(Ordering::SeqCst) == pid {
+            signal("-TERM");
+        }
+    });
+}
+
+// "Stop after this package": takes effect at the next package boundary.
+#[tauri::command]
+fn stop_updates() {
+    STOP_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+// A line where brew moves on to the next package — the safe place to interrupt. Pure → tested.
+fn is_package_boundary(line: &str) -> bool {
+    (line.starts_with("==> Upgrading ") && !line.contains("outdated package"))
+        || line.starts_with("==> Installing ")
+}
+
+// Set by the headless scheduled run. Nobody is at the keyboard, so update commands must never
+// put up the askpass password dialog; anything needing admin fails fast and is reported instead.
+static HEADLESS: AtomicBool = AtomicBool::new(false);
+
 // --- Helper: run a shell command and capture stdout ---
+// A Command for `cmd`. In the headless scheduled run it's wrapped in `taskpolicy -c background`:
+// macOS then keeps it (and everything it starts — brew's curl, codesign, spctl) on the efficiency
+// cores at low priority. Slower, but nobody is waiting on an unattended run, and it's what keeps
+// a 40-package upgrade from heating the Mac up while you work.
+fn command(cmd: &str) -> Command {
+    if HEADLESS.load(Ordering::Relaxed) {
+        let mut c = Command::new("/usr/sbin/taskpolicy");
+        c.args(["-c", "background", cmd]);
+        c
+    } else {
+        Command::new(cmd)
+    }
+}
+
 fn run_cmd(cmd: &str, args: &[&str]) -> Result<String, String> {
-    let output = Command::new(cmd)
+    let output = command(cmd)
         .args(args)
         .output()
         .map_err(|e| format!("Failed to run {cmd}: {e}"))?;
@@ -140,12 +323,66 @@ fn combine_output(stdout: &[u8], stderr: &[u8]) -> String {
 }
 
 // --- Helper: run an upgrade command, returning whether it succeeded plus combined output ---
-fn run_update_cmd(cmd: &str, args: &[&str]) -> (bool, String) {
-    let mut command = Command::new(cmd);
+fn update_command(cmd: &str, args: &[&str]) -> Command {
+    let mut command = command(cmd);
     command.args(args);
-    if let Some(askpass) = askpass_program() {
+    if HEADLESS.load(Ordering::Relaxed) {
+        command.env_remove("SUDO_ASKPASS");
+    } else if let Some(askpass) = askpass_program() {
         command.env("SUDO_ASKPASS", askpass);
     }
+    command
+}
+
+// Like run_update_cmd, but stdout and stderr share one pipe (as in a terminal), so a batch's
+// error lines stay next to the package they belong to; and each line is handed to `on_line` as
+// it arrives, so progress can be reported while a long batch runs.
+fn run_update_cmd_streaming(
+    cmd: &str,
+    args: &[&str],
+    on_line: &mut dyn FnMut(&str),
+) -> (bool, String) {
+    use std::io::BufRead as _;
+    let mut run = || -> std::io::Result<(bool, String)> {
+        let (reader, writer) = std::io::pipe()?;
+        let mut command = update_command(cmd, args);
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(writer.try_clone()?)
+            .stderr(writer)
+            // Its own process group, so Stop can signal brew and all its children together.
+            .process_group(0);
+        let mut child = command.spawn()?;
+        RUNNING_CHILD.store(child.id(), Ordering::SeqCst);
+        // The Command still holds write ends of the pipe; drop it so EOF arrives at child exit.
+        drop(command);
+        let mut reader = std::io::BufReader::new(reader);
+        let mut all = String::new();
+        let mut buf = Vec::new();
+        while reader.read_until(b'\n', &mut buf)? > 0 {
+            let line = String::from_utf8_lossy(&buf);
+            on_line(line.trim_end());
+            all.push_str(&line);
+            buf.clear();
+        }
+        let status = child.wait();
+        RUNNING_CHILD.store(0, Ordering::SeqCst);
+        Ok((status?.success(), all.trim().to_string()))
+    };
+    run().unwrap_or_else(|e| (false, format!("Failed to run {cmd}: {e}")))
+}
+
+// The requested package a `==> Upgrading <name>` line starts on, if any. Pure → unit-tested.
+fn upgrading_name<'a>(line: &str, wanted: &std::collections::HashSet<&'a str>) -> Option<&'a str> {
+    let name = line
+        .strip_prefix("==> Upgrading ")?
+        .split_whitespace()
+        .next()?;
+    wanted.get(name).copied()
+}
+
+fn run_update_cmd(cmd: &str, args: &[&str]) -> (bool, String) {
+    let mut command = update_command(cmd, args);
     match command.output() {
         Ok(out) => {
             let combined = maybe_append_mas_hint(combine_output(&out.stdout, &out.stderr));
@@ -496,76 +733,46 @@ fn is_valid_npm_package(name: &str) -> bool {
     })
 }
 
-// Homebrew's bulk cask metadata is a JWS envelope: { "payload": "<json string>", "signatures": ... }.
-// The cask array lives inside the payload string.
-fn extract_jws_payload(jws: &str) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_str(jws).ok()?;
-    v["payload"].as_str().map(String::from)
-}
-
-// Build a lowercased ".app filename" -> cask token index from the cask array JSON, so an installed
-// app can be matched to the cask that provides it. On name collisions, prefer the bare token over
-// an @-variant (e.g. "google-chrome" over "google-chrome@beta").
-fn build_cask_app_index(payload_json: &str) -> HashMap<String, String> {
-    let casks: Vec<serde_json::Value> = serde_json::from_str(payload_json).unwrap_or_default();
-    let mut idx: HashMap<String, String> = HashMap::new();
-    for cask in &casks {
-        let Some(token) = cask["token"].as_str() else {
-            continue;
-        };
-        let Some(artifacts) = cask["artifacts"].as_array() else {
-            continue;
-        };
-        for art in artifacts {
-            if let Some(apps) = art["app"].as_array() {
-                for app in apps.iter().filter_map(|a| a.as_str()) {
-                    let key = app.to_lowercase();
-                    let replace = idx
-                        .get(&key)
-                        .is_none_or(|existing| existing.contains('@') && !token.contains('@'));
-                    if replace {
-                        idx.insert(key, token.to_string());
-                    }
-                }
-            }
-        }
-    }
-    idx
-}
-
 // --- Check functions (thin I/O wrappers around the pure parsers above) ---
 
-fn check_brew() -> CategoryStatus {
-    match run_cmd("brew", &["outdated", "--json=v2"]) {
-        Ok(stdout) => CategoryStatus {
-            category: "Homebrew".into(),
-            kind: "brew".into(),
-            items: parse_brew_outdated(&stdout),
-            error: None,
-        },
-        Err(e) => failed_category_err("Homebrew", "brew", e),
-    }
-}
-
-fn normal_cask_names() -> std::collections::HashSet<String> {
-    run_cmd("brew", &["outdated", "--cask", "--json=v2"]).map_or_else(
-        |_| std::collections::HashSet::new(),
-        |s| parse_cask_names(&s),
-    )
-}
-
-// Always runs --greedy to get the full set (including self-updating casks); parse_casks tags each.
-// The frontend hides self-updating casks unless the user opts in, so toggling is instant.
-fn check_casks() -> CategoryStatus {
-    let normal = normal_cask_names();
-    match run_cmd("brew", &["outdated", "--cask", "--greedy", "--json=v2"]) {
-        Ok(stdout) => CategoryStatus {
-            category: "Applications".into(),
-            kind: "cask".into(),
-            items: parse_casks(&stdout, &normal),
-            error: None,
-        },
-        Err(e) => failed_category_err("Applications", "cask", e),
+// Formulae and casks from two `brew outdated` processes (each pays ~0.5s of Ruby start-up), run
+// in parallel. The --greedy call lists formulae plus every outdated cask, self-updating ones
+// included; the plain cask call tells us which of those are *not* self-updating. Casks are tagged
+// self_updating so the frontend can hide them without a re-fetch.
+#[tracing::instrument(skip_all)]
+fn check_homebrew() -> (CategoryStatus, CategoryStatus) {
+    let (greedy, normal) = std::thread::scope(|scope| {
+        let normal = scope.spawn(|| run_cmd("brew", &["outdated", "--cask", "--json=v2"]));
+        let greedy = run_cmd("brew", &["outdated", "--json=v2", "--greedy"]);
+        (
+            greedy,
+            normal
+                .join()
+                .unwrap_or_else(|_| Err("brew check panicked".into())),
+        )
+    });
+    match greedy {
+        Ok(stdout) => {
+            let normal = normal.map(|n| parse_cask_names(&n)).unwrap_or_default();
+            (
+                CategoryStatus {
+                    category: "Homebrew".into(),
+                    kind: "brew".into(),
+                    items: parse_brew_outdated(&stdout),
+                    error: None,
+                },
+                CategoryStatus {
+                    category: "Applications".into(),
+                    kind: "cask".into(),
+                    items: parse_casks(&stdout, &normal),
+                    error: None,
+                },
+            )
+        }
+        Err(e) => (
+            failed_category_err("Homebrew", "brew", e.clone()),
+            failed_category_err("Applications", "cask", e),
+        ),
     }
 }
 
@@ -727,21 +934,113 @@ fn failed_category(category: &str, kind: &str) -> CategoryStatus {
 // by check_sparkle_apps so a slow/unreachable appcast can't stall the whole refresh.
 #[tauri::command]
 async fn check_outdated() -> Vec<CategoryStatus> {
-    let brew = tauri::async_runtime::spawn_blocking(check_brew);
-    let casks = tauri::async_runtime::spawn_blocking(check_casks);
-    let mas = tauri::async_runtime::spawn_blocking(check_mas);
-    let npm = tauri::async_runtime::spawn_blocking(check_npm);
-    vec![
-        brew.await
-            .unwrap_or_else(|_| failed_category("Homebrew", "brew")),
-        casks
-            .await
-            .unwrap_or_else(|_| failed_category("Applications", "cask")),
-        mas.await
-            .unwrap_or_else(|_| failed_category("App Store", "mas")),
-        npm.await
-            .unwrap_or_else(|_| failed_category("npm globals", "npm")),
-    ]
+    tauri::async_runtime::spawn_blocking(check_outdated_blocking)
+        .await
+        .unwrap_or_default()
+}
+
+#[tracing::instrument]
+fn check_outdated_blocking() -> Vec<CategoryStatus> {
+    // Without a recent `brew update`, `brew outdated` compares against stale metadata and misses
+    // new releases. Throttled to once an hour, so most checks pay nothing for it.
+    if let Some(r) = brew_update_if_stale() {
+        if !r.success {
+            tracing::warn!(output = %r.output, "brew update failed; checking against cached metadata");
+        }
+    }
+    let ((brew, casks), mas, npm) = std::thread::scope(|scope| {
+        let mas = scope.spawn(check_mas);
+        let npm = scope.spawn(check_npm);
+        let homebrew = check_homebrew();
+        (
+            homebrew,
+            mas.join()
+                .unwrap_or_else(|_| failed_category("App Store", "mas")),
+            npm.join()
+                .unwrap_or_else(|_| failed_category("npm globals", "npm")),
+        )
+    });
+    let categories = vec![brew, casks, mas, npm];
+    save_cached_check(&categories);
+    categories
+}
+
+// --- Last check, cached so the window can show it instantly while a fresh check runs ---
+
+#[derive(Serialize, Deserialize)]
+struct CachedCheck {
+    // Unix seconds.
+    checked_at: u64,
+    categories: Vec<CategoryStatus>,
+}
+
+fn cached_check_path() -> Option<PathBuf> {
+    freshet_dir().map(|d| d.join("last-check.json"))
+}
+
+fn save_cached_check(categories: &[CategoryStatus]) {
+    let cached = CachedCheck {
+        checked_at: unix_now(),
+        categories: categories.to_vec(),
+    };
+    if let (Some(path), Ok(json)) = (cached_check_path(), serde_json::to_string(&cached)) {
+        let _ = write_private_atomic(&path, &json);
+    }
+}
+
+#[tauri::command]
+fn get_cached_check() -> Option<CachedCheck> {
+    let text = std::fs::read_to_string(cached_check_path()?).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+// --- `brew update`, at most once an hour ---
+
+const BREW_UPDATE_MAX_AGE_SECS: u64 = 3600;
+const FULL_SCAN_INTERVAL_SECS: u64 = 7 * 86_400;
+
+fn brew_update_stamp_path() -> Option<PathBuf> {
+    freshet_dir().map(|d| d.join("brew-update.stamp"))
+}
+
+// Stale if never run, older than max_age, or stamped in the future (clock change). Pure → tested.
+fn update_is_stale(last: Option<u64>, now: u64, max_age: u64) -> bool {
+    last.is_none_or(|l| l > now || now - l >= max_age)
+}
+
+// Runs `brew update` if the last successful one is over an hour old; None if skipped.
+fn brew_update_if_stale() -> Option<UpdateResult> {
+    let stamp = brew_update_stamp_path();
+    let last = stamp
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| s.trim().parse().ok());
+    if !update_is_stale(last, unix_now(), BREW_UPDATE_MAX_AGE_SECS) {
+        tracing::info!("brew update skipped: ran within the last hour");
+        return None;
+    }
+    let started = std::time::Instant::now();
+    let (success, output) = run_update_cmd("brew", &["update"]);
+    let elapsed_ms = elapsed_ms(started);
+    tracing::info!(elapsed_ms, success, "brew update");
+    if success {
+        if let Some(p) = stamp {
+            let _ = write_private(&p, &unix_now().to_string(), false);
+        }
+    }
+    Some(UpdateResult {
+        kind: "brew".into(),
+        name: "brew update".into(),
+        success,
+        output,
+        action: None,
+        elapsed_ms: Some(elapsed_ms),
+        skipped: false,
+    })
+}
+
+fn elapsed_ms(since: std::time::Instant) -> u64 {
+    u64::try_from(since.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 // Network-bound Sparkle check, loaded separately/in the background by the frontend.
@@ -837,6 +1136,229 @@ async fn cask_info(token: String) -> Option<CaskInfo> {
     .flatten()
 }
 
+// --- Package details for the update list: what is this thing, and where are its release notes ---
+
+#[derive(Serialize, Clone, Debug, PartialEq, Eq, Default)]
+struct PackageInfo {
+    desc: String,
+    homepage: String,
+    license: String,
+    // Formula installed only to satisfy another formula — not something the user asked for.
+    dependency: bool,
+    // Cask that updates itself (Homebrew's `auto_updates`).
+    auto_updates: bool,
+    // GitHub releases page when the project lives on GitHub; empty otherwise.
+    release_notes: String,
+    // The cask's .app bundle name, used to look up its icon.
+    app: String,
+}
+
+// "https://github.com/owner/repo(.git)(/anything)" → "https://github.com/owner/repo/releases".
+// First GitHub URL wins. Pure → unit-tested.
+fn github_releases_url<'a>(urls: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    urls.into_iter().find_map(|u| {
+        let rest = u
+            .strip_prefix("https://github.com/")
+            .or_else(|| u.strip_prefix("http://github.com/"))?;
+        let mut parts = rest.split('/');
+        let owner = parts.next().filter(|s| !s.is_empty())?;
+        let repo = parts.next()?.trim_end_matches(".git");
+        let valid = |s: &str| {
+            !s.is_empty()
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        };
+        (valid(owner) && valid(repo)).then(|| format!("https://github.com/{owner}/{repo}/releases"))
+    })
+}
+
+fn json_str(v: &serde_json::Value) -> String {
+    v.as_str().unwrap_or("").to_string()
+}
+
+// `brew info --json=v2 --formula …` → name → info. Pure → unit-tested against real output.
+fn parse_formula_infos(json: &str) -> HashMap<String, PackageInfo> {
+    let parsed: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
+    parsed["formulae"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .map(|f| {
+            let homepage = json_str(&f["homepage"]);
+            let release_notes = github_releases_url([
+                homepage.as_str(),
+                f["urls"]["head"]["url"].as_str().unwrap_or(""),
+                f["urls"]["stable"]["url"].as_str().unwrap_or(""),
+            ])
+            .unwrap_or_default();
+            let info = PackageInfo {
+                desc: json_str(&f["desc"]),
+                license: json_str(&f["license"]),
+                dependency: f["installed"][0]["installed_on_request"] == serde_json::json!(false),
+                release_notes,
+                homepage,
+                ..PackageInfo::default()
+            };
+            (json_str(&f["name"]), info)
+        })
+        .collect()
+}
+
+// `brew info --json=v2 --cask …` → token → info. Pure → unit-tested against real output.
+fn parse_cask_infos(json: &str) -> HashMap<String, PackageInfo> {
+    let parsed: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
+    parsed["casks"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .map(|c| {
+            let homepage = json_str(&c["homepage"]);
+            let app = c["artifacts"]
+                .as_array()
+                .and_then(|arts| arts.iter().find_map(|a| a["app"][0].as_str()))
+                .unwrap_or("")
+                .to_string();
+            let info = PackageInfo {
+                desc: json_str(&c["desc"]),
+                auto_updates: c["auto_updates"].as_bool().unwrap_or(false),
+                release_notes: github_releases_url([
+                    homepage.as_str(),
+                    c["url"].as_str().unwrap_or(""),
+                ])
+                .unwrap_or_default(),
+                homepage,
+                app,
+                ..PackageInfo::default()
+            };
+            (json_str(&c["token"]), info)
+        })
+        .collect()
+}
+
+// One `brew info` per kind for the whole list (~0.4s each, run in parallel), keyed
+// "brew::<name>" / "cask::<token>" to match the frontend's selKey.
+#[tauri::command]
+async fn package_details(
+    formulae: Vec<String>,
+    casks: Vec<String>,
+) -> HashMap<String, PackageInfo> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let info = |flag: &'static str, ids: &[String]| -> Option<String> {
+            let ids: Vec<&str> = ids
+                .iter()
+                .map(String::as_str)
+                .filter(|id| is_valid_cask_token(id))
+                .collect();
+            if ids.is_empty() {
+                return None;
+            }
+            let mut args = vec!["info", "--json=v2", flag];
+            args.extend(ids);
+            run_cmd("brew", &args).ok()
+        };
+        let (formula_json, cask_json) = std::thread::scope(|scope| {
+            let f = scope.spawn(|| info("--formula", &formulae));
+            let c = info("--cask", &casks);
+            (f.join().ok().flatten(), c)
+        });
+        let formula = formula_json
+            .map(|j| parse_formula_infos(&j))
+            .unwrap_or_default();
+        let cask = cask_json.map(|j| parse_cask_infos(&j)).unwrap_or_default();
+        formula
+            .into_iter()
+            .map(|(k, v)| (format!("brew::{k}"), v))
+            .chain(cask.into_iter().map(|(k, v)| (format!("cask::{k}"), v)))
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
+}
+
+// --- App icons ---
+//
+// The installed app's own icon, as a PNG data URL (img-src allows data:). Converted once with
+// `sips` and cached in ~/.freshet/icons, regenerated when the app's .icns is newer (an update can
+// change the icon).
+
+// A bare "Something.app" bundle name — no path separators, so it can only name a bundle directly
+// inside an Applications folder. Pure → unit-tested.
+fn is_valid_app_name(app: &str) -> bool {
+    app.len() <= 255
+        && Path::new(app)
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("app"))
+        && !app.contains('/')
+        && !app.starts_with('.')
+        && !app.chars().any(char::is_control)
+}
+
+fn find_app_bundle(app: &str) -> Option<PathBuf> {
+    let home_apps = dirs::home_dir().map(|h| h.join("Applications"));
+    [Some(PathBuf::from("/Applications")), home_apps]
+        .into_iter()
+        .flatten()
+        .map(|d| d.join(app))
+        .find(|p| p.is_dir())
+}
+
+fn icns_path(bundle: &Path) -> Option<PathBuf> {
+    let info = bundle.join("Contents/Info.plist");
+    let name = read_plist_string(info.to_str()?, "CFBundleIconFile")?;
+    let file = if Path::new(&name).extension().is_some() {
+        name
+    } else {
+        format!("{name}.icns")
+    };
+    let path = bundle.join("Contents/Resources").join(file);
+    path.is_file().then_some(path)
+}
+
+fn modified(p: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(p).and_then(|m| m.modified()).ok()
+}
+
+fn app_icon_png(app: &str) -> Option<Vec<u8>> {
+    let icns = icns_path(&find_app_bundle(app)?)?;
+    let dir = freshet_dir()?.join("icons");
+    std::fs::create_dir_all(&dir).ok()?;
+    let png = dir.join(format!("{}.png", app.trim_end_matches(".app")));
+    let fresh = matches!((modified(&png), modified(&icns)), (Some(p), Some(i)) if p >= i);
+    if !fresh {
+        let ok = Command::new("/usr/bin/sips")
+            .args(["-s", "format", "png", "-Z", "64"])
+            .arg(&icns)
+            .arg("--out")
+            .arg(&png)
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !ok {
+            return None;
+        }
+    }
+    std::fs::read(&png).ok()
+}
+
+#[tauri::command]
+async fn app_icon(app: String) -> Option<String> {
+    use base64::Engine as _;
+    if !is_valid_app_name(&app) {
+        return None;
+    }
+    tauri::async_runtime::spawn_blocking(move || app_icon_png(&app))
+        .await
+        .ok()
+        .flatten()
+        .map(|png| {
+            format!(
+                "data:image/png;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(png)
+            )
+        })
+}
+
 // Open an http(s) URL in the default browser (custom command, so no extra capability needed).
 #[tauri::command]
 fn open_url(url: String) {
@@ -863,77 +1385,125 @@ fn set_badge(app: tauri::AppHandle, count: u32) {
     }
 }
 
-// `brew --cache` shells out and is stable for the life of the process, so memoize it.
-// Returning &'static Path so callers don't have to clone for the common read-only use.
-fn brew_cache_dir() -> Option<&'static Path> {
-    static CACHE: OnceLock<Option<PathBuf>> = OnceLock::new();
-    CACHE
-        .get_or_init(|| {
-            let out = Command::new("brew").arg("--cache").output().ok()?;
-            if !out.status.success() {
-                return None;
-            }
-            let base = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if base.is_empty() {
-                None
-            } else {
-                Some(PathBuf::from(base))
-            }
-        })
-        .as_deref()
-}
-
-fn cask_jws_path() -> Option<PathBuf> {
-    let mut p = brew_cache_dir()?.to_path_buf();
-    p.push("api");
-    p.push("cask.jws.json");
-    Some(p)
-}
-
 // Scan /Applications and suggest apps that aren't brew-managed but have a matching cask, so the
-// user can adopt them in one click. Uses Homebrew's local cask metadata (no network).
+// user can adopt them in one click.
+//
+// Homebrew 7 removed the cask metadata file this used to read (and disabled `--eval-all`), so it
+// now uses only public commands: guess each unmanaged app's likely cask tokens from its name, keep
+// the guesses that are real casks (`brew casks`, all ~7,800 names in 0.1s), then confirm with one
+// `brew info --cask` that each candidate really installs that exact .app. Apps whose cask is
+// named nothing like the app (rare) aren't found.
+
+// Likely cask tokens for an app name, following Homebrew's token rules (lowercase, spaces →
+// hyphens, "+" → "-plus", "@" → "-at", other punctuation dropped), plus looser variants that
+// the brew-info confirmation step filters. Pure → unit-tested.
+fn cask_token_candidates(app_stem: &str) -> Vec<String> {
+    let lower = app_stem.to_lowercase();
+    let mut slug = String::new();
+    for c in lower.chars() {
+        match c {
+            'a'..='z' | '0'..='9' | '.' => slug.push(c),
+            '+' => slug.push_str("-plus"),
+            '@' => slug.push_str("-at"),
+            _ => slug.push('-'),
+        }
+    }
+    let tidy = |s: &str| {
+        s.split('-')
+            .filter(|p| !p.is_empty())
+            .collect::<Vec<_>>()
+            .join("-")
+    };
+    let base = tidy(&slug);
+    let mut out = vec![
+        base.clone(),
+        tidy(&base.replace('.', "-")),
+        tidy(&base.replace('.', "")),
+        // "zoom.us" → "zoom", "IntelliJ IDEA CE" → "intellij"
+        base.split(['-', '.']).next().unwrap_or("").to_string(),
+    ];
+    out.retain(|t| !t.is_empty());
+    out.dedup();
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|t| seen.insert(t.clone()));
+    out
+}
+
+// Pair unmanaged app bundles with candidate casks whose `app` artifact matches the bundle name
+// exactly (case-insensitive). `apps`: (bundle filename, display name). Pure → unit-tested.
+fn match_adoptions(
+    apps: &[(String, String)],
+    candidates: &HashMap<String, Vec<String>>,
+    cask_apps: &HashMap<String, Vec<String>>,
+) -> Vec<AdoptableApp> {
+    let mut out: Vec<AdoptableApp> = apps
+        .iter()
+        .filter_map(|(file, name)| {
+            let token = candidates.get(file)?.iter().find(|t| {
+                cask_apps
+                    .get(*t)
+                    .is_some_and(|apps| apps.iter().any(|a| a.eq_ignore_ascii_case(file)))
+            })?;
+            Some(AdoptableApp {
+                name: name.clone(),
+                token: token.clone(),
+            })
+        })
+        .collect();
+    out.sort_by_key(|a| a.name.to_lowercase());
+    out.dedup_by(|a, b| a.token == b.token);
+    out
+}
+
 #[tauri::command]
 async fn suggest_adoptions() -> Vec<AdoptableApp> {
-    tauri::async_runtime::spawn_blocking(|| {
-        let index = cask_jws_path()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|jws| extract_jws_payload(&jws))
-            .map(|payload| build_cask_app_index(&payload))
+    tauri::async_runtime::spawn_blocking(suggest_adoptions_blocking)
+        .await
+        .unwrap_or_default()
+}
+
+fn suggest_adoptions_blocking() -> Vec<AdoptableApp> {
+    {
+        let all_casks: std::collections::HashSet<String> = run_cmd("brew", &["casks"])
+            .map(|s| s.lines().map(|l| l.trim().to_string()).collect())
             .unwrap_or_default();
-        if index.is_empty() {
+        if all_casks.is_empty() {
             return vec![];
         }
-        let managed: std::collections::HashSet<String> = run_cmd("brew", &["list", "--cask"])
-            .map(|s| parse_cask_tokens(&s).into_iter().collect())
+        // Apps Homebrew already manages: whatever bundles the installed casks own.
+        let managed_tokens: Vec<String> = run_cmd("brew", &["list", "--cask"])
+            .map(|s| parse_cask_tokens(&s))
             .unwrap_or_default();
+        let managed_apps: std::collections::HashSet<String> = cask_apps(&managed_tokens)
+            .into_values()
+            .flatten()
+            .map(|a| a.to_lowercase())
+            .collect();
 
-        let mut seen = std::collections::HashSet::new();
-        let mut out = Vec::new();
+        let mut apps = Vec::new();
+        let mut candidates: HashMap<String, Vec<String>> = HashMap::new();
         for path in list_applications() {
-            let filename = match path.file_name().and_then(|s| s.to_str()) {
-                Some(f) => f.to_lowercase(),
-                None => continue,
+            let (Some(file), Some(stem)) = (
+                path.file_name().and_then(|s| s.to_str()),
+                path.file_stem().and_then(|s| s.to_str()),
+            ) else {
+                continue;
             };
-            if let Some(token) = index.get(&filename) {
-                if managed.contains(token) || !seen.insert(token.clone()) {
-                    continue;
-                }
-                let name = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("")
-                    .to_string();
-                out.push(AdoptableApp {
-                    name,
-                    token: token.clone(),
-                });
+            if managed_apps.contains(&file.to_lowercase()) {
+                continue;
+            }
+            let tokens: Vec<String> = cask_token_candidates(stem)
+                .into_iter()
+                .filter(|t| all_casks.contains(t))
+                .collect();
+            if !tokens.is_empty() {
+                candidates.insert(file.to_string(), tokens);
+                apps.push((file.to_string(), stem.to_string()));
             }
         }
-        out.sort_by_key(|a| a.name.to_lowercase());
-        out
-    })
-    .await
-    .unwrap_or_default()
+        let wanted: Vec<String> = candidates.values().flatten().cloned().collect();
+        match_adoptions(&apps, &candidates, &cask_apps(&wanted))
+    }
 }
 
 // The brew args that adopt an existing install. Pure so the --adopt flag can't silently regress.
@@ -953,6 +1523,9 @@ fn adopt_one(token: &str) -> UpdateResult {
             name: token.to_string(),
             success: false,
             output: "invalid cask token".into(),
+            action: None,
+            elapsed_ms: None,
+            skipped: false,
         };
     }
     let args = adopt_args(token);
@@ -963,6 +1536,9 @@ fn adopt_one(token: &str) -> UpdateResult {
         name: token.to_string(),
         success,
         output,
+        action: None,
+        elapsed_ms: None,
+        skipped: false,
     }
 }
 
@@ -976,6 +1552,9 @@ async fn adopt_cask(token: String) -> UpdateResult {
             name: "adopt".into(),
             success: false,
             output: "adoption task failed".into(),
+            action: None,
+            elapsed_ms: None,
+            skipped: false,
         })
 }
 
@@ -1021,86 +1600,433 @@ fn fetch_batches(selections: &[UpdateSelection]) -> (Vec<String>, Vec<String>) {
     (formulae, casks)
 }
 
-// Concurrently pre-download the artifacts for the selected brew formulae and casks so the network
-// transfers overlap instead of downloading one-at-a-time inside the serialized install loop.
-// `brew fetch` fills Homebrew's cache without installing; the subsequent `brew upgrade` then
-// installs from cache with no re-download.
-//
-// One batched `brew fetch` PER KIND (not one process per token): Homebrew loads formula metadata
-// once and downloads the whole set concurrently itself (HOMEBREW_DOWNLOAD_CONCURRENCY, 16 by
-// default on brew 4.4+). That avoids paying brew's ~1s/token Ruby+metadata startup 20+ times over
-// and lets brew's own downloader saturate the link — measurably faster than spawning a fetch per
-// token. The two kinds run on their own threads so formula and cask downloads overlap too.
-// Best-effort: a fetch miss just means the upgrade downloads it inline.
-fn prefetch_selected(selections: &[UpdateSelection]) {
-    let (formulae, casks) = fetch_batches(selections);
-    std::thread::scope(|scope| {
-        if !formulae.is_empty() {
-            scope.spawn(|| {
-                let mut args: Vec<&str> = vec!["fetch", "--formula"];
-                args.extend(formulae.iter().map(String::as_str));
-                let _ = run_cmd("brew", &args);
-            });
-        }
-        if !casks.is_empty() {
-            scope.spawn(|| {
-                let mut args: Vec<&str> = vec!["fetch", "--cask"];
-                args.extend(casks.iter().map(String::as_str));
-                let _ = run_cmd("brew", &args);
-            });
-        }
-    });
+// Pre-download the selected casks with one `brew fetch --cask` so the pre-install signer check
+// (preverify) has the new version on disk to inspect before anything is installed. Formulae are
+// not prefetched: `brew upgrade` already downloads its whole batch in parallel through its own
+// download queue (HOMEBREW_DOWNLOAD_CONCURRENCY, 2× cores), so a separate fetch was a redundant
+// brew start-up plus a silent phase. Best-effort: a miss just means preverify can't inspect.
+fn prefetch_casks(selections: &[UpdateSelection]) {
+    let (_, casks) = fetch_batches(selections);
+    if !casks.is_empty() {
+        let mut args: Vec<&str> = vec!["fetch", "--cask"];
+        args.extend(casks.iter().map(String::as_str));
+        let _ = run_cmd("brew", &args);
+    }
+}
+
+// Live progress for an update run, emitted to the frontend as "update-progress".
+#[derive(Clone, Serialize, Debug, PartialEq, Eq)]
+struct UpdateProgress {
+    // What's happening: "Refreshing Homebrew", "Downloading apps", "Checking publisher",
+    // "Upgrading", "Installing".
+    phase: String,
+    // The package being worked on, if any.
+    current: Option<String>,
+    // Packages finished so far, out of `total` selected.
+    done: usize,
+    total: usize,
+}
+
+type ProgressFn<'a> = &'a (dyn Fn(UpdateProgress) + Sync);
+
+fn progress_event(phase: &str, current: Option<&str>, done: usize, total: usize) -> UpdateProgress {
+    UpdateProgress {
+        phase: phase.into(),
+        current: current.map(String::from),
+        done,
+        total,
+    }
 }
 
 // --- Upgrade only the items the user selected, returning a result per item ---
 #[tauri::command]
-async fn run_selected_updates(selections: Vec<UpdateSelection>) -> Vec<UpdateResult> {
-    tauri::async_runtime::spawn_blocking(move || run_selected_updates_blocking(&selections))
-        .await
-        .unwrap_or_default()
+async fn run_selected_updates(
+    app: tauri::AppHandle,
+    selections: Vec<UpdateSelection>,
+) -> Vec<UpdateResult> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let results = run_selected_updates_blocking(&selections, &|p| {
+            let _ = app.emit("update-progress", p);
+        });
+        record_manual_history(&selections, &results);
+        results
+    })
+    .await
+    .unwrap_or_default()
 }
 
-fn run_selected_updates_blocking(selections: &[UpdateSelection]) -> Vec<UpdateResult> {
+fn run_selected_updates_blocking(
+    selections: &[UpdateSelection],
+    progress: ProgressFn<'_>,
+) -> Vec<UpdateResult> {
+    STOP_REQUESTED.store(false, Ordering::SeqCst);
     let mut results = Vec::new();
-
-    // Refresh Homebrew's metadata once up front if any brew/cask item is selected.
+    // Refresh Homebrew's metadata first if any brew/cask item is selected (skipped if fresh).
     if selections
         .iter()
         .any(|s| s.kind == "brew" || s.kind == "cask")
     {
-        let (success, output) = run_update_cmd("brew", &["update"]);
-        results.push(UpdateResult {
-            kind: "brew".into(),
-            name: "brew update".into(),
-            success,
-            output,
-        });
+        progress(progress_event(
+            "Refreshing Homebrew",
+            None,
+            0,
+            selections.len(),
+        ));
+        results.extend(brew_update_if_stale());
+    }
+    results.extend(install_selections(selections, progress));
+    results
+}
+
+// Install each selection, returning exactly one result per selection, in order. No `brew update`
+// here — callers decide when metadata is refreshed (the scheduled run does it before checking).
+//
+// Homebrew items are upgraded in one `brew upgrade` per kind rather than one process per package:
+// each brew start-up costs ~0.7s and re-resolves dependencies, so 10 formulae went from 7.1s of
+// overhead to 0.8s (measured). Per-item results are recovered afterwards: what's still outdated
+// failed, and each item's log is its own `==> Upgrading <name>` section of brew's output.
+// Casks are checked for a publisher change *before* installing (see preverify) and snapshotted
+// for rollback. mas and npm have no batch mode and run one at a time.
+fn install_selections(
+    selections: &[UpdateSelection],
+    progress: ProgressFn<'_>,
+) -> Vec<UpdateResult> {
+    let total = selections.len();
+    let mut done = 0;
+    let mut results: Vec<Option<UpdateResult>> = vec![None; total];
+    let stopped = || STOP_REQUESTED.load(Ordering::SeqCst);
+    // One `ps` for the whole run: which app bundles have a process running right now.
+    let running = running_executables();
+
+    if selections.iter().any(|s| s.kind == "cask") && !stopped() {
+        progress(progress_event("Downloading apps", None, done, total));
+        let started = std::time::Instant::now();
+        prefetch_casks(selections);
+        tracing::info!(elapsed_ms = elapsed_ms(started), "prefetch casks");
     }
 
-    // Warm the download cache for every selected formula/cask concurrently before the serialized
-    // install loop, so the network transfers overlap instead of downloading one at a time.
-    prefetch_selected(selections);
+    let mut formulae = Vec::new();
+    let mut casks = Vec::new();
+    for (i, sel) in selections.iter().enumerate() {
+        match build_update_command(&sel.kind, &sel.id) {
+            None => {
+                results[i] = Some(failed_result(
+                    sel,
+                    format!("unsupported or invalid update: {} / {}", sel.kind, sel.id),
+                ));
+            }
+            Some(_) if sel.kind == "brew" => formulae.push(i),
+            Some(_) if sel.kind == "cask" => casks.push(i),
+            Some((cmd, args)) => {
+                if stopped() {
+                    results[i] = Some(not_started(sel));
+                    continue;
+                }
+                // App Store apps are bundles in /Applications named after the app.
+                if sel.kind == "mas" {
+                    let bundle = Path::new("/Applications").join(format!("{}.app", sel.name));
+                    if bundle_is_running(&bundle, &running) {
+                        results[i] = Some(skipped_open(sel, &bundle));
+                        done += 1;
+                        continue;
+                    }
+                }
+                progress(progress_event("Installing", Some(&sel.name), done, total));
+                done += 1;
+                let started = std::time::Instant::now();
+                let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+                let (success, output) = run_update_cmd(cmd, &arg_refs);
+                results[i] = Some(UpdateResult {
+                    kind: sel.kind.clone(),
+                    name: sel.name.clone(),
+                    success,
+                    output,
+                    action: None,
+                    elapsed_ms: Some(elapsed_ms(started)),
+                    skipped: false,
+                });
+            }
+        }
+    }
 
-    for sel in selections {
-        let Some((cmd, args)) = build_update_command(&sel.kind, &sel.id) else {
-            results.push(UpdateResult {
+    // Casks: skip ones that are open (upgrading can quit them and lose unsaved work), refuse any
+    // whose download is signed by a different publisher, and snapshot the rest for rollback.
+    let mut cleared_casks = Vec::new();
+    let tokens: Vec<String> = casks.iter().map(|&i| selections[i].id.clone()).collect();
+    let apps_by_token = cask_apps(&tokens);
+    for i in casks {
+        let sel = &selections[i];
+        if stopped() {
+            results[i] = Some(not_started(sel));
+            continue;
+        }
+        let installed =
+            installed_cask_apps(apps_by_token.get(&sel.id).map_or(&[][..], Vec::as_slice));
+        if let Some(open) = installed.iter().find(|b| bundle_is_running(b, &running)) {
+            results[i] = Some(skipped_open(sel, open));
+            done += 1;
+            continue;
+        }
+        progress(progress_event(
+            "Checking publisher",
+            Some(&sel.name),
+            done,
+            total,
+        ));
+        match preverify::check_cask(&sel.id, &installed) {
+            preverify::Verdict::Blocked {
+                reason,
+                bundle_id,
+                team,
+            } => {
+                tracing::warn!(cask = %sel.id, %reason, "blocked before install");
+                results[i] = Some(UpdateResult {
+                    action: bundle_id
+                        .map(|bundle_id| ResultAction::TrustSigner { bundle_id, team }),
+                    ..failed_result(sel, reason)
+                });
+                done += 1;
+            }
+            preverify::Verdict::Allowed { note } => {
+                let snapshotted = rollback::snapshot_cask(&sel.id, &installed);
+                tracing::info!(cask = %sel.id, ?note, snapshotted, "cleared for install");
+                cleared_casks.push((i, note, snapshotted));
+            }
+        }
+    }
+
+    let formula_results = upgrade_batch("--formula", &formulae, selections, progress, done, total);
+    done += formulae.len();
+    for (i, r) in formulae.iter().zip(formula_results) {
+        results[*i] = Some(r);
+    }
+    let cask_indices: Vec<usize> = cleared_casks.iter().map(|(i, _, _)| *i).collect();
+    let cask_results = upgrade_batch("--cask", &cask_indices, selections, progress, done, total);
+    for ((i, note, snapshotted), mut r) in cleared_casks.into_iter().zip(cask_results) {
+        if let Some(note) = note {
+            r.output = format!("{note}\n{}", r.output).trim().to_string();
+        }
+        if snapshotted && r.success {
+            r.action = Some(ResultAction::Rollback {
+                token: selections[i].id.clone(),
+            });
+        }
+        results[i] = Some(r);
+    }
+
+    results
+        .into_iter()
+        .zip(selections)
+        .map(|(r, sel)| r.unwrap_or_else(|| failed_result(sel, "not attempted".into())))
+        .collect()
+}
+
+fn failed_result(sel: &UpdateSelection, output: String) -> UpdateResult {
+    UpdateResult {
+        kind: sel.kind.clone(),
+        name: sel.name.clone(),
+        success: false,
+        output,
+        action: None,
+        elapsed_ms: None,
+        skipped: false,
+    }
+}
+
+const NOT_STARTED: &str = "Not started: you stopped the update.";
+
+fn not_started(sel: &UpdateSelection) -> UpdateResult {
+    UpdateResult {
+        skipped: true,
+        ..failed_result(sel, NOT_STARTED.into())
+    }
+}
+
+fn skipped_open(sel: &UpdateSelection, bundle: &Path) -> UpdateResult {
+    let app = bundle
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let shown = app.trim_end_matches(".app");
+    UpdateResult {
+        skipped: true,
+        action: Some(ResultAction::QuitAndUpdate {
+            kind: sel.kind.clone(),
+            id: sel.id.clone(),
+            name: sel.name.clone(),
+            app: app.clone(),
+        }),
+        ..failed_result(
+            sel,
+            format!(
+                "Skipped: {shown} is open, and updating it could quit it and lose unsaved work. \
+                 Quit it and update now, or it will be updated next time."
+            ),
+        )
+    }
+}
+
+// --- Is an app open? ---
+
+// Full executable paths of every running process (`ps -axo comm=` prints them on macOS).
+fn running_executables() -> Vec<String> {
+    Command::new("/bin/ps")
+        .args(["-axo", "comm="])
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(|l| l.trim().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+// Any process (the app or one of its helpers) running from inside `bundle`. Pure → tested.
+fn bundle_is_running(bundle: &Path, executables: &[String]) -> bool {
+    let prefix = format!("{}/Contents/", bundle.display());
+    executables.iter().any(|e| e.starts_with(&prefix))
+}
+
+// One `brew upgrade <kind_flag> a b c …` for the given selections; one result per index, in order.
+// `done_before`/`total` place this batch within the whole run for progress reporting.
+#[tracing::instrument(skip(indices, selections, progress), fields(count = indices.len()))]
+fn upgrade_batch(
+    kind_flag: &str,
+    indices: &[usize],
+    selections: &[UpdateSelection],
+    progress: ProgressFn<'_>,
+    done_before: usize,
+    total: usize,
+) -> Vec<UpdateResult> {
+    if indices.is_empty() {
+        return Vec::new();
+    }
+    if STOP_REQUESTED.load(Ordering::SeqCst) {
+        return indices
+            .iter()
+            .map(|&i| not_started(&selections[i]))
+            .collect();
+    }
+    let ids: Vec<&str> = indices.iter().map(|&i| selections[i].id.as_str()).collect();
+    let mut args = vec!["upgrade", kind_flag];
+    args.extend(&ids);
+
+    let started = std::time::Instant::now();
+    progress(progress_event("Upgrading", None, done_before, total));
+    // Report each package as brew reaches it, so a 65-package batch isn't a silent multi-minute
+    // wait; and if the user asked to stop, interrupt at the next package boundary.
+    let wanted: std::collections::HashSet<&str> = ids.iter().copied().collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut interrupted = false;
+    let (batch_ok, output) = run_update_cmd_streaming("brew", &args, &mut |line| {
+        if interrupted {
+            return;
+        }
+        if is_package_boundary(line) && STOP_REQUESTED.load(Ordering::SeqCst) {
+            interrupt_running_child();
+            interrupted = true;
+            return;
+        }
+        if let Some(name) = upgrading_name(line, &wanted) {
+            if seen.insert(name.to_string()) {
+                let done = done_before + seen.len() - 1;
+                progress(progress_event("Upgrading", Some(name), done, total));
+            }
+        }
+    });
+    let elapsed = elapsed_ms(started);
+    tracing::info!(
+        elapsed_ms = elapsed,
+        batch_ok,
+        interrupted,
+        "brew upgrade batch"
+    );
+
+    // brew exits non-zero if *any* item failed. The truth per item is whether it's still outdated.
+    let still_outdated: Option<std::collections::HashSet<String>> = if batch_ok {
+        Some(std::collections::HashSet::new())
+    } else {
+        run_cmd("brew", &["outdated", "--json=v2", "--greedy"])
+            .ok()
+            .map(|json| outdated_names(&json))
+    };
+    let sections = split_brew_sections(&output, &ids);
+
+    indices
+        .iter()
+        .zip(&ids)
+        .map(|(&i, id)| {
+            let sel = &selections[i];
+            // If even the re-check failed, fall back to the batch's overall outcome.
+            let success = still_outdated
+                .as_ref()
+                .map_or(batch_ok, |outdated| !outdated.contains(*id));
+            if interrupted && !success && !seen.contains(*id) {
+                return not_started(sel);
+            }
+            let own = sections.get(*id).cloned().unwrap_or_default();
+            let item_output = if !own.is_empty() {
+                own
+            } else if success {
+                format!("Upgraded in one batch of {}.", ids.len())
+            } else {
+                output.clone()
+            };
+            UpdateResult {
                 kind: sel.kind.clone(),
                 name: sel.name.clone(),
-                success: false,
-                output: format!("unsupported or invalid update: {} / {}", sel.kind, sel.id),
-            });
-            continue;
-        };
-        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let (success, output) = run_update_cmd(cmd, &arg_refs);
-        results.push(UpdateResult {
-            kind: sel.kind.clone(),
-            name: sel.name.clone(),
-            success,
-            output,
-        });
+                success,
+                output: item_output,
+                action: None,
+                elapsed_ms: Some(elapsed),
+                skipped: false,
+            }
+        })
+        .collect()
+}
+
+// Names of everything (formulae + casks) in `brew outdated --json=v2 --greedy` output.
+fn outdated_names(json: &str) -> std::collections::HashSet<String> {
+    parse_brew_outdated(json)
+        .into_iter()
+        .map(|i| i.id)
+        .chain(parse_cask_names(json))
+        .collect()
+}
+
+// Split a batched `brew upgrade` log into per-package sections. brew starts each package with
+// `==> Upgrading <name>` (formula and cask alike; see Homebrew's upgrade.rb / cask/upgrade.rb),
+// and reports failures as `Error: <name>: …` lines, often at the end, so those are attributed to
+// their package too. Pure → unit-tested.
+fn split_brew_sections(output: &str, names: &[&str]) -> HashMap<String, String> {
+    let wanted: std::collections::HashSet<&str> = names.iter().copied().collect();
+    let mut sections: HashMap<String, String> = HashMap::new();
+    let mut current: Option<String> = None;
+    for line in output.lines() {
+        if let Some(rest) = line.strip_prefix("==> Upgrading ") {
+            let name = rest.split_whitespace().next().unwrap_or("");
+            current = wanted.contains(name).then(|| name.to_string());
+        }
+        if let Some(rest) = line.strip_prefix("Error: ") {
+            let name = rest.split(':').next().unwrap_or("").trim();
+            if wanted.contains(name) {
+                let entry = sections.entry(name.to_string()).or_default();
+                entry.push_str(line);
+                entry.push('\n');
+                continue;
+            }
+        }
+        if let Some(name) = &current {
+            let entry = sections.entry(name.clone()).or_default();
+            entry.push_str(line);
+            entry.push('\n');
+        }
     }
-    results
+    sections
+        .into_iter()
+        .map(|(k, v)| (k, v.trim().to_string()))
+        .collect()
 }
 
 // --- Signature / provenance verification ---
@@ -1109,6 +2035,8 @@ fn run_selected_updates_blocking(selections: &[UpdateSelection]) -> Vec<UpdateRe
 
 struct AppSig {
     name: String,
+    // CFBundleIdentifier from the signature; the signer store's key (stable across renames).
+    bundle_id: Option<String>,
     team_id: Option<String>,
     authority: Option<String>,
     signed: bool,
@@ -1159,12 +2087,41 @@ fn parse_notarized(spctl_accepted: bool, spctl_output: &str) -> bool {
         && spctl_output.to_lowercase().contains("source=notarized")
 }
 
+// `Identifier=` line of `codesign -dvv`: the signed bundle identifier.
+fn parse_identifier(codesign_output: &str) -> Option<String> {
+    codesign_output.lines().find_map(|l| {
+        let id = l.strip_prefix("Identifier=")?.trim();
+        (!id.is_empty()).then(|| id.to_string())
+    })
+}
+
+// Just who signed a bundle (no spctl/notarization), for the pre-install comparison.
+fn read_signer(path: &Path) -> preverify::Signer {
+    Command::new("/usr/bin/codesign")
+        .arg("-dvv")
+        .arg(path)
+        .output()
+        .map_or(
+            preverify::Signer {
+                bundle_id: None,
+                team: None,
+            },
+            |out| {
+                let text = combine_output(&out.stdout, &out.stderr);
+                preverify::Signer {
+                    bundle_id: parse_identifier(&text),
+                    team: parse_signing(&text).0,
+                }
+            },
+        )
+}
+
 // A signer change (different Team ID than last seen) is the hijacked-release signal.
 fn cert_changed(previous: Option<&str>, current: Option<&str>) -> bool {
     matches!((previous, current), (Some(p), Some(c)) if p != c)
 }
 
-fn inspect_app(path: &Path) -> AppSig {
+fn inspect_app(path: &Path, known_notarized: Option<bool>) -> AppSig {
     let name = path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -1174,28 +2131,36 @@ fn inspect_app(path: &Path) -> AppSig {
 
     let mut team_id = None;
     let mut authority = None;
+    let mut bundle_id = None;
     let mut signed = false;
-    if let Ok(out) = Command::new("codesign").args(["-dvv", path_str]).output() {
+    if let Ok(out) = command("/usr/bin/codesign")
+        .args(["-dvv", path_str])
+        .output()
+    {
         signed = out.status.success();
         // codesign writes its details to stderr.
         let text = combine_output(&out.stdout, &out.stderr);
         let (t, a) = parse_signing(&text);
         team_id = t;
         authority = a;
+        bundle_id = parse_identifier(&text);
     }
 
-    let notarized = if let Ok(out) = Command::new("spctl")
-        .args(["--assess", "--type", "execute", "-v", path_str])
-        .output()
-    {
-        let text = combine_output(&out.stdout, &out.stderr);
-        parse_notarized(out.status.success(), &text)
-    } else {
-        false
-    };
+    // spctl is the slow part (~2.7s/app, and serialized system-wide by syspolicyd, so
+    // parallelism barely helps); skip it when the caller already knows the answer.
+    let notarized = known_notarized.unwrap_or_else(|| {
+        command("/usr/sbin/spctl")
+            .args(["--assess", "--type", "execute", "-v", path_str])
+            .output()
+            .is_ok_and(|out| {
+                let text = combine_output(&out.stdout, &out.stderr);
+                parse_notarized(out.status.success(), &text)
+            })
+    });
 
     AppSig {
         name,
+        bundle_id,
         team_id,
         authority,
         signed,
@@ -1267,10 +2232,22 @@ fn build_verify_entries(
 ) -> Vec<(UpdateResult, bool)> {
     let mut entries: Vec<(UpdateResult, bool)> = Vec::new();
     for sig in sigs {
-        let prev = store.get(&sig.name).cloned();
+        // Keyed by bundle id (survives renames, no collisions between same-named apps). Older
+        // stores were keyed by app name; those entries are read as a fallback and migrated.
+        let key = sig.bundle_id.clone().unwrap_or_else(|| sig.name.clone());
+        let prev = store.get(&key).or_else(|| store.get(&sig.name)).cloned();
         let changed = cert_changed(prev.as_deref(), sig.team_id.as_deref());
-        if let Some(c) = &sig.team_id {
-            store.insert(sig.name.clone(), c.clone());
+        // The baseline only moves when nothing changed. On drift it stays put, so the warning
+        // repeats on every check until the user explicitly trusts the new publisher
+        // (trust_signer) — previously the first sighting of a new signer silently became the
+        // baseline and the alarm fired exactly once.
+        if !changed {
+            if let Some(team) = &sig.team_id {
+                store.insert(key.clone(), team.clone());
+                if key != sig.name {
+                    store.remove(&sig.name);
+                }
+            }
         }
         // Flagged = a changed signer or an unsigned app. Everything else is a "verified publisher".
         let ok = sig.signed && !changed;
@@ -1299,12 +2276,22 @@ fn build_verify_entries(
             "Notarized by Apple: no"
         });
 
+        let action = match (changed, &sig.team_id) {
+            (true, Some(team)) => Some(ResultAction::TrustSigner {
+                bundle_id: key.clone(),
+                team: team.clone(),
+            }),
+            _ => None,
+        };
         entries.push((
             UpdateResult {
                 kind: "verify".into(),
                 name: sig.name.clone(),
                 success: ok,
                 output: out.trim().to_string(),
+                action,
+                elapsed_ms: None,
+                skipped: false,
             },
             changed,
         ));
@@ -1312,78 +2299,234 @@ fn build_verify_entries(
     entries
 }
 
-// Resolve a set of cask tokens to the lowercased `.app` filenames they install. The local
-// Homebrew JWS metadata enumerates each cask's `artifacts.app` array; a single token can map to
-// several `.app` bundles. Pure so it's unit-testable against fixture JSON.
-fn resolve_cask_app_filenames(payload_json: &str, tokens: &[String]) -> Vec<String> {
-    let casks: Vec<serde_json::Value> = serde_json::from_str(payload_json).unwrap_or_default();
-    let wanted: std::collections::HashSet<&str> = tokens.iter().map(String::as_str).collect();
-    let mut out = Vec::new();
-    for cask in &casks {
-        let Some(token) = cask["token"].as_str() else {
-            continue;
-        };
-        if !wanted.contains(token) {
-            continue;
-        }
-        let Some(artifacts) = cask["artifacts"].as_array() else {
-            continue;
-        };
-        for art in artifacts {
-            if let Some(apps) = art["app"].as_array() {
-                for app in apps.iter().filter_map(|a| a.as_str()) {
-                    out.push(app.to_lowercase());
-                }
-            }
-        }
+// The trusted Team ID for a bundle id, if one has been recorded.
+fn trusted_team(bundle_id: &str) -> Option<String> {
+    let _guard = signing_store_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    load_signing_store().get(bundle_id).cloned()
+}
+
+// Shapes we accept from the frontend before writing them into the trust baseline.
+fn is_valid_bundle_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 255
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+}
+
+fn is_valid_team_id(team: &str) -> bool {
+    team.len() == 10
+        && team
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+}
+
+// The user vouches for a publisher change: record `team` as the baseline for `bundle_id`. Clears
+// the repeating drift warning, and lets a pre-install check that blocked on it go through.
+#[tauri::command]
+fn trust_signer(bundle_id: String, team: String) -> Result<(), String> {
+    if !is_valid_bundle_id(&bundle_id) || !is_valid_team_id(&team) {
+        return Err("invalid bundle id or Team ID".into());
     }
-    out
+    let _guard = signing_store_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut store = load_signing_store();
+    store.insert(bundle_id, team);
+    save_signing_store(&store);
+    Ok(())
+}
+
+// --- Which .app bundles a cask owns ---
+//
+// From the public `brew info --json=v2 --cask` (one call for many tokens). Homebrew 7 removed
+// the `api/cask.jws.json` cache file this used to read, which silently emptied the post-update
+// check; its replacement is an internal, indexed format we don't depend on.
+
+// token → its `app` artifact names. Pure → unit-tested against real output.
+fn parse_cask_apps(json: &str) -> HashMap<String, Vec<String>> {
+    let parsed: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
+    parsed["casks"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|c| {
+            let token = c["token"].as_str()?.to_string();
+            let apps = c["artifacts"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|a| a["app"].as_array())
+                .flatten()
+                .filter_map(|a| a.as_str().map(String::from))
+                .collect();
+            Some((token, apps))
+        })
+        .collect()
+}
+
+fn cask_apps(tokens: &[String]) -> HashMap<String, Vec<String>> {
+    let tokens: Vec<&str> = tokens
+        .iter()
+        .map(String::as_str)
+        .filter(|t| is_valid_cask_token(t))
+        .collect();
+    if tokens.is_empty() {
+        return HashMap::new();
+    }
+    let info = |tokens: &[&str]| -> Option<HashMap<String, Vec<String>>> {
+        let mut args = vec!["info", "--json=v2", "--cask"];
+        args.extend(tokens);
+        let parsed = parse_cask_apps(&run_cmd("brew", &args).ok()?);
+        (!parsed.is_empty()).then_some(parsed)
+    };
+    // `brew info` is all-or-nothing: one cask it refuses to load (e.g. from an untrusted tap)
+    // fails the whole call with no output. Then ask per cask, so one bad token only costs itself
+    // — otherwise every cask in the batch would silently lose its pre-install check and snapshot.
+    info(&tokens).unwrap_or_else(|| {
+        tracing::warn!("bulk brew info failed; looking casks up one by one");
+        let next = AtomicUsize::new(0);
+        let found = std::sync::Mutex::new(HashMap::new());
+        std::thread::scope(|scope| {
+            for _ in 0..tokens.len().min(8) {
+                scope.spawn(|| {
+                    while let Some(token) = tokens.get(next.fetch_add(1, Ordering::SeqCst)) {
+                        if let Some(one) = info(&[token]) {
+                            found
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .extend(one);
+                        }
+                    }
+                });
+            }
+        });
+        found
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    })
+}
+
+// The named bundles that are actually present in /Applications (case-insensitive match).
+fn installed_cask_apps(app_names: &[String]) -> Vec<PathBuf> {
+    let wanted: std::collections::HashSet<String> =
+        app_names.iter().map(|a| a.to_lowercase()).collect();
+    list_applications()
+        .into_iter()
+        .filter(|p| {
+            p.file_name()
+                .is_some_and(|f| wanted.contains(&f.to_string_lossy().to_lowercase()))
+        })
+        .collect()
+}
+
+// --- Notarization cache ---
+//
+// An app's notarization status only changes when the app does, so `spctl`'s answer is cached per
+// bundle path, keyed on its Info.plist mtime (rewritten by every update). A rescan of an
+// unchanged /Applications skips spctl entirely: ~31s → about a second on 33 apps (measured).
+
+type NotarizationCache = HashMap<String, (u64, bool)>;
+
+fn notarization_cache_path() -> Option<PathBuf> {
+    freshet_dir().map(|d| d.join("notarization.json"))
+}
+
+fn info_plist_mtime(app: &Path) -> Option<u64> {
+    modified(&app.join("Contents/Info.plist"))?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+// The cached answer, only if the app hasn't changed since. Pure → unit-tested.
+fn cached_notarization(cache: &NotarizationCache, path: &str, mtime: Option<u64>) -> Option<bool> {
+    let (cached_mtime, notarized) = cache.get(path)?;
+    (Some(*cached_mtime) == mtime).then_some(*notarized)
+}
+
+// Inspect every app in /Applications: at most one worker per core (spctl is serialized by the
+// system anyway, so more processes just contend), notarization served from cache when the app
+// hasn't changed. `progress(done, total)` is called as each app finishes.
+fn inspect_all_apps(progress: &(dyn Fn(usize, usize) + Sync)) -> Vec<AppSig> {
+    let apps = list_applications();
+    let total = apps.len();
+    let mut cache: NotarizationCache = notarization_cache_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    let workers = std::thread::available_parallelism()
+        .map_or(4, std::num::NonZeroUsize::get)
+        .clamp(1, 8);
+    let next = AtomicUsize::new(0);
+    let done = AtomicUsize::new(0);
+    let found = std::sync::Mutex::new(Vec::with_capacity(total));
+    let started = std::time::Instant::now();
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::SeqCst);
+                let Some(path) = apps.get(i) else { break };
+                let key = path.to_string_lossy().into_owned();
+                let mtime = info_plist_mtime(path);
+                let sig = inspect_app(path, cached_notarization(&cache, &key, mtime));
+                found
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push((key, mtime, sig));
+                progress(done.fetch_add(1, Ordering::SeqCst) + 1, total);
+            });
+        }
+    });
+    let found = found
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    cache.clear(); // drop apps that were removed
+    let mut sigs = Vec::with_capacity(found.len());
+    for (key, mtime, sig) in found {
+        if let Some(m) = mtime {
+            cache.insert(key, (m, sig.notarized));
+        }
+        sigs.push(sig);
+    }
+    if let (Some(p), Ok(json)) = (notarization_cache_path(), serde_json::to_string(&cache)) {
+        let _ = write_private(&p, &json, false);
+    }
+    tracing::info!(
+        apps = total,
+        elapsed_ms = elapsed_ms(started),
+        "signature scan"
+    );
+    sigs
+}
+
+// Full scan diffed against (and updating) the signer baseline.
+fn verify_all_blocking(progress: &(dyn Fn(usize, usize) + Sync)) -> Vec<(UpdateResult, bool)> {
+    let sigs = inspect_all_apps(progress);
+    let _guard = signing_store_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut store = load_signing_store();
+    let entries = build_verify_entries(&sigs, &mut store);
+    save_signing_store(&store);
+    entries
 }
 
 #[tauri::command]
 async fn verify_signatures(app: tauri::AppHandle, only_changed: Option<bool>) -> Vec<UpdateResult> {
     let only_changed = only_changed.unwrap_or(false);
-    let apps = tauri::async_runtime::spawn_blocking(list_applications)
-        .await
-        .unwrap_or_default();
-
-    let total = apps.len();
-    let done = Arc::new(AtomicUsize::new(0));
-    let _ = app.emit("verify-progress", VerifyProgress { done: 0, total });
-
-    // Each app is inspected on its own blocking thread and emits a progress tick when it finishes,
-    // so the frontend's progress ring reflects real completion.
-    let mut handles = Vec::new();
-    for path in apps {
-        let app = app.clone();
-        let done = done.clone();
-        handles.push(tauri::async_runtime::spawn_blocking(move || {
-            let sig = inspect_app(&path);
-            let d = done.fetch_add(1, Ordering::SeqCst) + 1;
-            let _ = app.emit("verify-progress", VerifyProgress { done: d, total });
-            sig
-        }));
-    }
-    let mut sigs = Vec::new();
-    for h in handles {
-        if let Ok(sig) = h.await {
-            sigs.push(sig);
-        }
-    }
-
-    // Held across the load → mutate → save so concurrent verify runs can't lose updates.
-    // Lock poisoning is harmless here (store is just a serializable HashMap), so recover
-    // instead of panicking on a previous panic.
-    let entries = {
-        let _guard = signing_store_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut store = load_signing_store();
-        let entries = build_verify_entries(&sigs, &mut store);
-        save_signing_store(&store);
-        entries
-    };
-
+    let entries = tauri::async_runtime::spawn_blocking(move || {
+        let _ = app.emit("verify-progress", VerifyProgress { done: 0, total: 0 });
+        verify_all_blocking(&|done, total| {
+            let _ = app.emit("verify-progress", VerifyProgress { done, total });
+        })
+    })
+    .await
+    .unwrap_or_default();
     let mut results = select_verify_results(entries, only_changed);
     // Flagged apps first (they auto-expand and need attention); verified publishers after.
     results.sort_by_key(|r| r.success);
@@ -1405,31 +2548,13 @@ fn verify_updated_casks_blocking(tokens: &[String]) -> Vec<UpdateResult> {
     if tokens.is_empty() {
         return vec![];
     }
-    // token → app filename(s) via the local Homebrew cask metadata. No network.
-    let filenames: std::collections::HashSet<String> = cask_jws_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|jws| extract_jws_payload(&jws))
-        .map(|payload| resolve_cask_app_filenames(&payload, tokens))
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
-    if filenames.is_empty() {
-        return vec![];
-    }
-    // Filter /Applications to just the matching bundles.
-    let paths: Vec<PathBuf> = list_applications()
-        .into_iter()
-        .filter(|p| {
-            p.file_name()
-                .and_then(|s| s.to_str())
-                .is_some_and(|f| filenames.contains(&f.to_lowercase()))
-        })
-        .collect();
+    let names: Vec<String> = cask_apps(tokens).into_values().flatten().collect();
+    let paths = installed_cask_apps(&names);
     if paths.is_empty() {
         return vec![];
     }
     // Targeted check is small (1–5 apps in practice); serial inspection is fine.
-    let sigs: Vec<AppSig> = paths.iter().map(|p| inspect_app(p)).collect();
+    let sigs: Vec<AppSig> = paths.iter().map(|p| inspect_app(p, None)).collect();
 
     let entries = {
         let _guard = signing_store_lock()
@@ -1447,113 +2572,894 @@ fn verify_updated_casks_blocking(tokens: &[String]) -> Vec<UpdateResult> {
     results
 }
 
+// --- Update history: ~/.freshet/history.jsonl, one line per package per run ---
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+struct HistoryEntry {
+    // Unix seconds.
+    at: u64,
+    // "manual" or "scheduled".
+    source: String,
+    kind: String,
+    id: String,
+    name: String,
+    from: String,
+    to: String,
+    // "updated" | "failed" | "needs_admin" | "blocked" | "skipped_open"
+    outcome: String,
+    #[serde(default)]
+    elapsed_ms: Option<u64>,
+}
+
+const HISTORY_KEEP: usize = 2000;
+
+fn history_path() -> Option<PathBuf> {
+    freshet_dir().map(|d| d.join("history.jsonl"))
+}
+
+fn outcome_of(r: &UpdateResult) -> &'static str {
+    match &r.action {
+        Some(ResultAction::TrustSigner { .. }) => "blocked",
+        Some(ResultAction::QuitAndUpdate { .. }) => "skipped_open",
+        _ if r.success => "updated",
+        _ if needs_admin(&r.output) => "needs_admin",
+        _ => "failed",
+    }
+}
+
+// (kind, id) → (installed, latest), from a check's categories.
+type Versions = HashMap<(String, String), (String, String)>;
+
+fn versions_of(categories: &[CategoryStatus]) -> Versions {
+    categories
+        .iter()
+        .flat_map(|c| {
+            c.items.iter().map(|i| {
+                (
+                    (c.kind.clone(), i.id.clone()),
+                    (i.current.clone(), i.latest.clone()),
+                )
+            })
+        })
+        .collect()
+}
+
+// One entry per attempted package. Items never started (the user stopped the run) aren't
+// history. `results` must align 1:1 with `selections`. Pure → unit-tested.
+fn history_entries(
+    selections: &[UpdateSelection],
+    results: &[UpdateResult],
+    versions: &Versions,
+    source: &str,
+    at: u64,
+) -> Vec<HistoryEntry> {
+    selections
+        .iter()
+        .zip(results)
+        .filter(|(_, r)| !(r.skipped && r.action.is_none()))
+        .map(|(sel, r)| {
+            let (from, to) = versions
+                .get(&(sel.kind.clone(), sel.id.clone()))
+                .cloned()
+                .unwrap_or_default();
+            HistoryEntry {
+                at,
+                source: source.into(),
+                kind: sel.kind.clone(),
+                id: sel.id.clone(),
+                name: sel.name.clone(),
+                from,
+                to,
+                outcome: outcome_of(r).into(),
+                elapsed_ms: r.elapsed_ms,
+            }
+        })
+        .collect()
+}
+
+fn append_history(entries: &[HistoryEntry]) {
+    let Some(path) = history_path() else { return };
+    if entries.is_empty() {
+        return;
+    }
+    let mut lines: Vec<String> = std::fs::read_to_string(&path)
+        .map(|s| s.lines().map(String::from).collect())
+        .unwrap_or_default();
+    lines.extend(entries.iter().filter_map(|e| serde_json::to_string(e).ok()));
+    let start = lines.len().saturating_sub(HISTORY_KEEP);
+    let _ = write_private_atomic(&path, &(lines[start..].join("\n") + "\n"));
+}
+
+// The update results come back with the optional "brew update" row first; history wants the
+// rows that line up with the selections.
+fn record_manual_history(selections: &[UpdateSelection], results: &[UpdateResult]) {
+    let offset = results.len().saturating_sub(selections.len());
+    let versions = get_cached_check()
+        .map(|c| versions_of(&c.categories))
+        .unwrap_or_default();
+    append_history(&history_entries(
+        selections,
+        &results[offset..],
+        &versions,
+        "manual",
+        unix_now(),
+    ));
+}
+
+// Newest first.
+#[tauri::command]
+fn get_history(limit: Option<usize>) -> Vec<HistoryEntry> {
+    let text = history_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_default();
+    text.lines()
+        .rev()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .take(limit.unwrap_or(200).min(HISTORY_KEEP))
+        .collect()
+}
+
+// --- Quit an open app, then update just that item ---
+
+#[allow(clippy::needless_pass_by_value)] // Tauri hands command arguments over by value.
+#[tauri::command]
+async fn quit_and_update(
+    app: tauri::AppHandle,
+    kind: String,
+    id: String,
+    name: String,
+    app_name: String,
+) -> Result<Vec<UpdateResult>, String> {
+    if !is_valid_app_name(&app_name) || !matches!(kind.as_str(), "cask" | "mas") {
+        return Err("invalid app".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let bundle = Path::new("/Applications").join(&app_name);
+        let shown = app_name.trim_end_matches(".app").to_string();
+        // A polite quit: the app gets to ask about unsaved work, exactly as with ⌘Q.
+        let script = format!("tell application {} to quit", applescript_string(&shown));
+        let _ = Command::new("/usr/bin/osascript")
+            .args(["-e", &script])
+            .output();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while bundle_is_running(&bundle, &running_executables()) {
+            if std::time::Instant::now() > deadline {
+                return Err(format!(
+                    "{shown} didn't quit; it may be asking you to save something. Nothing was updated."
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        let selections = [UpdateSelection { kind, id, name }];
+        let results = run_selected_updates_blocking(&selections, &|p| {
+            let _ = app.emit("update-progress", p);
+        });
+        record_manual_history(&selections, &results);
+        Ok(results)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+// --- Freshet updating itself (tauri-plugin-updater) ---
+//
+// Each release publishes latest.json beside the DMG; the update archive is signed with the key
+// whose public half is in tauri.conf.json (plugins.updater.pubkey), and the plugin refuses
+// anything that doesn't verify against it.
+
+#[derive(Serialize)]
+struct AppUpdate {
+    version: String,
+    notes: Option<String>,
+}
+
+#[tauri::command]
+async fn check_app_update(app: tauri::AppHandle) -> Result<Option<AppUpdate>, String> {
+    use tauri_plugin_updater::UpdaterExt as _;
+    let update = app
+        .updater()
+        .map_err(|e| e.to_string())?
+        .check()
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(update.map(|u| AppUpdate {
+        version: u.version,
+        notes: u.body,
+    }))
+}
+
+#[tauri::command]
+async fn install_app_update(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri_plugin_updater::UpdaterExt as _;
+    if RUNNING_CHILD.load(Ordering::SeqCst) != 0 {
+        return Err("Finish or stop the running update first.".into());
+    }
+    let update = app
+        .updater()
+        .map_err(|e| e.to_string())?
+        .check()
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or("Freshet is already up to date.")?;
+    update
+        .download_and_install(|_, _| {}, || {})
+        .await
+        .map_err(|e| e.to_string())?;
+    app.restart()
+}
+
+#[allow(clippy::needless_pass_by_value)] // AppHandle is a cheap clone; Tauri passes it by value.
+#[tauri::command]
+fn app_version(app: tauri::AppHandle) -> String {
+    app.package_info().version.to_string()
+}
+
+// --- Launch at login (tauri-plugin-autostart, a LaunchAgent in ~/Library/LaunchAgents) ---
+
+#[allow(clippy::needless_pass_by_value)] // AppHandle is a cheap clone; Tauri passes it by value.
+#[tauri::command]
+fn get_launch_at_login(app: tauri::AppHandle) -> bool {
+    use tauri_plugin_autostart::ManagerExt as _;
+    app.autolaunch().is_enabled().unwrap_or(false)
+}
+
+#[allow(clippy::needless_pass_by_value)] // AppHandle is a cheap clone; Tauri passes it by value.
+#[tauri::command]
+fn set_launch_at_login(app: tauri::AppHandle, enabled: bool) -> Result<bool, String> {
+    use tauri_plugin_autostart::ManagerExt as _;
+    let launcher = app.autolaunch();
+    if enabled {
+        launcher.enable().map_err(|e| e.to_string())?;
+    } else {
+        launcher.disable().map_err(|e| e.to_string())?;
+    }
+    launcher.is_enabled().map_err(|e| e.to_string())
+}
+
+// --- Settings shared by the app and the scheduled run ---
+//
+// Skipped versions, notify-only and greedy used to live in the webview's localStorage, which the
+// launchd job can't read — so the scheduled run ignored all three. They now live in
+// ~/.freshet/settings.json, written by the app (save_settings) and read by `--run-scheduled`.
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, Eq)]
+#[serde(default)]
+struct Settings {
+    greedy: bool,
+    notify_only: bool,
+    // Opt-in: look up known vulnerabilities for npm updates on osv.dev (see vulns.rs).
+    check_vulnerabilities: bool,
+    // ignore_key()s of skipped versions.
+    skipped: Vec<String>,
+}
+
+// Must match `ignoreKey` in src/logic.ts. Keyed by version, so a newer release is not skipped.
+fn ignore_key(kind: &str, id: &str, latest: &str) -> String {
+    format!("{kind}::{id}::{latest}")
+}
+
+fn settings_path() -> Option<PathBuf> {
+    freshet_dir().map(|d| d.join("settings.json"))
+}
+
+// None when no settings file exists yet (the frontend then migrates its localStorage values).
+fn load_settings() -> Option<Settings> {
+    let text = std::fs::read_to_string(settings_path()?).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+// Write-then-rename, so the scheduled run never reads a half-written file.
+fn write_private_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    write_private(&tmp, contents, false)?;
+    std::fs::rename(&tmp, path)
+}
+
+#[tauri::command]
+fn get_settings() -> Option<Settings> {
+    load_settings()
+}
+
+// Tauri deserializes command arguments into owned values; a reference isn't an option.
+#[allow(clippy::needless_pass_by_value)]
+#[tauri::command]
+fn save_settings(settings: Settings) -> Result<(), String> {
+    let path = settings_path().ok_or_else(|| "could not resolve ~/.freshet".to_string())?;
+    let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
+    write_private_atomic(&path, &json).map_err(|e| e.to_string())
+}
+
+// --- The scheduled run: `freshet --run-scheduled`, invoked daily by launchd ---
+//
+// Same code path as the app: the same checks, the same filters as the visible list (skipped
+// versions, self-updating casks unless greedy), the same per-item install, the same signer-drift
+// check. Scope is Homebrew (formulae + casks) plus `brew cleanup`.
+
+// What the scheduled run would install: exactly what the app lists for brew + casks. Mirrors
+// `allDisplayedSelections` in src/logic.ts. Pure → unit-tested.
+fn plan_scheduled_run(categories: &[CategoryStatus], settings: &Settings) -> Vec<UpdateSelection> {
+    let skipped: std::collections::HashSet<&str> =
+        settings.skipped.iter().map(String::as_str).collect();
+    categories
+        .iter()
+        .filter(|c| c.kind == "brew" || c.kind == "cask")
+        .flat_map(|c| {
+            c.items
+                .iter()
+                .filter(|i| settings.greedy || !i.self_updating)
+                .filter(|i| !skipped.contains(ignore_key(&c.kind, &i.id, &i.latest).as_str()))
+                .map(|i| UpdateSelection {
+                    kind: c.kind.clone(),
+                    id: i.id.clone(),
+                    name: i.name.clone(),
+                })
+        })
+        .collect()
+}
+
+// sudo's messages when it can't ask for a password (no terminal, no askpass) — what a cask that
+// needs admin rights produces in the headless run. Those are "needs you", not "broken".
+fn needs_admin(output: &str) -> bool {
+    output.contains("a terminal is required to read the password")
+        || output.contains("sudo: a password is required")
+}
+
+#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, Eq)]
+#[serde(default)]
+struct ScheduledRunSummary {
+    // Unix seconds.
+    finished_at: u64,
+    notify_only: bool,
+    // Updates found after filtering (what would be / was attempted).
+    available: usize,
+    updated: Vec<String>,
+    // Need an admin password: left for the user to run from the app.
+    needs_admin: Vec<String>,
+    failed: Vec<String>,
+    // Casks whose code-signing Team ID changed with this update.
+    signer_changed: Vec<String>,
+}
+
+// Sort install results into the summary's buckets. Pure → unit-tested.
+fn summarize_results(summary: &mut ScheduledRunSummary, results: &[UpdateResult]) {
+    for r in results {
+        if matches!(r.action, Some(ResultAction::TrustSigner { .. })) {
+            summary.signer_changed.push(r.name.clone());
+        } else if r.success {
+            summary.updated.push(r.name.clone());
+        } else if needs_admin(&r.output) {
+            summary.needs_admin.push(r.name.clone());
+        } else {
+            summary.failed.push(r.name.clone());
+        }
+    }
+}
+
+fn plural(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+// The notification text. Pure → unit-tested.
+fn summary_message(s: &ScheduledRunSummary) -> String {
+    if s.notify_only {
+        return if s.available == 0 {
+            "Homebrew is up to date.".into()
+        } else {
+            format!(
+                "{} available. Notify-only is on, so nothing was installed.",
+                plural(s.available, "update", "updates")
+            )
+        };
+    }
+    let mut parts = Vec::new();
+    if !s.signer_changed.is_empty() {
+        parts.push(format!("Signer changed: {}.", s.signer_changed.join(", ")));
+    }
+    if !s.updated.is_empty() {
+        parts.push(format!(
+            "Updated {}.",
+            plural(s.updated.len(), "package", "packages")
+        ));
+    }
+    if !s.needs_admin.is_empty() {
+        parts.push(format!(
+            "{} your password; open Freshet to finish.",
+            plural(s.needs_admin.len(), "needs", "need")
+        ));
+    }
+    if !s.failed.is_empty() {
+        parts.push(format!("{} failed.", s.failed.len()));
+    }
+    if parts.is_empty() {
+        "Homebrew is up to date.".into()
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn applescript_string(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+// FRESHET_NO_NOTIFY lets the integration tests run the real binary without popping banners.
+fn notify(message: &str) {
+    if std::env::var_os("FRESHET_NO_NOTIFY").is_some() {
+        return;
+    }
+    let script = format!(
+        "display notification {} with title \"Freshet\"",
+        applescript_string(message)
+    );
+    let _ = Command::new("/usr/bin/osascript")
+        .args(["-e", &script])
+        .output();
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+// Append-only run log. A log write failing must never abort the run itself.
+struct RunLog(Option<std::fs::File>);
+
+impl RunLog {
+    fn open(path: &Path) -> Self {
+        Self(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .mode(0o600)
+                .open(path)
+                .ok(),
+        )
+    }
+
+    fn line(&mut self, text: &str) {
+        if let Some(f) = &mut self.0 {
+            let _ = writeln!(f, "{text}");
+        }
+    }
+
+    // Successful steps log one line; failures include the tool's output so the log is
+    // actionable without dumping 65 packages' worth of brew progress.
+    fn result(&mut self, r: &UpdateResult) {
+        if r.success {
+            self.line(&format!(">>> {}: ok", r.name));
+        } else {
+            self.line(&format!("!!! {} failed:", r.name));
+            for l in r.output.lines() {
+                self.line(&format!("    {l}"));
+            }
+        }
+    }
+}
+
+fn last_run_path() -> Option<PathBuf> {
+    freshet_dir().map(|d| d.join("last-run.json"))
+}
+
+#[tauri::command]
+fn get_last_scheduled_run() -> Option<ScheduledRunSummary> {
+    let text = std::fs::read_to_string(last_run_path()?).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+// ~/.freshet/scheduled-run.pid exists (holding the run's pid) while a scheduled run is going, so
+// the app can say so, hold off its own updates (two brews would fight over Homebrew's locks), and
+// refresh itself when the run ends.
+fn scheduled_pid_path() -> Option<PathBuf> {
+    freshet_dir().map(|d| d.join("scheduled-run.pid"))
+}
+
+fn pid_alive(pid: u32) -> bool {
+    Command::new("/bin/kill")
+        .args(["-0", &pid.to_string()])
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+// Running only if the marker names a live process (a crashed run leaves a stale marker).
+fn scheduled_run_active() -> bool {
+    scheduled_pid_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .is_some_and(pid_alive)
+}
+
+#[derive(Serialize)]
+struct ScheduledState {
+    running: bool,
+    last: Option<ScheduledRunSummary>,
+}
+
+// Cheap enough to poll (a stat, a tiny file, one `kill -0`).
+#[tauri::command]
+fn get_scheduled_state() -> ScheduledState {
+    ScheduledState {
+        running: scheduled_run_active(),
+        last: get_last_scheduled_run(),
+    }
+}
+
+// Returns the process exit code: 0 if everything that was attempted succeeded.
+fn run_scheduled() -> i32 {
+    HEADLESS.store(true, Ordering::Relaxed);
+    let Some(dir) = freshet_dir() else {
+        eprintln!("freshet: could not resolve ~/.freshet");
+        return 1;
+    };
+    let marker = dir.join("scheduled-run.pid");
+    let _ = write_private(&marker, &std::process::id().to_string(), false);
+    let code = run_scheduled_inner(&dir);
+    let _ = std::fs::remove_file(&marker);
+    code
+}
+
+fn run_scheduled_inner(dir: &Path) -> i32 {
+    let mut log = RunLog::open(&dir.join("run.log"));
+    let started = Command::new("/bin/date")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    log.line(&format!("===== scheduled run {started} ====="));
+    let settings = load_settings().unwrap_or_default();
+    let mut summary = ScheduledRunSummary {
+        notify_only: settings.notify_only,
+        ..ScheduledRunSummary::default()
+    };
+
+    // Metadata only, installs nothing — so it runs in notify-only mode too; otherwise
+    // "outdated" would be stale. Skipped if the app already did it within the hour.
+    match brew_update_if_stale() {
+        Some(update) => {
+            log.result(&update);
+            if !update.success {
+                summary.failed.push(update.name);
+            }
+        }
+        None => log.line(">>> brew update: skipped, ran within the last hour"),
+    }
+
+    let categories: [CategoryStatus; 2] = check_homebrew().into();
+    for c in &categories {
+        if let Some(e) = &c.error {
+            log.line(&format!("!!! checking {} failed: {e}", c.category));
+            summary.failed.push(format!("{} check", c.category));
+        }
+    }
+    let selections = plan_scheduled_run(&categories, &settings);
+    summary.available = selections.len();
+    log.line(&format!(
+        "{} after skipped versions{}: {}",
+        plural(selections.len(), "update", "updates"),
+        if settings.greedy {
+            ""
+        } else {
+            " and self-updating apps"
+        },
+        selections
+            .iter()
+            .map(|s| s.id.as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
+    ));
+
+    if settings.notify_only {
+        log.line("notify-only is on: nothing installed");
+    } else {
+        if !selections.is_empty() {
+            let message = format!(
+                "Updating {} in the background. You can keep working.",
+                plural(selections.len(), "Homebrew package", "Homebrew packages")
+            );
+            log.line(&format!("notify: {message}"));
+            notify(&message);
+        }
+        let results = install_selections(&selections, &|_| {});
+        append_history(&history_entries(
+            &selections,
+            &results,
+            &versions_of(&categories),
+            "scheduled",
+            unix_now(),
+        ));
+        for r in &results {
+            log.result(r);
+        }
+        summarize_results(&mut summary, &results);
+
+        let cleanup = run_update_cmd("brew", &["cleanup"]);
+        let cleanup = UpdateResult {
+            kind: "brew".into(),
+            name: "brew cleanup".into(),
+            success: cleanup.0,
+            output: cleanup.1,
+            action: None,
+            elapsed_ms: None,
+            skipped: false,
+        };
+        log.result(&cleanup);
+        if !cleanup.success {
+            summary.failed.push(cleanup.name);
+        }
+
+        let updated_casks: Vec<String> = selections
+            .iter()
+            .zip(&results)
+            .filter(|(s, r)| s.kind == "cask" && r.success)
+            .map(|(s, _)| s.id.clone())
+            .collect();
+        for drift in verify_updated_casks_blocking(&updated_casks) {
+            log.line(&format!(
+                "!!! signer changed: {} ({})",
+                drift.name, drift.output
+            ));
+            summary.signer_changed.push(drift.name);
+        }
+    }
+
+    // Weekly, a full signature scan of /Applications: catches apps changed outside Homebrew
+    // (direct downloads, self-updaters) that no update-time check sees.
+    let scan_stamp = freshet_dir().map(|d| d.join("full-scan.stamp"));
+    let last_scan = scan_stamp
+        .as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| s.trim().parse().ok());
+    if update_is_stale(last_scan, unix_now(), FULL_SCAN_INTERVAL_SECS) {
+        let entries = verify_all_blocking(&|_, _| {});
+        let drift: Vec<UpdateResult> = select_verify_results(entries, true);
+        log.line(&format!(
+            ">>> weekly signature scan: {}",
+            if drift.is_empty() {
+                "no publisher changes".to_string()
+            } else {
+                format!("{} changed", drift.len())
+            }
+        ));
+        for d in drift {
+            log.line(&format!(
+                "!!! signer changed: {} ({})",
+                d.name,
+                d.output.lines().next().unwrap_or("")
+            ));
+            summary.signer_changed.push(d.name);
+        }
+        if let Some(p) = scan_stamp {
+            let _ = write_private(&p, &unix_now().to_string(), false);
+        }
+    }
+
+    summary.finished_at = unix_now();
+    if let Some(path) = last_run_path() {
+        if let Ok(json) = serde_json::to_string_pretty(&summary) {
+            let _ = write_private_atomic(&path, &json);
+        }
+    }
+    let message = summary_message(&summary);
+    log.line(&format!("notify: {message}"));
+    notify(&message);
+    log.line("===== done =====");
+    i32::from(
+        !summary.failed.is_empty()
+            || !summary.needs_admin.is_empty()
+            || !summary.signer_changed.is_empty(),
+    )
+}
+
 // --- Launchd schedule management ---
+//
+// The daily job is a launchd LaunchAgent that runs this app's own binary with --run-scheduled,
+// so it works whether or not Freshet is open.
+const SCHEDULE_LABEL: &str = "com.freshet.daily";
+const RUN_SCHEDULED_FLAG: &str = "--run-scheduled";
+
 const fn valid_schedule_time(hour: u32, minute: u32) -> bool {
     hour <= 23 && minute <= 59
 }
 
-fn plist_path() -> PathBuf {
-    let mut p = dirs::home_dir().expect("home dir");
-    p.push("Library/LaunchAgents/com.freshet.daily.plist");
-    p
+fn find_brew() -> Option<PathBuf> {
+    ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"]
+        .iter()
+        .map(PathBuf::from)
+        .find(|p| p.is_file())
 }
 
-fn script_path() -> PathBuf {
-    let mut p = dirs::home_dir().expect("home dir");
-    p.push(".freshet/run.sh");
-    p
+// macOS runs a quarantined app opened from Downloads from a randomized read-only mount that
+// vanishes later; a schedule pointing there would break. Pure → unit-tested.
+fn is_translocated(exe: &Path) -> bool {
+    exe.to_string_lossy().contains("/AppTranslocation/")
 }
 
-fn write_run_script() -> Result<(), String> {
-    let path = freshet_dir()
-        .map(|d| d.join("run.sh"))
-        .ok_or_else(|| "could not resolve ~/.freshet".to_string())?;
-    let script = r#"#!/usr/bin/env bash
-# Auto-generated by Freshet
-set -uo pipefail
-LOG="$HOME/.freshet/run.log"
-echo "===== $(date) =====" >> "$LOG"
-run() { echo ">>> $*" >> "$LOG"; "$@" >> "$LOG" 2>&1 || echo "!!! $* failed" >> "$LOG"; }
-
-if command -v brew >/dev/null 2>&1; then
-  run brew update
-  run brew upgrade
-  run brew upgrade --cask
-  run brew cleanup
-fi
-if command -v mas >/dev/null 2>&1; then run mas upgrade; fi
-export NVM_DIR="$HOME/.nvm"
-if [ -s "$NVM_DIR/nvm.sh" ]; then
-  . "$NVM_DIR/nvm.sh"
-  run nvm install --lts --reinstall-packages-from=current --latest-npm
-fi
-if command -v npm >/dev/null 2>&1; then run npm update -g; fi
-if command -v pnpm >/dev/null 2>&1; then run pnpm self-update; run pnpm update -g; fi
-echo "===== done =====" >> "$LOG"
-"#;
-    write_private(&path, script, true).map_err(|e| e.to_string())?;
-    Ok(())
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
-#[tauri::command]
-fn install_schedule(hour: u32, minute: u32) -> Result<(), String> {
-    if !valid_schedule_time(hour, minute) {
-        return Err(format!("invalid schedule time {hour}:{minute}"));
-    }
-    write_run_script()?;
-    let script = script_path();
-    let home = dirs::home_dir().ok_or_else(|| "could not resolve home directory".to_string())?;
-    let plist = format!(
+fn render_plist(label: &str, program: &[String], log_dir: &Path, hour: u32, minute: u32) -> String {
+    let args = program.iter().fold(String::new(), |mut out, a| {
+        let _ = write!(out, "\n        <string>{}</string>", xml_escape(a));
+        out
+    });
+    let log_dir = xml_escape(&log_dir.to_string_lossy());
+    format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>Label</key><string>com.freshet.daily</string>
+    <key>Label</key><string>{label}</string>
     <key>ProgramArguments</key>
-    <array>
-        <string>/bin/bash</string>
-        <string>{script}</string>
+    <array>{args}
     </array>
     <key>StartCalendarInterval</key>
     <dict>
         <key>Hour</key><integer>{hour}</integer>
         <key>Minute</key><integer>{minute}</integer>
     </dict>
-    <key>StandardOutPath</key><string>{home}/.freshet/launchd.out.log</string>
-    <key>StandardErrorPath</key><string>{home}/.freshet/launchd.err.log</string>
+    <key>StandardOutPath</key><string>{log_dir}/launchd.out.log</string>
+    <key>StandardErrorPath</key><string>{log_dir}/launchd.err.log</string>
 </dict>
 </plist>
-"#,
-        script = script.display(),
-        home = home.display(),
-    );
-    let p = plist_path();
-    if let Some(parent) = p.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+"#
+    )
+}
+
+// Run launchctl and turn a non-zero exit into an Err carrying its message. `Command::status()`
+// alone only fails if launchctl can't be spawned, which is how a failed load used to go unnoticed.
+fn launchctl(args: &[&str]) -> Result<(), String> {
+    let out = Command::new("/bin/launchctl")
+        .args(args)
+        .output()
+        .map_err(|e| format!("launchctl: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        let msg = String::from_utf8_lossy(&out.stderr);
+        Err(format!(
+            "launchctl {} failed: {}",
+            args.first().unwrap_or(&""),
+            msg.trim()
+        ))
     }
-    std::fs::write(&p, plist).map_err(|e| e.to_string())?;
-    let p_str = p
-        .to_str()
-        .ok_or_else(|| "plist path is not valid UTF-8".to_string())?;
-    // Reload: unload first (ignore errors) then load
-    let _ = Command::new("launchctl").args(["unload", p_str]).status();
-    Command::new("launchctl")
-        .args(["load", p_str])
-        .status()
+}
+
+// The logged-in user's launchd domain, e.g. "gui/501".
+fn gui_domain() -> Result<String, String> {
+    let out = Command::new("/usr/bin/id")
+        .arg("-u")
+        .output()
         .map_err(|e| e.to_string())?;
-    Ok(())
+    let uid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if uid.is_empty() || !uid.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("could not determine user id".into());
+    }
+    Ok(format!("gui/{uid}"))
+}
+
+// One launchd job: its label, plist location, and the program it runs. The real one is
+// `ScheduleJob::daily()`; tests use a temp dir and a throwaway label so they never touch the
+// user's installed schedule.
+struct ScheduleJob {
+    label: String,
+    plist: PathBuf,
+    program: Vec<String>,
+    log_dir: PathBuf,
+}
+
+impl ScheduleJob {
+    fn daily() -> Result<Self, String> {
+        let home =
+            dirs::home_dir().ok_or_else(|| "could not resolve home directory".to_string())?;
+        let log_dir = freshet_dir().ok_or_else(|| "could not resolve ~/.freshet".to_string())?;
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        Ok(Self {
+            label: SCHEDULE_LABEL.into(),
+            plist: home.join(format!("Library/LaunchAgents/{SCHEDULE_LABEL}.plist")),
+            program: vec![
+                exe.to_string_lossy().into_owned(),
+                RUN_SCHEDULED_FLAG.into(),
+            ],
+            log_dir,
+        })
+    }
+
+    fn service(&self) -> Result<String, String> {
+        Ok(format!("{}/{}", gui_domain()?, self.label))
+    }
+
+    fn is_loaded(&self) -> bool {
+        self.service()
+            .is_ok_and(|svc| launchctl(&["print", &svc]).is_ok())
+    }
+
+    fn install(&self, hour: u32, minute: u32) -> Result<(), String> {
+        if !valid_schedule_time(hour, minute) {
+            return Err(format!("invalid schedule time {hour}:{minute}"));
+        }
+        if let Some(parent) = self.plist.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let plist = render_plist(&self.label, &self.program, &self.log_dir, hour, minute);
+        std::fs::write(&self.plist, plist).map_err(|e| e.to_string())?;
+
+        // Replace any previous load (e.g. the old time); "not loaded" is the expected error here.
+        let domain = gui_domain()?;
+        let _ = launchctl(&["bootout", &self.service()?]);
+        let plist_str = self.plist.to_string_lossy();
+        // bootout completes asynchronously; an immediate bootstrap can hit "Input/output error"
+        // while the old instance is still being torn down, so retry briefly.
+        let mut result = Err(String::new());
+        for _ in 0..10 {
+            result = launchctl(&["bootstrap", &domain, &plist_str]);
+            if result.is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        result?;
+        // Trust launchd, not our own bookkeeping: the job must actually be registered.
+        if self.is_loaded() {
+            Ok(())
+        } else {
+            Err(format!("launchd did not register {}", self.label))
+        }
+    }
+
+    fn uninstall(&self) -> Result<(), String> {
+        let _ = self.service().map(|svc| launchctl(&["bootout", &svc]));
+        if self.plist.exists() {
+            std::fs::remove_file(&self.plist).map_err(|e| e.to_string())?;
+        }
+        if self.is_loaded() {
+            return Err(format!("launchd still has {} loaded", self.label));
+        }
+        Ok(())
+    }
+
+    fn status(&self) -> ScheduleStatus {
+        // A plist on disk that launchd hasn't loaded runs nothing, so it doesn't count.
+        let installed = self.plist.exists() && self.is_loaded();
+        let time = installed
+            .then(|| std::fs::read_to_string(&self.plist).ok())
+            .flatten()
+            .and_then(|s| parse_schedule_time(&s));
+        ScheduleStatus {
+            installed,
+            hour: time.map(|(h, _)| h),
+            minute: time.map(|(_, m)| m),
+        }
+    }
+}
+
+// Earlier versions ran ~/.freshet/run.sh; the job no longer uses it.
+fn remove_legacy_run_script() {
+    if let Some(dir) = freshet_dir() {
+        let _ = std::fs::remove_file(dir.join("run.sh"));
+    }
+}
+
+#[tauri::command]
+fn install_schedule(hour: u32, minute: u32) -> Result<(), String> {
+    if find_brew().is_none() {
+        return Err("Homebrew not found in /opt/homebrew or /usr/local; install it first".into());
+    }
+    let job = ScheduleJob::daily()?;
+    if job
+        .program
+        .first()
+        .is_some_and(|exe| is_translocated(Path::new(exe)))
+    {
+        return Err("Move Freshet to your Applications folder before scheduling updates".into());
+    }
+    remove_legacy_run_script();
+    job.install(hour, minute)
 }
 
 #[tauri::command]
 fn uninstall_schedule() -> Result<(), String> {
-    let p = plist_path();
-    if p.exists() {
-        if let Some(p_str) = p.to_str() {
-            let _ = Command::new("launchctl").args(["unload", p_str]).status();
-        }
-        std::fs::remove_file(&p).map_err(|e| e.to_string())?;
-    }
-    Ok(())
+    remove_legacy_run_script();
+    ScheduleJob::daily()?.uninstall()
 }
 
 // Read Hour/Minute back out of the launchd plist so the UI reflects the schedule that's
@@ -1582,27 +3488,36 @@ struct ScheduleStatus {
 
 #[tauri::command]
 fn get_schedule() -> ScheduleStatus {
-    let p = plist_path();
-    if !p.exists() {
-        return ScheduleStatus {
+    ScheduleJob::daily().map_or(
+        ScheduleStatus {
             installed: false,
             hour: None,
             minute: None,
-        };
-    }
-    let time = std::fs::read_to_string(&p)
-        .ok()
-        .and_then(|s| parse_schedule_time(&s));
-    ScheduleStatus {
-        installed: true,
-        hour: time.map(|(h, _)| h),
-        minute: time.map(|(_, m)| m),
-    }
+        },
+        |job| job.status(),
+    )
 }
 
 fn main() {
+    // Timings for every check/update phase: `RUST_LOG=freshet=info pnpm tauri dev`.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+    augment_path();
+    if std::env::args().any(|a| a == RUN_SCHEDULED_FLAG) {
+        std::process::exit(run_scheduled());
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_positioner::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .setup(|app| {
             // Build the menu bar tray
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
@@ -1665,10 +3580,36 @@ fn main() {
             verify_updated_casks,
             install_schedule,
             uninstall_schedule,
-            get_schedule
+            get_schedule,
+            get_settings,
+            save_settings,
+            package_details,
+            app_icon,
+            get_cached_check,
+            trust_signer,
+            rollback::list_snapshots,
+            rollback::restore_snapshot,
+            vulns::check_vulnerabilities,
+            stop_updates,
+            get_history,
+            get_scheduled_state,
+            quit_and_update,
+            check_app_update,
+            install_app_update,
+            app_version,
+            get_launch_at_login,
+            set_launch_at_login,
+            get_last_scheduled_run
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app, event| {
+            // Quitting mid-update: interrupt brew politely so it cleans up (see stop_updates),
+            // rather than leaving it to die mid-install.
+            if matches!(event, tauri::RunEvent::Exit) {
+                interrupt_running_child();
+            }
+        });
 }
 
 #[cfg(test)]
@@ -1805,18 +3746,27 @@ mod tests {
             name: "stable".into(),
             success: true,
             output: "Team ID: AAA".into(),
+            action: None,
+            elapsed_ms: None,
+            skipped: false,
         };
         let unsigned_unchanged = UpdateResult {
             kind: "verify".into(),
             name: "always-unsigned".into(),
             success: false,
             output: "Not code-signed.".into(),
+            action: None,
+            elapsed_ms: None,
+            skipped: false,
         };
         let drifted = UpdateResult {
             kind: "verify".into(),
             name: "drifted".into(),
             success: false,
             output: "⚠ Developer certificate CHANGED: was Team AAA, now BBB.".into(),
+            action: None,
+            elapsed_ms: None,
+            skipped: false,
         };
         let entries = vec![
             (stable_ok.clone(), false),
@@ -1829,58 +3779,6 @@ mod tests {
         // Post-update mode: only drift.
         let filtered = select_verify_results(entries, true);
         assert_eq!(filtered, vec![drifted]);
-    }
-
-    // The targeted post-update verify needs to map cask tokens → the .app filenames they install,
-    // so it only inspects what was just upgraded. Filenames come back lowercased to match the
-    // case-insensitive filesystem lookup used in /Applications.
-    #[test]
-    fn resolve_cask_apps_maps_tokens_to_app_filenames() {
-        let payload = r#"[
-            {"token":"google-chrome","artifacts":[{"app":["Google Chrome.app"]},{"zap":[{}]}]},
-            {"token":"firefox","artifacts":[{"app":["Firefox.app"]}]},
-            {"token":"docker","artifacts":[{"app":["Docker.app","Docker Desktop.app"]}]},
-            {"token":"slack","artifacts":[{"app":["Slack.app"]}]}
-        ]"#;
-        let mut out =
-            resolve_cask_app_filenames(payload, &["google-chrome".into(), "docker".into()]);
-        out.sort();
-        assert_eq!(
-            out,
-            vec![
-                "docker desktop.app".to_string(),
-                "docker.app".to_string(),
-                "google chrome.app".to_string(),
-            ],
-            "multi-app casks contribute every .app; output is lowercased for case-insensitive lookup"
-        );
-    }
-
-    #[test]
-    fn resolve_cask_apps_skips_unknown_and_no_app_casks() {
-        let payload = r#"[
-            {"token":"good","artifacts":[{"app":["Good.app"]}]},
-            {"token":"no-artifacts"},
-            {"token":"no-app","artifacts":[{"zap":[{}]}]},
-            {"token":"objapp","artifacts":[{"app":[{"target":"x"}]}]}
-        ]"#;
-        // Unknown token → empty (we have nothing to verify, not a crash).
-        assert!(resolve_cask_app_filenames(payload, &["nope".into()]).is_empty());
-        // Known good → one entry.
-        assert_eq!(
-            resolve_cask_app_filenames(payload, &["good".into()]),
-            vec!["good.app".to_string()]
-        );
-        // Cask without an `app` artifact (font-only, qlplugin-only) → no entries; the cask
-        // updated, but there's no .app to verify.
-        assert!(resolve_cask_app_filenames(payload, &["no-app".into()]).is_empty());
-        assert!(resolve_cask_app_filenames(payload, &["no-artifacts".into()]).is_empty());
-        // Non-string app entries are ignored, not errors.
-        assert!(resolve_cask_app_filenames(payload, &["objapp".into()]).is_empty());
-        // Empty token list is a no-op.
-        assert!(resolve_cask_app_filenames(payload, &[]).is_empty());
-        // Malformed JSON → empty.
-        assert!(resolve_cask_app_filenames("not json", &["good".into()]).is_empty());
     }
 
     #[test]
@@ -2017,6 +3915,327 @@ mod tests {
         assert!(!valid_schedule_time(10, 60));
     }
 
+    // --- PATH for child processes ---
+
+    #[test]
+    fn brew_prefix_detection() {
+        assert!(!path_has_brew_prefix("/usr/bin:/bin:/usr/sbin:/sbin"));
+        assert!(path_has_brew_prefix("/usr/bin:/opt/homebrew/bin"));
+        assert!(path_has_brew_prefix("/usr/local/bin:/usr/bin"));
+        assert!(!path_has_brew_prefix("/opt/homebrew/binx"));
+    }
+
+    // Interactive shells may print around our output (motd, plugin notices); only the marked
+    // span counts. Unmarked or empty output yields None so we fall back to the known prefixes.
+    #[test]
+    fn marked_path_extraction() {
+        let out = format!("Welcome!\n{PATH_MARKER}/a:/b{PATH_MARKER}\nbye");
+        assert_eq!(extract_marked_path(&out), Some("/a:/b"));
+        assert_eq!(extract_marked_path("no markers"), None);
+        assert_eq!(extract_marked_path(&format!("{PATH_MARKER}/a")), None);
+        assert_eq!(
+            extract_marked_path(&format!("{PATH_MARKER}{PATH_MARKER}")),
+            None
+        );
+    }
+
+    #[test]
+    fn path_merge_keeps_order_and_dedupes() {
+        let merged = merge_path(
+            "/usr/bin:/bin",
+            "/opt/homebrew/bin:/usr/bin:/nvm/bin"
+                .split(':')
+                .chain(BREW_BIN_DIRS),
+        );
+        assert_eq!(
+            merged,
+            "/usr/bin:/bin:/opt/homebrew/bin:/nvm/bin:/opt/homebrew/sbin:/usr/local/bin"
+        );
+        assert_eq!(merge_path("", ["/a", ""]), "/a");
+    }
+
+    // --- settings + scheduled run planning ---
+
+    fn item(id: &str, latest: &str, self_updating: bool) -> OutdatedItem {
+        OutdatedItem {
+            id: id.into(),
+            name: id.into(),
+            current: "1".into(),
+            latest: latest.into(),
+            self_updating,
+            notes_url: String::new(),
+        }
+    }
+
+    fn category(kind: &str, items: Vec<OutdatedItem>) -> CategoryStatus {
+        CategoryStatus {
+            category: kind.into(),
+            kind: kind.into(),
+            items,
+            error: None,
+        }
+    }
+
+    fn planned_ids(categories: &[CategoryStatus], settings: &Settings) -> Vec<String> {
+        plan_scheduled_run(categories, settings)
+            .into_iter()
+            .map(|s| format!("{}:{}", s.kind, s.id))
+            .collect()
+    }
+
+    // The scheduled run must install exactly what the app would list: skipped versions and
+    // (unless greedy) self-updating casks are left alone, and only brew/cask kinds are in scope.
+    #[test]
+    fn scheduled_plan_honours_skipped_and_greedy() {
+        let categories = [
+            category(
+                "brew",
+                vec![item("git", "2.50", false), item("node", "24", false)],
+            ),
+            category(
+                "cask",
+                vec![item("iterm2", "3.6", false), item("chrome", "140", true)],
+            ),
+            category("npm", vec![item("typescript", "6", false)]),
+        ];
+        let mut settings = Settings {
+            skipped: vec![ignore_key("brew", "node", "24")],
+            ..Settings::default()
+        };
+        assert_eq!(
+            planned_ids(&categories, &settings),
+            ["brew:git", "cask:iterm2"]
+        );
+
+        settings.greedy = true;
+        assert_eq!(
+            planned_ids(&categories, &settings),
+            ["brew:git", "cask:iterm2", "cask:chrome"]
+        );
+    }
+
+    // A skip is for one version: when a newer release ships, it's planned again.
+    #[test]
+    fn scheduled_plan_skip_is_per_version() {
+        let categories = [category("brew", vec![item("node", "25", false)])];
+        let settings = Settings {
+            skipped: vec![ignore_key("brew", "node", "24")],
+            ..Settings::default()
+        };
+        assert_eq!(planned_ids(&categories, &settings), ["brew:node"]);
+    }
+
+    // The frontend writes this shape; older/partial files must still load (serde(default)).
+    #[test]
+    fn settings_json_round_trips_and_tolerates_missing_fields() {
+        let s: Settings = serde_json::from_str(
+            r#"{"greedy":true,"notify_only":true,"skipped":["brew::git::2.50"]}"#,
+        )
+        .unwrap();
+        assert!(s.greedy && s.notify_only);
+        assert_eq!(s.skipped, ["brew::git::2.50"]);
+        let partial: Settings = serde_json::from_str(r#"{"notify_only":true}"#).unwrap();
+        assert_eq!(
+            partial,
+            Settings {
+                notify_only: true,
+                ..Settings::default()
+            }
+        );
+    }
+
+    // Real sudo output (macOS 26) when it can't prompt: no terminal, no askpass.
+    #[test]
+    fn needs_admin_matches_real_sudo_output() {
+        assert!(needs_admin(
+            "==> Upgrading zoom\nsudo: a terminal is required to read the password; either use \
+             the -S option to read from standard input or configure an askpass helper\n\
+             sudo: a password is required"
+        ));
+        assert!(needs_admin("sudo: a password is required"));
+        assert!(!needs_admin("Error: Download failed: 404"));
+    }
+
+    fn result(name: &str, success: bool, output: &str) -> UpdateResult {
+        UpdateResult {
+            kind: "cask".into(),
+            name: name.into(),
+            success,
+            output: output.into(),
+            action: None,
+            elapsed_ms: None,
+            skipped: false,
+        }
+    }
+
+    #[test]
+    fn results_are_bucketed_for_the_summary() {
+        let mut summary = ScheduledRunSummary::default();
+        summarize_results(
+            &mut summary,
+            &[
+                result("git", true, ""),
+                result("zoom", false, "sudo: a password is required"),
+                result("broken", false, "Error: 404"),
+            ],
+        );
+        assert_eq!(summary.updated, ["git"]);
+        assert_eq!(summary.needs_admin, ["zoom"]);
+        assert_eq!(summary.failed, ["broken"]);
+    }
+
+    #[test]
+    fn summary_messages() {
+        let base = ScheduledRunSummary::default();
+        assert_eq!(summary_message(&base), "Homebrew is up to date.");
+
+        let notify = ScheduledRunSummary {
+            notify_only: true,
+            available: 3,
+            ..base.clone()
+        };
+        assert_eq!(
+            summary_message(&notify),
+            "3 updates available. Notify-only is on, so nothing was installed."
+        );
+
+        let mixed = ScheduledRunSummary {
+            updated: vec!["a".into(), "b".into()],
+            needs_admin: vec!["zoom".into()],
+            failed: vec!["x".into()],
+            signer_changed: vec!["Evil.app".into()],
+            ..base
+        };
+        assert_eq!(
+            summary_message(&mixed),
+            "Signer changed: Evil.app. Updated 2 packages. 1 needs your password; open Freshet \
+             to finish. 1 failed."
+        );
+    }
+
+    #[test]
+    fn applescript_string_escapes_quotes() {
+        assert_eq!(
+            applescript_string(r#"say "hi" \ bye"#),
+            r#""say \"hi\" \\ bye""#
+        );
+    }
+
+    #[test]
+    fn translocated_exe_is_detected() {
+        assert!(is_translocated(Path::new(
+            "/private/var/folders/x/AppTranslocation/ABC/d/Freshet.app/Contents/MacOS/freshet"
+        )));
+        assert!(!is_translocated(Path::new(
+            "/Applications/Freshet.app/Contents/MacOS/freshet"
+        )));
+    }
+
+    // --- launchd job ---
+
+    fn schedule_test_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("freshet test's {name} {}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn read(path: &Path) -> String {
+        std::fs::read_to_string(path).unwrap_or_default()
+    }
+
+    #[test]
+    fn rendered_plist_is_valid_and_round_trips() {
+        let dir = schedule_test_dir("plist");
+        let program = [
+            "/Applications/A&B.app/Contents/MacOS/freshet".to_string(),
+            RUN_SCHEDULED_FLAG.into(),
+        ];
+        let plist = render_plist("com.freshet.daily", &program, &dir, 7, 45);
+        assert_eq!(parse_schedule_time(&plist), Some((7, 45)));
+        assert!(plist.contains("<string>/Applications/A&amp;B.app/Contents/MacOS/freshet</string>"));
+        assert!(plist.contains("<string>--run-scheduled</string>"));
+        let path = dir.join("job.plist");
+        std::fs::write(&path, &plist).unwrap();
+        let lint = Command::new("/usr/bin/plutil")
+            .arg("-lint")
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(
+            lint.status.success(),
+            "{}",
+            String::from_utf8_lossy(&lint.stdout)
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // End-to-end through the real launchd: install → registered → kickstart → launchd ran the
+    // program with its args → uninstall → gone. Uses a throwaway label and a stand-in program
+    // in a temp dir, so it never touches the user's real schedule or packages. Ignored by
+    // default because it registers a (short-lived) job with the user's launchd; run it with:
+    //   cargo test -- --ignored launchd_runs_installed_job
+    #[test]
+    #[ignore = "registers a throwaway job with the user's launchd"]
+    fn launchd_runs_installed_job() {
+        struct Uninstall<'a>(&'a ScheduleJob);
+        impl Drop for Uninstall<'_> {
+            fn drop(&mut self) {
+                let _ = self.0.uninstall();
+            }
+        }
+
+        let dir = schedule_test_dir("launchd");
+        let program = dir.join("program");
+        let calls = dir.join("calls");
+        write_private(
+            &program,
+            &format!(
+                "#!/bin/bash\necho \"$* PATH=$PATH\" >> '{}'\n",
+                calls.display().to_string().replace('\'', r"'\''")
+            ),
+            true,
+        )
+        .unwrap();
+        let job = ScheduleJob {
+            label: format!("com.freshet.test.{}", std::process::id()),
+            plist: dir.join("job.plist"),
+            program: vec![
+                program.to_string_lossy().into_owned(),
+                RUN_SCHEDULED_FLAG.into(),
+            ],
+            log_dir: dir.clone(),
+        };
+        let guard = Uninstall(&job);
+
+        job.install(3, 15).unwrap();
+        let status = job.status();
+        assert!(status.installed);
+        assert_eq!((status.hour, status.minute), (Some(3), Some(15)));
+        // Re-installing (changing the time while enabled) must replace the loaded job cleanly.
+        job.install(4, 30).unwrap();
+        assert_eq!(job.status().hour, Some(4));
+
+        launchctl(&["kickstart", &job.service().unwrap()]).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while read(&calls).is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        // launchd invoked it with --run-scheduled, and with its bare PATH — which is why the
+        // binary calls augment_path() before anything else.
+        assert_eq!(
+            read(&calls),
+            "--run-scheduled PATH=/usr/bin:/bin:/usr/sbin:/sbin\n"
+        );
+
+        drop(guard);
+        assert!(!job.is_loaded());
+        assert!(!job.plist.exists());
+        assert!(!job.status().installed);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn numeric_id_validation() {
         assert!(is_numeric_id("462058435"));
@@ -2133,6 +4352,152 @@ mod tests {
     }
 
     #[test]
+    fn github_releases_url_from_homepage_or_repo() {
+        assert_eq!(
+            github_releases_url(["https://github.com/awslabs/aws-c-auth"]).as_deref(),
+            Some("https://github.com/awslabs/aws-c-auth/releases")
+        );
+        // Falls through non-GitHub URLs to the source repo; strips .git and extra path.
+        assert_eq!(
+            github_releases_url(["https://git-scm.com", "https://github.com/git/git.git"])
+                .as_deref(),
+            Some("https://github.com/git/git/releases")
+        );
+        assert_eq!(
+            github_releases_url(["https://github.com/o/r/archive/v1.tar.gz"]).as_deref(),
+            Some("https://github.com/o/r/releases")
+        );
+        assert_eq!(github_releases_url(["https://abseil.io", ""]), None);
+        assert_eq!(github_releases_url(["https://github.com/onlyowner"]), None);
+        assert_eq!(
+            github_releases_url(["https://github.com/o/r?x=<script>"]),
+            None
+        );
+    }
+
+    // Trimmed from real `brew info --json=v2 --formula abseil git` output.
+    #[test]
+    fn formula_infos_parse_real_output() {
+        let json = r#"{"formulae":[
+          {"name":"abseil","desc":"C++ Common Libraries","homepage":"https://abseil.io",
+           "license":"Apache-2.0",
+           "urls":{"stable":{"url":"https://github.com/abseil/abseil-cpp/archive/refs/tags/20250814.1.tar.gz"},
+                   "head":{"url":"https://github.com/abseil/abseil-cpp.git","branch":"master"}},
+           "installed":[{"version":"20250512.1","installed_on_request":false}]},
+          {"name":"git","desc":"Distributed revision control system","homepage":"https://git-scm.com",
+           "license":"GPL-2.0-only","urls":{"stable":{"url":"https://mirrors.edge.kernel.org/pub/software/scm/git/git-2.56.0.tar.xz"},
+           "head":{"url":"https://github.com/git/git.git"}},
+           "installed":[{"version":"2.49.0","installed_on_request":true}]}],"casks":[]}"#;
+        let infos = parse_formula_infos(json);
+        let abseil = &infos["abseil"];
+        assert_eq!(abseil.desc, "C++ Common Libraries");
+        assert!(abseil.dependency);
+        assert_eq!(
+            abseil.release_notes,
+            "https://github.com/abseil/abseil-cpp/releases"
+        );
+        let git = &infos["git"];
+        assert!(!git.dependency);
+        assert_eq!(git.homepage, "https://git-scm.com");
+        assert_eq!(git.license, "GPL-2.0-only");
+        assert_eq!(git.release_notes, "https://github.com/git/git/releases");
+        assert!(parse_formula_infos("not json").is_empty());
+    }
+
+    // Trimmed from real `brew info --json=v2 --cask slack` output.
+    #[test]
+    fn cask_infos_parse_real_output() {
+        let json = r#"{"formulae":[],"casks":[{"token":"slack","desc":"Team communication and collaboration software",
+          "homepage":"https://slack.com/","url":"https://downloads.slack-edge.com/desktop-releases/macos/arm64/4.46.101/Slack-4.46.101-macOS.dmg",
+          "artifacts":[{"uninstall":[{"quit":"com.tinyspeck.slackmacgap"}]},{"app":["Slack.app"]},{"zap":[]}],
+          "auto_updates":true}]}"#;
+        let slack = &parse_cask_infos(json)["slack"];
+        assert_eq!(slack.desc, "Team communication and collaboration software");
+        assert_eq!(slack.app, "Slack.app");
+        assert!(slack.auto_updates);
+        assert!(!slack.dependency);
+        assert_eq!(slack.release_notes, "");
+    }
+
+    // Real I/O against this Mac: Safari ships in /Applications on every macOS install.
+    //   cargo test -- --ignored app_icon_from_real_bundle
+    #[test]
+    #[ignore = "reads /Applications and writes ~/.freshet/icons"]
+    fn app_icon_from_real_bundle() {
+        let png = app_icon_png("Safari.app").expect("Safari icon");
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        assert!(app_icon_png("No Such App.app").is_none());
+    }
+
+    // Real I/O: full /Applications scan twice; the second is served from the notarization cache.
+    // Updates ~/.freshet/signing.json and notarization.json exactly as the app does.
+    //   cargo test -- --ignored full_scan_timing --nocapture
+    #[test]
+    #[ignore = "scans /Applications (~30s first time)"]
+    fn full_scan_timing() {
+        for pass in ["first", "second"] {
+            let started = std::time::Instant::now();
+            let entries = verify_all_blocking(&|_, _| {});
+            eprintln!(
+                "{pass} scan: {} apps in {}ms",
+                entries.len(),
+                elapsed_ms(started)
+            );
+        }
+    }
+
+    // The self-update chain: a release build's Freshet.app.tar.gz.sig must verify against the
+    // public key in tauri.conf.json — exactly what an installed Freshet checks before updating.
+    // Needs a build with updater artifacts first (see docs/14-release-signing.md).
+    //   cargo test -- --ignored updater_signature
+    #[test]
+    #[ignore = "needs a signed release build in target/release/bundle"]
+    fn updater_signature_verifies_against_configured_key() {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let conf: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string("tauri.conf.json").unwrap()).unwrap();
+        let pubkey_text = String::from_utf8(
+            b64.decode(conf["plugins"]["updater"]["pubkey"].as_str().unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        let bundle = Path::new("target/release/bundle/macos");
+        let sig_text = String::from_utf8(
+            b64.decode(
+                std::fs::read_to_string(bundle.join("Freshet.app.tar.gz.sig"))
+                    .unwrap()
+                    .trim(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let archive = std::fs::read(bundle.join("Freshet.app.tar.gz")).unwrap();
+
+        let pk = minisign_verify::PublicKey::decode(&pubkey_text).unwrap();
+        let sig = minisign_verify::Signature::decode(&sig_text).unwrap();
+        pk.verify(&archive, &sig, true)
+            .expect("signature must verify");
+
+        // And a tampered archive must not.
+        let mut tampered = archive;
+        let mid = tampered.len() / 2;
+        tampered[mid] ^= 0xff;
+        assert!(pk.verify(&tampered, &sig, true).is_err());
+    }
+
+    #[test]
+    fn app_name_validation() {
+        assert!(is_valid_app_name("Slack.app"));
+        assert!(is_valid_app_name("IntelliJ IDEA CE.app"));
+        assert!(!is_valid_app_name("../../etc.app"));
+        assert!(!is_valid_app_name("Foo/Bar.app"));
+        assert!(!is_valid_app_name(".app"));
+        assert!(!is_valid_app_name(".hidden.app"));
+        assert!(!is_valid_app_name("Slack"));
+    }
+
+    #[test]
     fn cask_info_parses_fields() {
         let json = r#"{"casks":[{"token":"google-chrome","name":["Google Chrome"],"desc":"Web browser","homepage":"https://www.google.com/chrome/","version":"148.0","auto_updates":true}]}"#;
         let info = parse_cask_info(json).unwrap();
@@ -2150,34 +4515,6 @@ mod tests {
             adopt_args("google-chrome"),
             vec!["install", "--cask", "google-chrome", "--adopt"]
         );
-    }
-
-    #[test]
-    fn jws_payload_extraction() {
-        assert_eq!(
-            extract_jws_payload(r#"{"payload":"[1,2]","signatures":[]}"#).as_deref(),
-            Some("[1,2]")
-        );
-        assert_eq!(extract_jws_payload("not json"), None);
-    }
-
-    #[test]
-    fn cask_app_index_maps_and_prefers_bare_token() {
-        // @beta listed FIRST, but the bare token must win the "Foo.app" collision
-        let payload = r#"[
-            {"token":"foo@beta","artifacts":[{"app":["Foo.app"]}]},
-            {"token":"foo","artifacts":[{"app":["Foo.app"]}]},
-            {"token":"google-chrome","artifacts":[{"app":["Google Chrome.app"]},{"zap":[{}]}]},
-            {"token":"slack","artifacts":[{"app":["Slack.app"]}]}
-        ]"#;
-        let idx = build_cask_app_index(payload);
-        assert_eq!(idx.get("foo.app").map(String::as_str), Some("foo"));
-        assert_eq!(
-            idx.get("google chrome.app").map(String::as_str),
-            Some("google-chrome")
-        );
-        assert_eq!(idx.get("slack.app").map(String::as_str), Some("slack"));
-        assert_eq!(idx.get("missing.app"), None);
     }
 
     #[test]
@@ -2279,19 +4616,6 @@ mod tests {
             Some("3.1")
         );
         assert_eq!(parse_appcast_latest("nothing here"), None);
-    }
-
-    #[test]
-    fn cask_index_handles_missing_and_nonstring() {
-        let payload = r#"[
-            {"token":"noart"},
-            {"token":"objapp","artifacts":[{"app":[{"target":"x"}]}]},
-            {"token":"good","artifacts":[{"app":["Good.app"]}]}
-        ]"#;
-        let idx = build_cask_app_index(payload);
-        assert_eq!(idx.get("good.app").map(String::as_str), Some("good"));
-        assert_eq!(idx.len(), 1); // missing-artifacts + non-string-app contribute nothing
-        assert!(build_cask_app_index("not json").is_empty());
     }
 
     #[test]
@@ -2457,6 +4781,7 @@ mod tests {
         // First sighting — silent adoption.
         let sigs1 = vec![AppSig {
             name: "App.app".into(),
+            bundle_id: None,
             team_id: Some("AAA".into()),
             authority: Some("Developer ID Application: Acme (AAA)".into()),
             signed: true,
@@ -2478,6 +4803,7 @@ mod tests {
         // Hijack signal: a different Team ID for the same app.
         let sigs3 = vec![AppSig {
             name: "App.app".into(),
+            bundle_id: None,
             team_id: Some("BBB".into()),
             authority: Some("Developer ID Application: Notacme (BBB)".into()),
             signed: true,
@@ -2490,7 +4816,396 @@ mod tests {
         assert!(r3.output.contains("CHANGED"));
         assert!(r3.output.contains("AAA"));
         assert!(r3.output.contains("BBB"));
-        assert_eq!(store.get("App.app").map(String::as_str), Some("BBB"));
+        // The baseline does NOT move on drift: the warning repeats until the user trusts it.
+        assert_eq!(store.get("App.app").map(String::as_str), Some("AAA"));
+        assert!(
+            matches!(r3.action, Some(ResultAction::TrustSigner { ref team, .. }) if team == "BBB")
+        );
+        let (_, still_changed) = &build_verify_entries(&sigs3, &mut store)[0];
+        assert!(
+            still_changed,
+            "a second scan still flags the unacknowledged change"
+        );
+    }
+
+    // Bundle-id keying: an entry stored under the old app-name key is honoured as the baseline
+    // and migrated to the bundle id; trusting a new publisher is what moves the baseline.
+    #[test]
+    fn signer_store_migrates_name_keys_and_trust_moves_baseline() {
+        let mut store: HashMap<String, String> =
+            HashMap::from([("Slack".into(), "BQR82RBBHL".into())]);
+        let sig = |team: &str| AppSig {
+            name: "Slack".into(),
+            bundle_id: Some("com.tinyspeck.slackmacgap".into()),
+            team_id: Some(team.into()),
+            authority: None,
+            signed: true,
+            notarized: true,
+        };
+        let (_, changed) = &build_verify_entries(&[sig("BQR82RBBHL")], &mut store)[0];
+        assert!(!changed);
+        assert_eq!(
+            store.get("com.tinyspeck.slackmacgap").map(String::as_str),
+            Some("BQR82RBBHL")
+        );
+        assert!(!store.contains_key("Slack"), "legacy name key migrated");
+
+        let (_, changed) = &build_verify_entries(&[sig("EVILEVIL99")], &mut store)[0];
+        assert!(changed);
+        // What trust_signer does:
+        store.insert("com.tinyspeck.slackmacgap".into(), "EVILEVIL99".into());
+        let (_, changed) = &build_verify_entries(&[sig("EVILEVIL99")], &mut store)[0];
+        assert!(!changed, "trusted publisher is quiet");
+    }
+
+    #[test]
+    fn identifier_parsing_from_real_codesign_output() {
+        let out = "Executable=/Applications/Slack.app/Contents/MacOS/Slack\nIdentifier=com.tinyspeck.slackmacgap\nFormat=app bundle with Mach-O universal (x86_64 arm64)\nAuthority=Developer ID Application: SLACK TECHNOLOGIES L.L.C. (BQR82RBBHL)\nTeamIdentifier=BQR82RBBHL\n";
+        assert_eq!(
+            parse_identifier(out).as_deref(),
+            Some("com.tinyspeck.slackmacgap")
+        );
+        assert_eq!(parse_identifier("TeamIdentifier=X\n"), None);
+    }
+
+    #[test]
+    fn trust_inputs_are_validated() {
+        assert!(is_valid_bundle_id("com.tinyspeck.slackmacgap"));
+        assert!(!is_valid_bundle_id("com.x/../../etc"));
+        assert!(!is_valid_bundle_id(""));
+        assert!(is_valid_team_id("BQR82RBBHL"));
+        assert!(!is_valid_team_id("bqr82rbbhl"));
+        assert!(!is_valid_team_id("SHORT"));
+    }
+
+    // Trimmed from real `brew info --json=v2 --cask discord slack` output.
+    #[test]
+    fn cask_apps_from_brew_info() {
+        let json = r#"{"formulae":[],"casks":[
+          {"token":"discord","artifacts":[{"app":["Discord.app"]},{"zap":[{"trash":["~/Library/Application Support/discord"]}]}]},
+          {"token":"slack","artifacts":[{"uninstall":[{"quit":"com.tinyspeck.slackmacgap"}]},{"app":["Slack.app"]}]},
+          {"token":"some-pkg","artifacts":[{"pkg":["Installer.pkg"]}]}]}"#;
+        let apps = parse_cask_apps(json);
+        assert_eq!(apps["discord"], ["Discord.app"]);
+        assert_eq!(apps["slack"], ["Slack.app"]);
+        assert!(apps["some-pkg"].is_empty());
+        assert!(parse_cask_apps("nope").is_empty());
+    }
+
+    #[test]
+    fn brew_update_staleness() {
+        assert!(update_is_stale(None, 1000, 3600));
+        assert!(!update_is_stale(Some(1000), 1000 + 3599, 3600));
+        assert!(update_is_stale(Some(1000), 1000 + 3600, 3600));
+        assert!(
+            update_is_stale(Some(5000), 1000, 3600),
+            "future stamp (clock moved back) is stale"
+        );
+    }
+
+    // brew's batched output: "==> Upgrading <name>" opens each package's section (Homebrew
+    // upgrade.rb / cask/upgrade.rb); failures are "Error: <name>: …", often at the very end.
+    #[test]
+    fn batch_output_splits_per_package() {
+        let out = "==> Fetching downloads for: git and wget\n==> Upgrading git\n  2.55.0 -> 2.56.0\n==> Pouring git--2.56.0.arm64_tahoe.bottle.tar.gz\n🍺  /opt/homebrew/Cellar/git/2.56.0: 1,700 files\n==> Upgrading wget\n  1.25.0 -> 1.25.1\n==> Pouring wget--1.25.1.arm64_tahoe.bottle.tar.gz\nError: wget: post-install step failed\n";
+        let sections = split_brew_sections(out, &["git", "wget", "absent"]);
+        assert!(sections["git"].starts_with("==> Upgrading git"));
+        assert!(sections["git"].contains("1,700 files"));
+        assert!(!sections["git"].contains("wget"));
+        assert!(
+            sections["wget"].contains("1.25.1")
+                && sections["wget"].ends_with("Error: wget: post-install step failed")
+        );
+        assert!(!sections.contains_key("absent"));
+    }
+
+    #[test]
+    fn upgrading_lines_name_only_requested_packages() {
+        let wanted: std::collections::HashSet<&str> = ["git", "ffmpeg"].into_iter().collect();
+        assert_eq!(upgrading_name("==> Upgrading git", &wanted), Some("git"));
+        assert_eq!(
+            upgrading_name("==> Upgrading ffmpeg 7.1 -> 8.0", &wanted),
+            Some("ffmpeg")
+        );
+        // A dependency brew upgrades along the way, and the cask-batch header, aren't counted.
+        assert_eq!(upgrading_name("==> Upgrading x265", &wanted), None);
+        assert_eq!(
+            upgrading_name("==> Upgrading 2 outdated packages:", &wanted),
+            None
+        );
+        assert_eq!(
+            upgrading_name("==> Pouring git--2.56.0.bottle.tar.gz", &wanted),
+            None
+        );
+    }
+
+    // Tests that spawn through run_update_cmd_streaming share the global RUNNING_CHILD slot.
+    static CHILD_SLOT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // Lines arrive one at a time while the process runs, stdout and stderr interleaved in order.
+    #[test]
+    fn streaming_runner_delivers_lines_in_order() {
+        let _slot = CHILD_SLOT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut lines = Vec::new();
+        let (ok, all) = run_update_cmd_streaming(
+            "/bin/sh",
+            &[
+                "-c",
+                "echo '==> Upgrading a'; echo oops >&2; echo '==> Upgrading b'; exit 3",
+            ],
+            &mut |l| lines.push(l.to_string()),
+        );
+        assert!(!ok);
+        assert_eq!(lines, ["==> Upgrading a", "oops", "==> Upgrading b"]);
+        assert_eq!(all, "==> Upgrading a\noops\n==> Upgrading b");
+    }
+
+    #[test]
+    fn cask_token_candidates_follow_homebrew_naming() {
+        assert_eq!(cask_token_candidates("Google Chrome")[0], "google-chrome");
+        assert_eq!(
+            cask_token_candidates("Visual Studio Code")[0],
+            "visual-studio-code"
+        );
+        assert!(cask_token_candidates("zoom.us").contains(&"zoom".to_string()));
+        assert!(cask_token_candidates("Notepad++")[0].starts_with("notepad-plus-plus"));
+        assert!(cask_token_candidates("IntelliJ IDEA CE").contains(&"intellij-idea-ce".to_string()));
+        assert!(cask_token_candidates("  ").is_empty());
+    }
+
+    // Only a cask whose own `app` artifact is this exact bundle counts: a candidate token that
+    // merely exists (here "zoom" installing something else) is rejected.
+    #[test]
+    fn adoptions_require_an_exact_app_match() {
+        let apps = vec![
+            ("Google Chrome.app".to_string(), "Google Chrome".to_string()),
+            ("zoom.us.app".to_string(), "zoom.us".to_string()),
+        ];
+        let candidates = HashMap::from([
+            (
+                "Google Chrome.app".to_string(),
+                vec!["google-chrome".to_string()],
+            ),
+            (
+                "zoom.us.app".to_string(),
+                vec!["zoom-us".to_string(), "zoom".to_string()],
+            ),
+        ]);
+        let cask_apps = HashMap::from([
+            (
+                "google-chrome".to_string(),
+                vec!["Google Chrome.app".to_string()],
+            ),
+            ("zoom".to_string(), vec!["zoom.us.app".to_string()]),
+            (
+                "zoom-us".to_string(),
+                vec!["Something Else.app".to_string()],
+            ),
+        ]);
+        let found = match_adoptions(&apps, &candidates, &cask_apps);
+        let pairs: Vec<(&str, &str)> = found
+            .iter()
+            .map(|a| (a.name.as_str(), a.token.as_str()))
+            .collect();
+        assert_eq!(
+            pairs,
+            [("Google Chrome", "google-chrome"), ("zoom.us", "zoom")]
+        );
+    }
+
+    // Stop's mechanism end to end: at a package boundary the running process gets SIGINT, and
+    // gets to run its interrupt handler (as brew's Ruby `Interrupt` → cleanup/relink does) —
+    // so the next package never starts.
+    #[test]
+    fn stop_interrupts_at_a_boundary_and_lets_the_process_clean_up() {
+        let _slot = CHILD_SLOT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Traps both: wherever SIGINT is ignored at start (as in many CI/background contexts),
+        // this exercises the SIGTERM fallback.
+        let script = "trap 'echo cleaned-up; exit 130' INT TERM; \
+                      echo '==> Upgrading a'; sleep 0.2; \
+                      echo '==> Upgrading b'; sleep 10 & wait $!; \
+                      echo '==> Upgrading c'";
+        let started = std::time::Instant::now();
+        let mut lines = Vec::new();
+        let (ok, _) = run_update_cmd_streaming("/bin/bash", &["-c", script], &mut |l| {
+            lines.push(l.to_string());
+            if l == "==> Upgrading b" {
+                interrupt_running_child();
+            }
+        });
+        assert!(!ok);
+        assert_eq!(lines, ["==> Upgrading a", "==> Upgrading b", "cleaned-up"]);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(8),
+            "didn't wait out the sleep"
+        );
+        assert_eq!(
+            RUNNING_CHILD.load(Ordering::SeqCst),
+            0,
+            "child cleared after exit"
+        );
+    }
+
+    // Real Homebrew + /Applications, read-only (brew casks / list / info).
+    //   cargo test -- --ignored adoption_live --nocapture
+    #[test]
+    #[ignore = "reads the real /Applications and Homebrew"]
+    fn adoption_live() {
+        let started = std::time::Instant::now();
+        let found = suggest_adoptions_blocking();
+        eprintln!("{} suggestions in {}ms:", found.len(), elapsed_ms(started));
+        for a in &found {
+            eprintln!("  {} → {}", a.name, a.token);
+        }
+    }
+
+    #[test]
+    fn package_boundaries() {
+        assert!(is_package_boundary("==> Upgrading ffmpeg"));
+        assert!(is_package_boundary(
+            "==> Installing dependencies for ffmpeg: x265"
+        ));
+        assert!(!is_package_boundary("==> Upgrading 2 outdated packages:"));
+        assert!(!is_package_boundary(
+            "==> Pouring ffmpeg--8.0.bottle.tar.gz"
+        ));
+    }
+
+    // Real `ps -axo comm=` lines: helpers inside the bundle count; a same-prefix app doesn't.
+    #[test]
+    fn open_app_detection() {
+        let ps = vec![
+            "/Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/140/Helpers/Google Chrome Helper.app/Contents/MacOS/Google Chrome Helper".to_string(),
+            "/usr/libexec/trustd".to_string(),
+        ];
+        assert!(bundle_is_running(
+            Path::new("/Applications/Google Chrome.app"),
+            &ps
+        ));
+        assert!(!bundle_is_running(
+            Path::new("/Applications/Google Chrome Canary.app"),
+            &ps
+        ));
+        assert!(!bundle_is_running(
+            Path::new("/Applications/Slack.app"),
+            &ps
+        ));
+    }
+
+    fn sel(kind: &str, id: &str) -> UpdateSelection {
+        UpdateSelection {
+            kind: kind.into(),
+            id: id.into(),
+            name: id.into(),
+        }
+    }
+
+    #[test]
+    fn history_records_outcomes_and_versions_but_not_unstarted_items() {
+        let selections = [
+            sel("brew", "git"),
+            sel("cask", "slack"),
+            sel("cask", "zoom"),
+            sel("brew", "go"),
+        ];
+        let ok = UpdateResult {
+            kind: "brew".into(),
+            name: "git".into(),
+            success: true,
+            output: String::new(),
+            action: None,
+            elapsed_ms: Some(1200),
+            skipped: false,
+        };
+        let open = skipped_open(&selections[1], Path::new("/Applications/Slack.app"));
+        let admin = failed_result(&selections[2], "sudo: a password is required".into());
+        let stopped = not_started(&selections[3]);
+        let versions = Versions::from([(
+            ("brew".into(), "git".into()),
+            ("2.55.0".into(), "2.56.0".into()),
+        )]);
+        let entries = history_entries(
+            &selections,
+            &[ok, open, admin, stopped],
+            &versions,
+            "manual",
+            100,
+        );
+        let summary: Vec<(&str, &str, &str, &str)> = entries
+            .iter()
+            .map(|e| {
+                (
+                    e.id.as_str(),
+                    e.outcome.as_str(),
+                    e.from.as_str(),
+                    e.to.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("git", "updated", "2.55.0", "2.56.0"),
+                ("slack", "skipped_open", "", ""),
+                ("zoom", "needs_admin", "", "")
+            ]
+        );
+        assert_eq!(entries[0].elapsed_ms, Some(1200));
+    }
+
+    #[test]
+    fn outdated_names_cover_formulae_and_casks() {
+        let json = r#"{"formulae":[{"name":"git","installed_versions":["2.55.0"],"current_version":"2.56.0"}],"casks":[{"name":"discord","installed_versions":["0.0.407"],"current_version":"0.0.414"}]}"#;
+        let names = outdated_names(json);
+        assert!(names.contains("git") && names.contains("discord") && names.len() == 2);
+    }
+
+    #[test]
+    fn notarization_cache_only_hits_for_unchanged_apps() {
+        let cache: NotarizationCache = HashMap::from([("/Applications/A.app".into(), (100, true))]);
+        assert_eq!(
+            cached_notarization(&cache, "/Applications/A.app", Some(100)),
+            Some(true)
+        );
+        assert_eq!(
+            cached_notarization(&cache, "/Applications/A.app", Some(101)),
+            None,
+            "app changed"
+        );
+        assert_eq!(
+            cached_notarization(&cache, "/Applications/A.app", None),
+            None
+        );
+        assert_eq!(
+            cached_notarization(&cache, "/Applications/B.app", Some(100)),
+            None
+        );
+    }
+
+    #[test]
+    fn blocked_installs_count_as_signer_changes_in_the_summary() {
+        let mut summary = ScheduledRunSummary::default();
+        summarize_results(
+            &mut summary,
+            &[UpdateResult {
+                kind: "cask".into(),
+                name: "discord".into(),
+                success: false,
+                output: "Blocked before install".into(),
+                action: Some(ResultAction::TrustSigner {
+                    bundle_id: "com.hnc.Discord".into(),
+                    team: "EVILEVIL99".into(),
+                }),
+                elapsed_ms: None,
+                skipped: false,
+            }],
+        );
+        assert_eq!(summary.signer_changed, ["discord"]);
+        assert!(summary.failed.is_empty());
     }
 
     // Story 9: unsigned apps are flagged (success=false) in the full inventory, but they are
@@ -2501,6 +5216,7 @@ mod tests {
         let mut store = HashMap::new();
         let sigs = vec![AppSig {
             name: "Sketchy.app".into(),
+            bundle_id: None,
             team_id: None,
             authority: None,
             signed: false,
@@ -2538,7 +5254,7 @@ mod tests {
                 name: "Bad NPM".into(),
             },
         ];
-        let results = run_selected_updates_blocking(&bad);
+        let results = run_selected_updates_blocking(&bad, &|_| {});
         assert_eq!(results.len(), 3, "every selection contributes a result row");
         for r in &results {
             assert!(!r.success);

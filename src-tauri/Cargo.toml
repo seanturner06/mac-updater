@@ -10,10 +10,15 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = ["tray-icon", "macos-private-api"] }
 tauri-plugin-positioner = { version = "2", features = ["tray-icon"] }
+tauri-plugin-updater = "2"
+tauri-plugin-autostart = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 semver = "1"
 dirs = "5"
+base64 = "0.22"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi"] }
 
 [lints.rust]
 unsafe_code = "deny"              # drop/loosen if you do FFI
@@ -41,8 +46,15 @@ too_many_lines           = "allow"
 cast_precision_loss      = "allow"
 cast_possible_truncation = "allow"
 doc_markdown             = "allow"
+# Conflicts with rustc's `unreachable_pub` (warn, above): for a module under the crate root,
+# pub(crate) is the only visibility both accept (pub → unreachable_pub; pub(super) is reported
+# as pub(crate)). Known clippy nursery false positive.
+redundant_pub_crate      = "allow"
 
 # Hand-picked stricter lints
 unwrap_used = "warn"
 todo        = "warn"
 dbg_macro   = "warn"
+
+[dev-dependencies]
+minisign-verify = "0.3"

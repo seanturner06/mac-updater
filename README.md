@@ -12,7 +12,7 @@ Freshet doesn't build its own version database (the trap that killed MacUpdater)
 - **Full signature inventory on demand.** Audit every app in /Applications: signer, Team ID, notarization, and drift since the last scan.
 - **Homebrew adoption.** Finds manually-installed apps that Homebrew could manage and adopts them in place (`brew install --cask --adopt`) — no re-download, and from then on they update with everything else.
 - **Skip a version.** Hide an update you don't want; it reappears automatically when a newer version ships.
-- **Scheduled updates.** Optional daily launchd job at a time you pick, with full logs in `~/.freshet/run.log`.
+- **Scheduled updates.** Optional daily Homebrew run at a time you pick. It honours skipped versions and notify-only, leaves anything needing your password for you, and reports the outcome in a notification, in Settings, and in `~/.freshet/run.log`.
 - **Notify-only mode.** See what's outdated without letting Freshet install anything.
 
 ## Security model
@@ -57,6 +57,38 @@ cargo fmt --check
 cargo audit               # RustSec advisories
 ```
 
+## Documentation
+
+The full design record lives in [`docs/`](docs/) — what the system is, how it's built, why it's
+built that way, and where the known gaps are.
+
+- [Product design](docs/01-product-design.md) — the scope boundary and why coverage is bounded on purpose
+- [System architecture](docs/02-architecture.md) — process model, the IPC boundary, concurrency, state
+- [Update sources](docs/03-update-sources.md) — the five sources and how to add a sixth
+- [Backend](docs/04-backend.md) · [Frontend](docs/05-frontend.md) — the pure-core / IO-shell layering in both languages
+- [Security](docs/06-security.md) — threat model, trust boundaries, every validator and why
+- [Provenance & signer drift](docs/07-provenance.md) — the differentiator, and its limits
+- [Scheduling](docs/08-scheduling.md) · [UI design system](docs/09-ui-design-system.md) · [Testing](docs/10-testing-and-quality.md) · [Performance](docs/11-performance.md)
+- [Roadmap & deferred work](docs/12-roadmap.md) · [Decision log](docs/13-decisions.md)
+
+## Contributing
+
+Contributions are welcome — start with [`CONTRIBUTING.md`](CONTRIBUTING.md). Two conventions
+shape most of the codebase: pure decision logic is separated from I/O in both languages, and test
+fixtures are captured from real tool output rather than invented.
+
+Security issues should be reported privately; see [`SECURITY.md`](SECURITY.md).
+
+## License
+
+[GNU Affero General Public License v3.0](LICENSE). Freshet is free software — you can use,
+study, modify, and redistribute it. A modified version that you distribute, or make available
+over a network, must also be released under AGPL-3.0.
+
+Contributions are accepted under a [CLA](.github/CLA.md) so the project can also be offered
+under commercial terms. See [Licensing and the CLA](CONTRIBUTING.md#licensing-and-the-cla) for
+what that means and why.
+
 ## Status
 
-Early development (v0.1). Core update flows, signer-drift detection, adoption, and scheduling work today; see [`context.md`](context.md) for the user stories driving the roadmap.
+Early development (v0.1). Core update flows, signer-drift detection, adoption, and scheduling work today; see [`context.md`](context.md) for the user stories driving the roadmap and [`docs/12-roadmap.md`](docs/12-roadmap.md) for what's next and what's knowingly unfinished.
