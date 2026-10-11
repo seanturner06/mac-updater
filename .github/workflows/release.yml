@@ -4,7 +4,9 @@ name: Release
 # Setup (Apple Developer account, certificate, secrets): docs/14-release-signing.md.
 on:
   push:
-    tags: ["v*"]
+    # Version tags only — not the `v<version>-unsigned` tags test-release.yml's drafts get when
+    # they're published (publishing a draft creates its tag as *you*, which does trigger workflows).
+    tags: ["v*", "!v*-unsigned"]
   workflow_dispatch:
 
 permissions:

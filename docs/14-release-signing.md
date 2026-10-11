@@ -74,6 +74,8 @@ GitHub → **Actions** → **Test release (unsigned)** → **Run workflow**. It 
 
 - Tagged `v<version>-unsigned` and named "(unsigned test build)", created as a **draft**: review
   it under Releases and click **Publish**. It can't collide with a later signed `v<version>`.
+  Publishing creates the tag, and `release.yml` excludes `-unsigned` tags (`"!v*-unsigned"`) so
+  the signed workflow doesn't start (and fail its secrets check) for a test build.
 - **Ad-hoc signed** (`signingIdentity: "-"`), so the bundle is properly sealed. Without that, a
   downloaded copy is reported as "damaged" and can't be opened at all.
 - Not marked pre-release: self-update follows GitHub's "latest release", which skips
