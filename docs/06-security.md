@@ -269,6 +269,12 @@ the adversarial validator cases, all run in CI on every push and pull request.
   (dev/CI only, never shipped), which globs the project's own sources with fixed patterns — the
   attack needs an attacker-supplied pattern. Ignored via `pnpm.auditConfig.ignoreGhsas` in
   `package.json`. Revisit if `braces` ships a fix or `type-coverage` changes its glob library.
+- **GHSA-g3hv-75wg-m249 — `minimatch` 10.x, denial of service via globparts amplification.**
+  Patched only in 11.0.1, and nothing that still uses 10 accepts 11: `@typescript-eslint/
+  typescript-estree` requires `^10.2.2` and `type-coverage-core` allows up to 10. Both are
+  lint/type-check tools (dev/CI only, never shipped) matching the project's own fixed globs; the
+  attack needs an attacker-supplied pattern. eslint itself was bumped to 10.15, which uses the
+  patched 11. Revisit when typescript-eslint or type-coverage move to minimatch 11.
 
 Transitive dev-tool dependencies with available fixes are pinned to patched floors with scoped
 `pnpm.overrides` (e.g. `"postcss@8": "^8.5.23"`), each limited to the affected major line.
