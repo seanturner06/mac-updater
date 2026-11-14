@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024"><defs>
+  <linearGradient id="bg" x1="0.2" y1="0" x2="0.8" y2="1"><stop offset="0" stop-color="#30262a"/><stop offset="0.55" stop-color="#1b1517"/><stop offset="1" stop-color="#0d0a0b"/></linearGradient>
+  <radialGradient id="glow" cx="0.5" cy="0.62" r="0.5"><stop offset="0" stop-color="#b6a0a0" stop-opacity="0.18"/><stop offset="1" stop-color="#b6a0a0" stop-opacity="0"/></radialGradient>
+  <linearGradient id="mk" x1="0.25" y1="0" x2="0.6" y2="1"><stop offset="0" stop-color="#f4eded"/><stop offset="0.6" stop-color="#cdb8b8"/><stop offset="1" stop-color="#9c8384"/></linearGradient>
+  <linearGradient id="mk2" x1="0" y1="1" x2="1" y2="0"><stop offset="0" stop-color="#8a7072"/><stop offset="1" stop-color="#f4eded"/></linearGradient>
+  <filter id="sh" x="-20%" y="-20%" width="140%" height="150%"><feDropShadow dx="0" dy="16" stdDeviation="20" flood-color="#000" flood-opacity="0.5"/></filter>
+  <filter id="lift" x="-20%" y="-20%" width="140%" height="150%"><feDropShadow dx="0" dy="10" stdDeviation="14" flood-color="#000" flood-opacity="0.55"/></filter>
+  <!-- fine grain over the background, so the dark gradient doesn't band -->
+  <filter id="grain"><feTurbulence type="fractalNoise" baseFrequency="0.9" numOctaves="2" seed="7"/><feColorMatrix values="0 0 0 0 1  0 0 0 0 1  0 0 0 0 1  0 0 0 0.05 0"/></filter>
+  <clipPath id="sq"><rect x="100" y="100" width="824" height="824" rx="185"/></clipPath>
+</defs>
+<rect x="100" y="100" width="824" height="824" rx="185" fill="url(#bg)" filter="url(#sh)"/>
+<g clip-path="url(#sq)"><rect x="100" y="100" width="824" height="824" fill="url(#glow)"/><rect x="100" y="100" width="824" height="824" filter="url(#grain)"/></g>
+<rect x="101.5" y="101.5" width="821" height="821" rx="184" fill="none" stroke="#fff" stroke-opacity="0.08" stroke-width="3"/>
+<mask id="cut"><rect width="1024" height="1024" fill="#fff"/>
+  <path d="M380 660 L512 528 L644 660" fill="none" stroke="#000" stroke-width="108" stroke-linecap="round" stroke-linejoin="round"/></mask>
+<g filter="url(#lift)">
+<path mask="url(#cut)" fill="url(#mk)" d="M512 214 C512 214 286 468 286 624 C286 749 387 850 512 850 C637 850 738 749 738 624 C738 468 512 214 512 214 Z"/>
+</g>
+</svg>

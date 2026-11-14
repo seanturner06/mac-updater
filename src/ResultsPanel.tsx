@@ -1,26 +1,68 @@
 // Outcome of an update (or a signature scan): one row per item with its log, how long it took,
 // and a follow-up action where one applies — trust a changed publisher, or roll an app back.
 import { useState } from "react";
-import { formatDuration, type ResultAction, type UpdateResult } from "./logic";
+import {
+  formatDuration,
+  slowestStep,
+  slowSummary,
+  stepBreakdown,
+  type ResultAction,
+  type Step,
+  type UpdateResult,
+} from "./logic";
 
 type ActionState = { status: "busy" | "done" | "error"; message: string };
 
 function actionLabel(a: ResultAction): string {
   if (a.type === "trust_signer") return "Trust new publisher";
   if (a.type === "quit_and_update") return `Quit & update`;
+  if (a.type === "allow_npm_scripts") return "Allow install scripts";
   return "Roll back";
 }
 
 function busyLabel(a: ResultAction): string {
   if (a.type === "trust_signer") return "Trusting…";
   if (a.type === "quit_and_update") return "Quitting & updating…";
+  if (a.type === "allow_npm_scripts") return "Installing…";
   return "Restoring…";
 }
 
 function actionHint(a: ResultAction): string {
   if (a.type === "trust_signer") return `Only if you know why Team ${a.team} now signs this app.`;
   if (a.type === "quit_and_update") return `${a.app.replace(/\.app$/, "")} will be asked to quit, as with ⌘Q.`;
+  if (a.type === "allow_npm_scripts")
+    return `Only if you trust ${a.name} ${a.version}: its scripts run with your account's full access.`;
   return "The previous version was saved before updating.";
+}
+
+// Where an item's time went: one bar per step that mattered, the slowest highlighted.
+function StepTimes({ steps }: { steps: Step[] }) {
+  const { shown, otherMs } = stepBreakdown(steps);
+  const max = Math.max(...steps.map((s) => s.ms), 1);
+  const slowest = slowestStep(steps);
+  return (
+    <div className="step-times">
+      {shown.map((s, i) => (
+        <div key={i} className={`step-row${s === slowest ? " slowest" : ""}`} title={s.label}>
+          <span className="step-label">
+            {s.label}
+            {s.shared && <span className="step-shared">whole batch</span>}
+          </span>
+          <span className="step-bar">
+            <span style={{ width: `${Math.max(2, (s.ms / max) * 100)}%` }} />
+          </span>
+          <span className="step-ms">{formatDuration(s.ms)}</span>
+        </div>
+      ))}
+      {otherMs >= 100 && (
+        <div className="step-row other">
+          <span className="step-label">Everything else</span>
+          <span className="step-bar" />
+          <span className="step-ms">{formatDuration(otherMs)}</span>
+        </div>
+      )}
+    </div>
+  );
 }
 
 export function ResultsPanel({
@@ -95,6 +137,8 @@ export function ResultsPanel({
                   </span>
                 )}
               </button>
+              {!open && slowSummary(r) && <div className="result-sub">{slowSummary(r)}</div>}
+              {open && r.steps && r.steps.length > 0 && <StepTimes steps={r.steps} />}
               {open && r.output && <pre className="result-log">{r.output}</pre>}
               {r.action && (
                 <div className="result-action">

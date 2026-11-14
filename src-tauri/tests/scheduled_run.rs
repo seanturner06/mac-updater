@@ -22,6 +22,7 @@ case "$*" in
   "info --json=v2 --cask "*) echo '{"formulae":[],"casks":[]}' ;;
   "upgrade "*)
     ps -o pri= -p $$ | tr -d ' ' >> "$HOME/upgrade-priority"
+    echo "$2 verify=${HOMEBREW_VERIFY_ATTESTATIONS:-unset}" >> "$HOME/upgrade-env"
     shift 2
     for n in "$@"; do
       echo "==> Upgrading $n"
@@ -73,6 +74,10 @@ fn setup(name: &str, settings: &str) -> Home {
 // launchd's environment, plus the fake brew dir first on PATH. SHELL=/usr/bin/false makes the
 // login-shell PATH lookup fail, exercising the fallback path.
 fn run_scheduled(home: &Path) -> std::process::Output {
+    run_scheduled_with(home, &[])
+}
+
+fn run_scheduled_with(home: &Path, extra_env: &[(&str, &str)]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_freshet"))
         .arg("--run-scheduled")
         .env_clear()
@@ -85,7 +90,13 @@ fn run_scheduled(home: &Path) -> std::process::Output {
             ),
         )
         .env("SHELL", "/usr/bin/false")
+        // Freshet runs brew from its fixed location, not PATH; debug builds accept this override
+        // so the stand-in is used. Without it, these tests would run the real Homebrew.
+        .env("FRESHET_BREW", home.join("bin/brew"))
         .env("FRESHET_NO_NOTIFY", "1")
+        // An empty gh config: no GitHub sign-in unless a test provides a token explicitly.
+        .env("GH_CONFIG_DIR", home.join("gh-config"))
+        .envs(extra_env.iter().copied())
         .stdin(std::process::Stdio::null())
         .output()
         .unwrap()
@@ -244,4 +255,23 @@ fn notify_only_installs_and_cleans_up_nothing() {
     assert_eq!(summary["available"], 4);
     assert!(read(&home.0.join(".freshet/run.log"))
         .contains("notify: 4 updates available. Notify-only is on, so nothing was installed."));
+}
+
+// Homebrew's build-provenance verification is turned on for formula upgrades only when GitHub
+// credentials exist (without them Homebrew refuses every bottle), and never for casks.
+#[test]
+fn provenance_verification_follows_github_credentials() {
+    let home = setup("prov-off", "{}");
+    run_scheduled(&home.0);
+    let env = read(&home.0.join("upgrade-env"));
+    assert!(env.contains("--formula verify=unset"), "{env}");
+
+    let home = setup("prov-on", "{}");
+    run_scheduled_with(&home.0, &[("HOMEBREW_GITHUB_API_TOKEN", "test-token")]);
+    let env = read(&home.0.join("upgrade-env"));
+    assert!(env.contains("--formula verify=1"), "{env}");
+    assert!(
+        env.contains("--cask verify=unset"),
+        "casks aren't bottles: {env}"
+    );
 }

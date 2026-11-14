@@ -79,11 +79,16 @@ type RowProps = {
   item: OutdatedItem;
   info?: PackageInfo;
   vuln?: VulnReport;
+  rolledBack?: boolean;
   icon?: string | null;
   selectable: boolean;
   checked: boolean;
   locked: boolean;
   open: boolean;
+  // Keyboard navigation: this row's id, its section, and whether the keyboard cursor is on it.
+  navId: string;
+  category: string;
+  cursor: boolean;
   onToggle: () => void;
   onToggleInfo: () => void;
   onSkip: () => void;
@@ -94,16 +99,22 @@ export function PackageRow({
   item,
   info,
   vuln,
+  rolledBack,
   icon,
   selectable,
   checked,
   locked,
   open,
+  navId,
+  category,
+  cursor,
   onToggle,
   onToggleInfo,
   onSkip,
 }: RowProps) {
-  const bump = versionBump(item.current, item.latest);
+  // What's really installed: the app's own version when it disagrees with Homebrew's record.
+  const from = info && info.on_disk_version !== "" ? info.on_disk_version : item.current;
+  const bump = versionBump(from, item.latest);
   const desc = info?.desc ?? "";
   // Only Homebrew rows get descriptions; reserve the line for them while details load.
   const describable = kind === "brew" || kind === "cask";
@@ -135,6 +146,7 @@ export function PackageRow({
             </span>
           )}
           {item.self_updating && <span className="chip">self-updating</span>}
+          {rolledBack && <span className="chip">rolled back</span>}
         </span>
         {desc ? (
           <span className="pkg-desc">{desc}</span>
@@ -142,9 +154,9 @@ export function PackageRow({
           describable && !info && <span className="pkg-desc pkg-desc-empty" aria-hidden />
         )}
       </span>
-      <span className="pkg-ver" title={`${item.current || "?"} → ${item.latest}`}>
+      <span className="pkg-ver" title={`${from || "?"} → ${item.latest}`}>
         <span className="pkg-ver-new">{item.latest}</span>
-        {item.current && <span className="pkg-ver-old">from {item.current}</span>}
+        {from && <span className="pkg-ver-old">from {from}</span>}
       </span>
       <button
         className={`pkg-info${open ? " active" : ""}`}
@@ -162,7 +174,11 @@ export function PackageRow({
   );
 
   return (
-    <div className={`pkg${open ? " open" : ""}${locked ? " locked" : ""}`}>
+    <div
+      className={`pkg${open ? " open" : ""}${locked ? " locked" : ""}${cursor ? " kb-cursor" : ""}`}
+      data-nav-id={navId}
+      data-cat={category}
+    >
       {selectable ? (
         <label className="pkg-row">{content}</label>
       ) : (
@@ -208,6 +224,12 @@ function PackageDetail({
       )}
       {bump === "major" && (
         <p className="pkg-detail-warn">Major version: may include breaking changes. Check the release notes.</p>
+      )}
+      {info?.on_disk_version && (
+        <p className="pkg-detail-note">
+          Installed: {info.on_disk_version}. Homebrew's record says {item.current}, because the app was rolled back
+          or changed outside Homebrew. Updating installs {item.latest} either way.
+        </p>
       )}
       {vuln && vuln.current.length > 0 && (
         <div className="pkg-vulns">

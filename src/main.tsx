@@ -1,6 +1,10 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
+import { applyThemeAttr, loadTheme } from "./theme";
+
+// Before the first paint, so the window never flashes the default theme.
+applyThemeAttr(loadTheme());
 
 const rootElement = document.getElementById("root");
 if (!rootElement) throw new Error("Root element #root not found");

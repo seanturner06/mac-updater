@@ -1,5 +1,5 @@
 // The settings sheet: the daily schedule first (it's the one setting that acts on its own), then
-// how updates behave, skipped versions, and tools.
+// how updates behave, skipped versions, appearance and tools.
 import type { ReactNode } from "react";
 import { useEffect, useState } from "react";
 import {
@@ -8,6 +8,7 @@ import {
   lastRunText,
   nextRunText,
   parseSkipped,
+  THEMES,
   type AppUpdate,
   type ScheduledRunSummary,
   type Snapshot,
@@ -203,6 +204,11 @@ export type SettingsPanelProps = {
   appUpdate: AppUpdate | null;
   // Resolves to a status line ("Freshet is up to date").
   onCheckAppUpdate: () => Promise<string>;
+  // Homebrew build verification is on (GitHub credentials found); null while checking.
+  provenanceActive: boolean | null;
+  // appearance
+  theme: string;
+  onTheme: (id: string) => void;
 };
 
 function VersionFooter({
@@ -258,10 +264,11 @@ function SnapshotRow({ snap, onRestore }: { snap: Snapshot; onRestore: (token: s
         <span className={`srow-sub${state.status === "error" ? " fail-text" : ""}`}>
           {state.status === "done" || state.status === "error"
             ? state.message
-            : `${snap.version ? `${snap.version} · ` : ""}saved ${when}`}
+            : `${snap.version ? `${snap.version} · ` : ""}${snap.in_use ? "in use now" : `saved ${when}`}`}
         </span>
       </span>
-      {state.status !== "done" && (
+      {snap.in_use && state.status !== "done" && <span className="always-on">In use</span>}
+      {!snap.in_use && state.status !== "done" && (
         <button
           className="btn-ghost btn-compact"
           disabled={state.status === "busy"}
@@ -471,6 +478,26 @@ export function SettingsPanel(p: SettingsPanelProps) {
             <span className="always-on">On</span>
           </Row>
           <Row
+            icon={icons.shield}
+            title="Verify Homebrew builds"
+            sub={
+              p.provenanceActive
+                ? "On. Each command-line tool is checked against Homebrew's signed build record before it installs."
+                : "Off: needs a GitHub sign-in. Run gh auth login in Terminal to turn it on."
+            }
+          >
+            <span className={p.provenanceActive ? "always-on" : "status-off"}>
+              {p.provenanceActive === null ? "…" : p.provenanceActive ? "On" : "Off"}
+            </span>
+          </Row>
+          <Row
+            icon={icons.lock}
+            title="Known publishers"
+            sub="17 widely used apps, including Slack, Chrome, Zoom and Microsoft Office, are checked against their real publisher from the first time Freshet sees them."
+          >
+            <span className="always-on">On</span>
+          </Row>
+          <Row
             icon={icons.bug}
             title="Flag known vulnerabilities"
             sub="Checks npm updates against osv.dev. Sends package names and versions there."
@@ -490,6 +517,28 @@ export function SettingsPanel(p: SettingsPanelProps) {
           ) : (
             p.snapshots.map((snap) => <SnapshotRow key={snap.token} snap={snap} onRestore={p.onRestore} />)
           )}
+        </div>
+
+        {/* ---- appearance ---- */}
+        <div className="settings-label">Appearance</div>
+        <div className="theme-grid" role="radiogroup" aria-label="Colour theme">
+          {THEMES.map((t) => (
+            <button
+              key={t.id}
+              role="radio"
+              aria-checked={p.theme === t.id}
+              className={`theme-swatch${p.theme === t.id ? " on" : ""}`}
+              onClick={() => p.onTheme(t.id)}
+              title={t.note}
+            >
+              <span className="theme-chips" aria-hidden>
+                {t.swatch.map((c) => (
+                  <span key={c} style={{ background: c }} />
+                ))}
+              </span>
+              <span className="theme-name">{t.name}</span>
+            </button>
+          ))}
         </div>
 
         {/* ---- tools ---- */}

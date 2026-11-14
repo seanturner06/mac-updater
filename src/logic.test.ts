@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import css from "./App.css?raw";
 import {
   selKey,
   ignoreKey,
@@ -22,7 +23,29 @@ import {
   formatClock,
   hourLabel,
   formatDuration,
+  advanceSteps,
+  liveView,
+  formatElapsed,
+  needsAttention,
+  keyAction,
+  routeKey,
+  type KeyContext,
+  moveFocus,
+  stepCursor,
+  parseNavId,
+  catNavId,
+  rowNavId,
+  filterItems,
+  matchText,
+  resolveTheme,
+  THEMES,
+  SHORTCUTS,
+  stepBreakdown,
+  slowestStep,
+  dependencyNames,
+  slowSummary,
   isStale,
+  adoptStatusText,
   groupHistoryByDay,
   type HistoryEntry,
   progressText,
@@ -264,6 +287,7 @@ describe("package presentation", () => {
     auto_updates: false,
     release_notes: "",
     app: "",
+    on_disk_version: "",
     ...over,
   });
 
@@ -328,6 +352,52 @@ describe("timing helpers", () => {
     expect(formatDuration(125_000)).toBe("2m 05s");
   });
 
+  // Labels as brew_steps produces them from a real awscli upgrade log.
+  const awscliSteps = [
+    { label: "Upgrading awscli", ms: 900 },
+    { label: "Installing dependencies for awscli: ca-certificates and python@3.15", ms: 100 },
+    { label: "Upgrading awscli dependency: ca-certificates (2026-09-25 -> 2026-10-20)", ms: 500 },
+    { label: "Pouring ca-certificates", ms: 1500 },
+    { label: "Installing awscli dependency: python@3.15 (3.15.1)", ms: 1000 },
+    { label: "Pouring python@3.15", ms: 41_000 },
+    { label: "Installing awscli", ms: 500 },
+    { label: "Pouring awscli", ms: 54_500 },
+    { label: "Cleanup", ms: 18_000 },
+    { label: "Caveats", ms: 100 },
+  ];
+
+  it("stepBreakdown keeps the steps that matter and sums the rest", () => {
+    const { shown, otherMs } = stepBreakdown(awscliSteps);
+    expect(shown.map((s) => s.label)).toEqual([
+      "Pouring ca-certificates",
+      "Installing awscli dependency: python@3.15 (3.15.1)",
+      "Pouring python@3.15",
+      "Pouring awscli",
+      "Cleanup",
+    ]);
+    expect(otherMs).toBe(900 + 100 + 500 + 500 + 100);
+    // On a short run a sub-second step can still be a big share.
+    expect(stepBreakdown([{ label: "a", ms: 300 }, { label: "b", ms: 5 }]).shown.map((s) => s.label)).toEqual(["a"]);
+  });
+
+  it("slowestStep / dependencyNames", () => {
+    expect(slowestStep(awscliSteps)?.label).toBe("Pouring awscli");
+    expect(slowestStep([])).toBeNull();
+    expect(dependencyNames(awscliSteps)).toEqual(["ca-certificates", "python@3.15"]);
+    expect(dependencyNames([{ label: "Installing dependencies for awscli: a, b", ms: 1 }])).toEqual([]);
+  });
+
+  it("slowSummary explains only slow items", () => {
+    expect(slowSummary({ elapsed_ms: 119_000, steps: awscliSteps })).toBe(
+      "+2 dependencies · slowest: Pouring awscli 55s",
+    );
+    expect(slowSummary({ elapsed_ms: 4_000, steps: awscliSteps })).toBeNull();
+    expect(slowSummary({ elapsed_ms: 30_000 })).toBeNull();
+    expect(slowSummary({ elapsed_ms: 12_000, steps: [{ label: "Pouring git", ms: 12_000 }] })).toBe(
+      "slowest: Pouring git 12s",
+    );
+  });
+
   it("isStale", () => {
     const t = new Date(2026, 9, 3, 12, 0);
     const later = (min: number) => new Date(t.getTime() + min * 60_000);
@@ -389,5 +459,324 @@ describe("clock formatting", () => {
   it("hourLabel shows just the hour in the same style", () => {
     expect(formatClock(14, 0).startsWith(hourLabel(14).replace(/\s?[AP]M$/i, ""))).toBe(true);
     expect(hourLabel(9)).not.toContain(":");
+  });
+});
+
+describe("adoption status", () => {
+  const p = (phase: string, mb = 0, stalled = false) => ({ token: "whatsapp", phase, downloaded_mb: mb, stalled });
+  it("adoptStatusText", () => {
+    expect(adoptStatusText(null)).toBe("Starting…");
+    expect(adoptStatusText(p("Downloading"))).toBe("Downloading…");
+    expect(adoptStatusText(p("Downloading", 148))).toBe("Downloading · 148 MB");
+    expect(adoptStatusText(p("Downloading", 148, true))).toContain("stalled at 148 MB");
+    expect(adoptStatusText(p("Adopting", 160))).toBe("Adopting…");
+  });
+});
+
+describe("blocked builds in the last run", () => {
+  it("lastRunText reports provenance blocks", () => {
+    expect(
+      lastRunText({ finished_at: 0, notify_only: false, available: 2, updated: ["git"], needs_admin: [], failed: [], signer_changed: [], blocked: ["xz"] })
+    ).toBe("blocked (failed build verification): xz · 1 updated");
+  });
+});
+
+describe("run view, menu bar, keyboard and themes", () => {
+  describe("live run view", () => {
+    const ev = (step: string | null, current: string | null = "awscli", done = 0) => ({
+      phase: "Upgrading",
+      current,
+      done,
+      total: 2,
+      step,
+    });
+
+    it("a new step closes the previous one with its duration", () => {
+      let steps = advanceSteps([], ev("Upgrading awscli"), 1_000);
+      steps = advanceSteps(steps, ev("Pouring python@3.15"), 2_500);
+      steps = advanceSteps(steps, ev("Pouring awscli"), 43_500);
+      expect(steps.map((s) => [s.label, s.ms])).toEqual([
+        ["Upgrading awscli", 1_500],
+        ["Pouring python@3.15", 41_000],
+        ["Pouring awscli", undefined],
+      ]);
+    });
+
+    it("a repeat of the running step changes nothing", () => {
+      const steps = advanceSteps([], ev("Pouring awscli"), 0);
+      expect(advanceSteps(steps, ev("Pouring awscli", "awscli", 1), 900)).toBe(steps);
+    });
+
+    it("the same label for another package is a new step", () => {
+      let steps = advanceSteps([], ev("Cleanup", "git"), 0);
+      steps = advanceSteps(steps, ev("Cleanup", "wget"), 300);
+      expect(steps).toHaveLength(2);
+      expect(steps[0].ms).toBe(300);
+    });
+
+    it("phases stand in when brew gives no step (mas, npm, preverify)", () => {
+      const steps = advanceSteps([], { phase: "Checking publisher", current: "zoom", done: 0, total: 1 }, 0);
+      expect(steps[0].label).toBe("Checking publisher zoom");
+    });
+
+    it("keeps a bounded history", () => {
+      let steps: ReturnType<typeof advanceSteps> = [];
+      for (let i = 0; i < 100; i++) steps = advanceSteps(steps, ev(`step ${i}`), i);
+      expect(steps).toHaveLength(60);
+      expect(steps[steps.length - 1].label).toBe("step 99");
+    });
+
+    it("liveView splits the running step from the recent finished ones", () => {
+      let steps = advanceSteps([], ev("a"), 0);
+      steps = advanceSteps(steps, ev("b"), 1);
+      steps = advanceSteps(steps, ev("c"), 2);
+      const view = liveView(steps, 1);
+      expect(view.running?.label).toBe("c");
+      expect(view.done.map((s) => s.label)).toEqual(["b"]);
+      expect(liveView([], 3)).toEqual({ done: [], running: null });
+    });
+
+    it("formatElapsed", () => {
+      expect(formatElapsed(0)).toBe("0:00");
+      expect(formatElapsed(7_900)).toBe("0:07");
+      expect(formatElapsed(102_000)).toBe("1:42");
+      expect(formatElapsed(-5)).toBe("0:00");
+    });
+  });
+
+  describe("needsAttention", () => {
+    const quiet = { vulns: {}, checkVulns: true, lastRun: null, results: null };
+    const run = {
+      finished_at: 1,
+      notify_only: false,
+      available: 3,
+      updated: ["git"],
+      needs_admin: [],
+      failed: [],
+      signer_changed: [],
+    };
+    it("is off when there's nothing to look at", () => {
+      expect(needsAttention(quiet)).toBe(false);
+      expect(needsAttention({ ...quiet, lastRun: run })).toBe(false);
+      expect(needsAttention({ ...quiet, lastRun: { ...run, needs_admin: ["zoom"] } })).toBe(false);
+    });
+    it("flags vulnerabilities only when the user opted in", () => {
+      const vulns = { lodash: { current: ["GHSA-1"], fixed: [] } };
+      expect(needsAttention({ ...quiet, vulns })).toBe(true);
+      expect(needsAttention({ ...quiet, vulns, checkVulns: false })).toBe(false);
+      expect(needsAttention({ ...quiet, vulns: { x: { current: [], fixed: [] } } })).toBe(false);
+    });
+    it("flags publisher changes and scheduled-run problems", () => {
+      const flagged = [
+        { kind: "cask", name: "zoom", success: false, output: "", action: { type: "trust_signer" as const, bundle_id: "b", team: "T" } },
+      ];
+      expect(needsAttention({ ...quiet, results: flagged })).toBe(true);
+      expect(needsAttention({ ...quiet, lastRun: { ...run, failed: ["x"] } })).toBe(true);
+      expect(needsAttention({ ...quiet, lastRun: { ...run, signer_changed: ["x"] } })).toBe(true);
+      expect(needsAttention({ ...quiet, lastRun: { ...run, blocked: ["x"] } })).toBe(true);
+    });
+  });
+
+  describe("keyboard", () => {
+    const k = (key: string, metaKey = false, inField = false) => keyAction({ key, metaKey, inField });
+    it("maps plain keys outside text fields", () => {
+      expect([k("ArrowDown"), k("j"), k("ArrowUp"), k("k"), k(" "), k("ArrowRight"), k("ArrowLeft")]).toEqual([
+        "down",
+        "down",
+        "up",
+        "up",
+        "toggle",
+        "expand",
+        "collapse",
+      ]);
+      expect([k("/"), k("?"), k("x")]).toEqual(["filter", "help", null]);
+    });
+    it("lets text fields keep their keys, except Esc and ⌘ shortcuts", () => {
+      expect(k("j", false, true)).toBeNull();
+      expect(k(" ", false, true)).toBeNull();
+      expect(k("Escape", false, true)).toBe("escape");
+      expect(k("Enter", true, true)).toBe("update");
+    });
+    it("maps ⌘ shortcuts", () => {
+      expect([k("Enter", true), k("f", true), k("r", true), k(",", true), k("q", true)]).toEqual([
+        "update",
+        "filter",
+        "refresh",
+        "settings",
+        null,
+      ]);
+      expect(k("Enter"), "plain Return never starts an update").toBeNull();
+    });
+    it("lists a shortcut for every action", () => {
+      expect(SHORTCUTS.length).toBeGreaterThanOrEqual(9);
+    });
+    it("moveFocus stops at the ends", () => {
+      expect(moveFocus(-1, 1, 5)).toBe(0);
+      expect(moveFocus(-1, -1, 5)).toBe(4);
+      expect(moveFocus(4, 1, 5)).toBe(4);
+      expect(moveFocus(0, -1, 5)).toBe(0);
+      expect(moveFocus(2, 1, 5)).toBe(3);
+      expect(moveFocus(3, 1, 0)).toBe(-1);
+    });
+  });
+
+  it("filterItems matches every word against name and id", () => {
+    const items = [
+      { id: "awscli", name: "awscli" },
+      { id: "visual-studio-code", name: "Visual Studio Code" },
+      { id: "python@3.15", name: "python@3.15" },
+    ];
+    expect(filterItems(items, "")).toBe(items);
+    expect(filterItems(items, "  ").map((i) => i.id)).toEqual(["awscli", "visual-studio-code", "python@3.15"]);
+    expect(filterItems(items, "CODE visual").map((i) => i.id)).toEqual(["visual-studio-code"]);
+    expect(filterItems(items, "studio-code").map((i) => i.id)).toEqual(["visual-studio-code"]);
+    expect(filterItems(items, "py 3.15").map((i) => i.id)).toEqual(["python@3.15"]);
+    expect(filterItems(items, "zzz")).toEqual([]);
+  });
+
+  it("matchText", () => {
+    expect([matchText(0), matchText(1), matchText(4)]).toEqual(["no matches", "1 match", "4 matches"]);
+  });
+
+  it("resolveTheme falls back to the default", () => {
+    expect(resolveTheme("cobalt")).toBe("cobalt");
+    expect(resolveTheme(null)).toBe("noir");
+    expect(resolveTheme("removed-theme")).toBe("noir");
+    expect(new Set(THEMES.map((t) => t.id)).size).toBe(THEMES.length);
+  });
+
+  it("every theme has a [data-theme] block defining every colour token", () => {
+    expect(css.length, "App.css loaded").toBeGreaterThan(1000);
+    const root = /:root \{([^}]*)\}/.exec(css)?.[1] ?? "";
+    const colourTokens = [...root.matchAll(/(--[a-z-]+):\s*(?:rgba?\(|#)/g)].map((m) => m[1]);
+    expect(colourTokens.length).toBeGreaterThan(15);
+    for (const t of THEMES.filter((t) => t.id !== "noir")) {
+      const block = new RegExp(`:root\\[data-theme="${t.id}"\\] \\{([^}]*)\\}`).exec(css)?.[1];
+      expect(block, t.id).toBeDefined();
+      for (const token of colourTokens) expect(block, `${t.id} ${token}`).toContain(`${token}:`);
+    }
+  });
+});
+
+describe("routeKey", () => {
+  const idle: KeyContext = {
+    help: false,
+    results: false,
+    history: false,
+    adopt: false,
+    settings: false,
+    filterOpen: false,
+    loading: false,
+    verifying: false,
+    updating: false,
+    notifyOnly: false,
+    scheduledRunning: false,
+    selectedCount: 0,
+    updatableCount: 5,
+  };
+  const panels = ["help", "results", "history", "adopt", "settings"] as const;
+
+  it("Esc closes the topmost layer first", () => {
+    const all = { ...idle, help: true, results: true, history: true, adopt: true, settings: true, filterOpen: true };
+    const order = ["help", "results", "history", "adopt", "settings", "filter"];
+    let c: KeyContext = all;
+    for (const what of order) {
+      expect(routeKey("escape", c)).toEqual({ cmd: { do: "close", what }, prevent: true });
+      c = { ...c, [what === "filter" ? "filterOpen" : what]: false };
+    }
+    expect(routeKey("escape", c)).toEqual({ cmd: { do: "nothing" }, prevent: true });
+  });
+
+  it("arrows move, → ← open and close, Space is left to the control", () => {
+    expect(routeKey("down", idle)).toEqual({ cmd: { do: "move", delta: 1 }, prevent: true });
+    expect(routeKey("up", idle)).toEqual({ cmd: { do: "move", delta: -1 }, prevent: true });
+    expect(routeKey("expand", idle).cmd).toEqual({ do: "expand" });
+    expect(routeKey("collapse", idle).cmd).toEqual({ do: "collapse" });
+    expect(routeKey("toggle", idle)).toEqual({ cmd: { do: "toggle" }, prevent: false });
+  });
+
+  it("the list keys do nothing, and don't swallow the key, while a panel is on top", () => {
+    for (const panel of panels) {
+      const c = { ...idle, [panel]: true };
+      for (const action of ["down", "up", "expand", "collapse", "toggle", "filter", "update"] as const) {
+        expect(routeKey(action, c), `${action} under ${panel}`).toEqual({ cmd: { do: "nothing" }, prevent: false });
+      }
+    }
+  });
+
+  it("? opens the shortcut list, and closes it again from on top", () => {
+    expect(routeKey("help", idle).cmd).toEqual({ do: "toggleHelp" });
+    expect(routeKey("help", { ...idle, help: true }).cmd).toEqual({ do: "toggleHelp" });
+    expect(routeKey("help", { ...idle, settings: true }).cmd).toEqual({ do: "nothing" });
+  });
+
+  it("⌘, and ⌘R work over panels, but not mid-check", () => {
+    for (const panel of panels) {
+      const c = { ...idle, [panel]: true };
+      expect(routeKey("settings", c).cmd).toEqual({ do: "settings" });
+      expect(routeKey("refresh", c).cmd).toEqual({ do: "refresh" });
+    }
+    expect(routeKey("settings", { ...idle, loading: true })).toEqual({ cmd: { do: "nothing" }, prevent: true });
+    for (const busy of ["loading", "verifying", "updating"] as const) {
+      // Still prevented: ⌘R must never reload the web view.
+      expect(routeKey("refresh", { ...idle, [busy]: true }), busy).toEqual({ cmd: { do: "nothing" }, prevent: true });
+    }
+  });
+
+  it("⌘↩ updates the selection, else everything shown, else nothing", () => {
+    expect(routeKey("update", { ...idle, selectedCount: 2 }).cmd).toEqual({ do: "update", which: "selected" });
+    expect(routeKey("update", idle).cmd).toEqual({ do: "update", which: "all" });
+    expect(routeKey("update", { ...idle, updatableCount: 0 }).cmd).toEqual({ do: "nothing" });
+  });
+
+  it("⌘↩ never starts an update when it shouldn't", () => {
+    for (const block of ["notifyOnly", "updating", "loading", "scheduledRunning"] as const) {
+      expect(routeKey("update", { ...idle, selectedCount: 3, [block]: true }).cmd, block).toEqual({ do: "nothing" });
+    }
+  });
+
+  it("the filter opens from the list, including while it's already open", () => {
+    expect(routeKey("filter", idle).cmd).toEqual({ do: "filter" });
+    expect(routeKey("filter", { ...idle, filterOpen: true }).cmd).toEqual({ do: "filter" });
+    expect(routeKey("down", { ...idle, filterOpen: true }).cmd).toEqual({ do: "move", delta: 1 });
+  });
+});
+
+describe("keyboard cursor", () => {
+  const ids = [catNavId("Homebrew"), rowNavId("brew", "git"), rowNavId("brew", "wget"), catNavId("Apps")];
+
+  it("steps through every row in order and stops at the ends", () => {
+    const seen: (string | null)[] = [];
+    let at: string | null = null;
+    for (let i = 0; i < 6; i++) {
+      at = stepCursor(ids, at, 1);
+      seen.push(at);
+    }
+    expect(seen).toEqual([...ids, ids[3], ids[3]]);
+    for (let i = 0; i < 6; i++) at = stepCursor(ids, at, -1);
+    expect(at).toBe(ids[0]);
+  });
+
+  it("starts at the top on ↓ and the bottom on ↑ from nowhere", () => {
+    expect(stepCursor(ids, null, 1)).toBe(ids[0]);
+    expect(stepCursor(ids, null, -1)).toBe(ids[3]);
+  });
+
+  it("restarts when its row is gone (section closed, filter changed)", () => {
+    expect(stepCursor(ids, rowNavId("brew", "hidden"), 1)).toBe(ids[0]);
+    expect(stepCursor(ids, rowNavId("brew", "hidden"), -1)).toBe(ids[3]);
+  });
+
+  it("has nowhere to go in an empty list", () => {
+    expect(stepCursor([], null, 1)).toBeNull();
+    expect(stepCursor([], "cat:x", -1)).toBeNull();
+  });
+
+  it("ids round-trip, including names with colons and spaces", () => {
+    expect(parseNavId(catNavId("Other apps"))).toEqual({ type: "cat", cat: "Other apps" });
+    expect(parseNavId(rowNavId("cask", "visual-studio-code"))).toEqual({ type: "row", key: "cask::visual-studio-code" });
+    expect(parseNavId(rowNavId("npm", "@scope/pkg"))).toEqual({ type: "row", key: "npm::@scope/pkg" });
+    expect(parseNavId(catNavId("a:b"))).toEqual({ type: "cat", cat: "a:b" });
+    expect(parseNavId("bogus")).toBeNull();
   });
 });

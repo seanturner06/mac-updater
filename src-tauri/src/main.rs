@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::{Read as _, Write as _};
-use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt};
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -25,6 +25,7 @@ use tauri::{
 };
 use tauri_plugin_positioner::{Position, WindowExt as _};
 
+mod npm;
 mod preverify;
 mod rollback;
 mod vulns;
@@ -69,13 +70,26 @@ struct UpdateResult {
     // A follow-up the user can take from the results panel (trust a new signer, roll back).
     #[serde(skip_serializing_if = "Option::is_none")]
     action: Option<ResultAction>,
-    // Wall time for this item; batched items share their batch's time.
+    // Wall time for this item: in a batch, its own steps plus the batch's shared downloads.
     #[serde(skip_serializing_if = "Option::is_none")]
     elapsed_ms: Option<u64>,
     // Deliberately not attempted (the app was open, or the user stopped the run): neither a
     // success nor a failure.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     skipped: bool,
+    // Where the time went, from brew's `==> …` lines (see brew_steps). Empty for mas/npm.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    steps: Vec<Step>,
+}
+
+// One `==> …` line of brew's output and how long until the next one: "Pouring python@3.15" took
+// 41s. `shared` steps belong to the whole batch (fetching every download up front), not one item.
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+struct Step {
+    label: String,
+    ms: u64,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    shared: bool,
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
@@ -89,6 +103,12 @@ enum ResultAction {
     // A pre-update snapshot of this cask's app exists and can be restored.
     Rollback {
         token: String,
+    },
+    // An npm package wants to run install scripts: approving lets this exact version run them.
+    AllowNpmScripts {
+        name: String,
+        version: String,
+        scripts: String,
     },
     // Skipped because the app was open: quit it, then update just this item.
     QuitAndUpdate {
@@ -236,13 +256,53 @@ static HEADLESS: AtomicBool = AtomicBool::new(false);
 // cores at low priority. Slower, but nobody is waiting on an unattended run, and it's what keeps
 // a 40-package upgrade from heating the Mac up while you work.
 fn command(cmd: &str) -> Command {
+    let program = resolve_program(cmd);
     if HEADLESS.load(Ordering::Relaxed) {
         let mut c = Command::new("/usr/sbin/taskpolicy");
-        c.args(["-c", "background", cmd]);
+        c.args(["-c", "background", &program]);
         c
     } else {
-        Command::new(cmd)
+        Command::new(program)
     }
+}
+
+// `brew` always runs from a fixed, trusted location, never "whatever is first on PATH": a fake
+// `brew` planted earlier on PATH would otherwise be handed Freshet's password dialog (askpass)
+// and every update. Other commands are looked up normally.
+fn resolve_program(cmd: &str) -> String {
+    if cmd != "brew" {
+        return cmd.to_string();
+    }
+    // Tests point this at a stand-in brew. Debug builds only: a release build ignores it, so it
+    // can't be used to redirect the real app.
+    if cfg!(debug_assertions) {
+        if let Some(path) = std::env::var_os("FRESHET_BREW") {
+            return path.to_string_lossy().into_owned();
+        }
+    }
+    trusted_brew().map_or_else(|| cmd.to_string(), |p| p.to_string_lossy().into_owned())
+}
+
+// The standard Homebrew prefixes, where the executable belongs to this user or root and isn't
+// writable by anyone else.
+fn trusted_brew() -> Option<PathBuf> {
+    let me = own_uid()?;
+    BREW_LOCATIONS.iter().map(PathBuf::from).find(|p| {
+        std::fs::metadata(p).is_ok_and(|m| m.is_file() && owned_safely(m.uid(), m.mode(), me))
+    })
+}
+
+const BREW_LOCATIONS: [&str; 2] = ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"];
+
+// Owned by `me` or root, and not group/world-writable. Pure → unit-tested.
+const fn owned_safely(uid: u32, mode: u32, me: u32) -> bool {
+    (uid == me || uid == 0) && mode & 0o022 == 0
+}
+
+// The current user's uid: the owner of their home directory.
+fn own_uid() -> Option<u32> {
+    static UID: OnceLock<Option<u32>> = OnceLock::new();
+    *UID.get_or_init(|| std::fs::metadata(dirs::home_dir()?).ok().map(|m| m.uid()))
 }
 
 fn run_cmd(cmd: &str, args: &[&str]) -> Result<String, String> {
@@ -262,12 +322,24 @@ fn run_cmd(cmd: &str, args: &[&str]) -> Result<String, String> {
 
 // ~/.freshet, created 0700 (owner-only) so no other local user can read or tamper with the
 // askpass helper, the scheduled run script, or the signing baseline that live inside it.
+// Refuses (None) a ~/.freshet that is a symlink or belongs to someone else: everything Freshet
+// trusts lives here, so it must be the user's own directory, not one planted for them.
 fn freshet_dir() -> Option<PathBuf> {
     let mut p = dirs::home_dir()?;
     p.push(".freshet");
     std::fs::create_dir_all(&p).ok()?;
+    let meta = std::fs::symlink_metadata(&p).ok()?;
+    if !dir_is_safe(meta.file_type().is_symlink(), meta.uid(), own_uid()?) {
+        tracing::error!(path = %p.display(), "~/.freshet is not this user's own directory; refusing to use it");
+        return None;
+    }
     let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700));
     Some(p)
+}
+
+// Pure → unit-tested.
+const fn dir_is_safe(is_symlink: bool, uid: u32, me: u32) -> bool {
+    !is_symlink && uid == me
 }
 
 // Write a file owner-only (0700 for executables / 0600 for data is enough; the dir is already 0700).
@@ -277,22 +349,51 @@ fn write_private(path: &Path, contents: &str, executable: bool) -> std::io::Resu
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
 }
 
-// Lazily write a GUI askpass helper and return its path. When SUDO_ASKPASS points at this and
-// no terminal is available (the packaged app), sudo shows a native macOS password dialog instead
-// of prompting on a hidden terminal. Written once per process.
-fn askpass_program() -> Option<&'static str> {
-    static ASKPASS: OnceLock<Option<String>> = OnceLock::new();
-    ASKPASS
-        .get_or_init(|| {
-            let mut path = freshet_dir()?;
-            path.push("askpass.sh");
-            let script = r#"#!/bin/bash
+// The GUI password helper sudo runs (SUDO_ASKPASS) when it needs admin rights and has no
+// terminal: it shows a native macOS password dialog. It's created fresh for every command that
+// might need it and deleted when that command finishes, rather than living in ~/.freshet where
+// anything running as the user could swap in a version that keeps a copy of the password.
+// Created with O_EXCL (create_new) and 0700 so an existing file or planted symlink can't be
+// reused, then checked before use.
+struct Askpass(PathBuf);
+
+impl Drop for Askpass {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+const ASKPASS_SCRIPT: &str = r#"#!/bin/bash
 osascript -e 'display dialog "Freshet needs your administrator password to update one or more apps." with title "Freshet" default answer "" with hidden answer with icon caution' -e 'text returned of result' 2>/dev/null
 "#;
-            write_private(&path, script, true).ok()?;
-            Some(path.to_str()?.to_string())
-        })
-        .as_deref()
+
+fn fresh_askpass() -> Option<Askpass> {
+    fresh_askpass_in(&freshet_dir()?)
+}
+
+fn fresh_askpass_in(dir: &Path) -> Option<Askpass> {
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let path = dir.join(format!(
+        "askpass-{}-{}-{}.sh",
+        std::process::id(),
+        unix_now(),
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o700)
+        .open(&path)
+        .ok()?;
+    file.write_all(ASKPASS_SCRIPT.as_bytes()).ok()?;
+    drop(file);
+    let guard = Askpass(path);
+    let meta = std::fs::symlink_metadata(&guard.0).ok()?;
+    let ok = meta.is_file()
+        && meta.mode() & 0o777 == 0o700
+        && own_uid() == Some(meta.uid())
+        && std::fs::read_to_string(&guard.0).ok()? == ASKPASS_SCRIPT;
+    ok.then_some(guard)
 }
 
 // mas can't update App Store apps acquired under a different Apple ID (or installed outside the
@@ -323,15 +424,20 @@ fn combine_output(stdout: &[u8], stderr: &[u8]) -> String {
 }
 
 // --- Helper: run an upgrade command, returning whether it succeeded plus combined output ---
-fn update_command(cmd: &str, args: &[&str]) -> Command {
+// The askpass guard must outlive the command: dropping it deletes the helper.
+fn update_command(cmd: &str, args: &[&str]) -> (Command, Option<Askpass>) {
     let mut command = command(cmd);
     command.args(args);
-    if HEADLESS.load(Ordering::Relaxed) {
-        command.env_remove("SUDO_ASKPASS");
-    } else if let Some(askpass) = askpass_program() {
-        command.env("SUDO_ASKPASS", askpass);
+    command.env_remove("SUDO_ASKPASS");
+    let askpass = if HEADLESS.load(Ordering::Relaxed) {
+        None
+    } else {
+        fresh_askpass()
+    };
+    if let Some(a) = &askpass {
+        command.env("SUDO_ASKPASS", &a.0);
     }
-    command
+    (command, askpass)
 }
 
 // Like run_update_cmd, but stdout and stderr share one pipe (as in a terminal), so a batch's
@@ -340,13 +446,15 @@ fn update_command(cmd: &str, args: &[&str]) -> Command {
 fn run_update_cmd_streaming(
     cmd: &str,
     args: &[&str],
+    envs: &[(&str, &str)],
     on_line: &mut dyn FnMut(&str),
 ) -> (bool, String) {
     use std::io::BufRead as _;
     let mut run = || -> std::io::Result<(bool, String)> {
         let (reader, writer) = std::io::pipe()?;
-        let mut command = update_command(cmd, args);
+        let (mut command, _askpass) = update_command(cmd, args);
         command
+            .envs(envs.iter().copied())
             .stdin(std::process::Stdio::null())
             .stdout(writer.try_clone()?)
             .stderr(writer)
@@ -372,6 +480,46 @@ fn run_update_cmd_streaming(
     run().unwrap_or_else(|e| (false, format!("Failed to run {cmd}: {e}")))
 }
 
+// --- Homebrew build provenance (attestations) ---
+//
+// With HOMEBREW_VERIFY_ATTESTATIONS=1, Homebrew checks each formula bottle's GitHub build
+// provenance attestation (via the `gh` CLI) before pouring it, and refuses one that wasn't built
+// by Homebrew's CI. It needs GitHub credentials, and with none it refuses to install *any*
+// bottle (Homebrew utils/attestation.rb: GhAuthNeeded → CannotInstallFormulaError). So Freshet
+// turns it on only when credentials exist; Settings shows which, and how to enable it.
+
+// HOMEBREW_GITHUB_API_TOKEN, or a `gh` that is signed in (what Homebrew itself looks for).
+fn github_credentials_available() -> bool {
+    if std::env::var("HOMEBREW_GITHUB_API_TOKEN").is_ok_and(|t| !t.trim().is_empty()) {
+        return true;
+    }
+    Command::new("gh")
+        .args(["auth", "token"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .is_ok_and(|o| o.status.success() && !o.stdout.trim_ascii().is_empty())
+}
+
+// Pure → unit-tested.
+fn provenance_env(has_credentials: bool) -> Vec<(&'static str, &'static str)> {
+    if has_credentials {
+        vec![("HOMEBREW_VERIFY_ATTESTATIONS", "1")]
+    } else {
+        Vec::new()
+    }
+}
+
+// Homebrew's wording when a bottle fails verification ("…has an invalid build provenance
+// attestation"). That's a block, not an ordinary failure. Pure → unit-tested.
+fn provenance_failed(output: &str) -> bool {
+    output.contains("invalid build provenance attestation")
+}
+
+#[tauri::command]
+fn homebrew_provenance_active() -> bool {
+    github_credentials_available()
+}
+
 // The requested package a `==> Upgrading <name>` line starts on, if any. Pure → unit-tested.
 fn upgrading_name<'a>(line: &str, wanted: &std::collections::HashSet<&'a str>) -> Option<&'a str> {
     let name = line
@@ -382,7 +530,7 @@ fn upgrading_name<'a>(line: &str, wanted: &std::collections::HashSet<&'a str>) -
 }
 
 fn run_update_cmd(cmd: &str, args: &[&str]) -> (bool, String) {
-    let mut command = update_command(cmd, args);
+    let (mut command, _askpass) = update_command(cmd, args);
     match command.output() {
         Ok(out) => {
             let combined = maybe_append_mas_hint(combine_output(&out.stdout, &out.stderr));
@@ -810,6 +958,27 @@ fn failed_category_err(category: &str, kind: &str, error: String) -> CategorySta
     }
 }
 
+// The version an app reports about itself (CFBundleShortVersionString, else CFBundleVersion).
+// For casks this is the truth about what's installed: Homebrew only records what *it* last
+// installed, so after a rollback (or an app updating itself) the two disagree.
+fn bundle_version(app: &Path) -> Option<String> {
+    let info = app.join("Contents/Info.plist");
+    let info = info.to_str()?;
+    read_plist_string(info, "CFBundleShortVersionString")
+        .or_else(|| read_plist_string(info, "CFBundleVersion"))
+}
+
+// Does Homebrew's recorded cask version describe the app on disk? Cask versions can carry a
+// ",build" suffix, and apps sometimes report fewer or more components ("26" vs "26.0.1"), so
+// one being a dotted prefix of the other counts as agreement. Pure → unit-tested.
+fn versions_agree(cask_version: &str, bundle_version: &str) -> bool {
+    let cask = cask_version.split(',').next().unwrap_or("").trim();
+    let bundle = bundle_version.trim();
+    cask == bundle
+        || cask.starts_with(&format!("{bundle}."))
+        || bundle.starts_with(&format!("{cask}."))
+}
+
 fn read_plist_string(info_path: &str, key: &str) -> Option<String> {
     let out = Command::new("defaults")
         .args(["read", info_path, key])
@@ -1018,7 +1187,33 @@ fn update_is_stale(last: Option<u64>, now: u64, max_age: u64) -> bool {
 
 // Runs `brew update` if the last successful one is over an hour old; None if skipped.
 fn brew_update_if_stale() -> Option<UpdateResult> {
-    let stamp = brew_update_stamp_path();
+    brew_update_if_stale_with(
+        brew_update_stamp_path(),
+        &mut || run_update_cmd("brew", &["update"]),
+        &mut std::thread::sleep,
+    )
+}
+
+// One `brew update` at a time within Freshet: a check, an update and the scheduled run can all
+// ask for one at once (and React runs startup effects twice in dev). The second caller waits
+// here, then finds the stamp fresh and skips — instead of hitting Homebrew's lock and reporting
+// a failure.
+static BREW_UPDATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+// How long to wait for someone else's `brew update` (a terminal, another Freshet) to finish.
+const BREW_UPDATE_WAIT: std::time::Duration = std::time::Duration::from_mins(1);
+const BREW_UPDATE_RETRY_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+
+// brew_update_if_stale with the stamp file, the command and sleeping passed in, for tests.
+fn brew_update_if_stale_with(
+    stamp: Option<PathBuf>,
+    run: &mut dyn FnMut() -> (bool, String),
+    sleep: &mut dyn FnMut(std::time::Duration),
+) -> Option<UpdateResult> {
+    let _one_at_a_time = BREW_UPDATE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Read only once holding the lock, so a caller that waited sees the update it waited for.
     let last = stamp
         .as_ref()
         .and_then(|p| std::fs::read_to_string(p).ok())
@@ -1028,7 +1223,13 @@ fn brew_update_if_stale() -> Option<UpdateResult> {
         return None;
     }
     let started = std::time::Instant::now();
-    let (success, output) = run_update_cmd("brew", &["update"]);
+    let Some((success, output)) =
+        update_waiting_for_lock(run, sleep, BREW_UPDATE_WAIT, BREW_UPDATE_RETRY_EVERY)
+    else {
+        // Someone else is refreshing the same metadata: not a failure, and nothing to report.
+        tracing::info!("brew update skipped: another `brew update` kept the lock");
+        return None;
+    };
     let elapsed_ms = elapsed_ms(started);
     tracing::info!(elapsed_ms, success, "brew update");
     if success {
@@ -1044,7 +1245,36 @@ fn brew_update_if_stale() -> Option<UpdateResult> {
         action: None,
         elapsed_ms: Some(elapsed_ms),
         skipped: false,
+        steps: Vec::new(),
     })
+}
+
+// Homebrew's refusal when another `brew update` holds its lock (cmd/update.sh). Pure.
+fn brew_update_locked(output: &str) -> bool {
+    output.contains("Another `brew update` process is already running")
+}
+
+// Run `brew update`, and while another process holds Homebrew's lock, retry every `every` for up
+// to `max_wait` (brew refuses immediately, so each retry is cheap). None if it was still locked
+// at the end. Other failures return at once. Pure apart from `run` and `sleep`.
+fn update_waiting_for_lock(
+    run: &mut dyn FnMut() -> (bool, String),
+    sleep: &mut dyn FnMut(std::time::Duration),
+    max_wait: std::time::Duration,
+    every: std::time::Duration,
+) -> Option<(bool, String)> {
+    let mut waited = std::time::Duration::ZERO;
+    loop {
+        let (ok, output) = run();
+        if ok || !brew_update_locked(&output) {
+            return Some((ok, output));
+        }
+        if waited >= max_wait {
+            return None;
+        }
+        sleep(every);
+        waited += every;
+    }
 }
 
 fn elapsed_ms(since: std::time::Instant) -> u64 {
@@ -1159,6 +1389,9 @@ struct PackageInfo {
     release_notes: String,
     // The cask's .app bundle name, used to look up its icon.
     app: String,
+    // The version the installed app reports, set only when it disagrees with Homebrew's record
+    // (e.g. after a rollback). The list shows this as the real "from" version.
+    on_disk_version: String,
 }
 
 // "https://github.com/owner/repo(.git)(/anything)" → "https://github.com/owner/repo/releases".
@@ -1251,6 +1484,9 @@ fn parse_cask_infos(json: &str) -> HashMap<String, PackageInfo> {
 async fn package_details(
     formulae: Vec<String>,
     casks: Vec<String>,
+    // token → the version Homebrew records as installed (the list's "from"), to compare with
+    // what the app on disk reports.
+    installed: Option<HashMap<String, String>>,
 ) -> HashMap<String, PackageInfo> {
     tauri::async_runtime::spawn_blocking(move || {
         let info = |flag: &'static str, ids: &[String]| -> Option<String> {
@@ -1274,7 +1510,19 @@ async fn package_details(
         let formula = formula_json
             .map(|j| parse_formula_infos(&j))
             .unwrap_or_default();
-        let cask = cask_json.map(|j| parse_cask_infos(&j)).unwrap_or_default();
+        let mut cask = cask_json.map(|j| parse_cask_infos(&j)).unwrap_or_default();
+        let installed = installed.unwrap_or_default();
+        for (token, info) in &mut cask {
+            let (Some(recorded), false) = (installed.get(token), info.app.is_empty()) else {
+                continue;
+            };
+            let on_disk = installed_cask_apps(std::slice::from_ref(&info.app))
+                .first()
+                .and_then(|app| bundle_version(app));
+            if let Some(v) = on_disk.filter(|v| !versions_agree(recorded, v)) {
+                info.on_disk_version = v;
+            }
+        }
         formula
             .into_iter()
             .map(|(k, v)| (format!("brew::{k}"), v))
@@ -1384,13 +1632,71 @@ fn badge_title(count: u32) -> Option<String> {
     }
 }
 
+// What the menu-bar icon should say, from the window's point of view.
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+struct TrayState {
+    // Updates available.
+    count: u32,
+    // Something needs a look: a publisher change, a known vulnerability, a scheduled run that
+    // failed or was blocked.
+    attention: bool,
+    // Updating now (in the window, or a scheduled run); `done` of `total` when known.
+    running: bool,
+    done: u32,
+    total: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TrayLook {
+    // The template drop: macOS tints it for a light or dark menu bar.
+    Normal,
+    // Outline drop (template): an update is running.
+    Running,
+    // Amber drop, not a template, so the colour shows: needs a look.
+    Attention,
+}
+
+// Icon and title for a state. Running wins (it's what's happening now), then attention.
+// Pure → unit-tested.
+fn tray_look(s: &TrayState) -> (TrayLook, Option<String>) {
+    if s.running {
+        let title = (s.total > 0).then(|| format!("{}/{}", s.done.min(s.total), s.total));
+        (TrayLook::Running, title)
+    } else if s.attention {
+        (TrayLook::Attention, badge_title(s.count))
+    } else {
+        (TrayLook::Normal, badge_title(s.count))
+    }
+}
+
+// The icon last set, so a stream of progress updates only swaps the image when it changes.
+static TRAY_LOOK: std::sync::Mutex<Option<TrayLook>> = std::sync::Mutex::new(None);
+
 // AppHandle is taken by value to match the Tauri command convention; it's a cheap Arc clone.
 #[allow(clippy::needless_pass_by_value)]
 #[tauri::command]
-fn set_badge(app: tauri::AppHandle, count: u32) {
-    if let Some(tray) = app.tray_by_id("main-tray") {
-        let _ = tray.set_title(badge_title(count));
+fn set_tray_state(app: tauri::AppHandle, state: TrayState) {
+    let Some(tray) = app.tray_by_id("main-tray") else {
+        return;
+    };
+    let (look, title) = tray_look(&state);
+    let mut last = TRAY_LOOK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if *last != Some(look) {
+        let bytes: &[u8] = match look {
+            TrayLook::Normal => include_bytes!("../icons/tray-template.png"),
+            TrayLook::Running => include_bytes!("../icons/tray-running.png"),
+            TrayLook::Attention => include_bytes!("../icons/tray-attention.png"),
+        };
+        if let Ok(icon) = tauri::image::Image::from_bytes(bytes) {
+            let _ = tray.set_icon(Some(icon));
+            let _ = tray.set_icon_as_template(look != TrayLook::Attention);
+            *last = Some(look);
+        }
     }
+    drop(last);
+    let _ = tray.set_title(title);
 }
 
 // Scan /Applications and suggest apps that aren't brew-managed but have a matching cask, so the
@@ -1524,7 +1830,62 @@ fn adopt_args(token: &str) -> Vec<String> {
     ]
 }
 
-fn adopt_one(token: &str) -> UpdateResult {
+// Live progress for an adoption ("adopt-progress" events).
+#[derive(Clone, Serialize, Debug, PartialEq, Eq)]
+struct AdoptProgress {
+    token: String,
+    // "Starting", "Downloading", "Adopting".
+    phase: String,
+    // Size of the download so far, from Homebrew's in-progress file; 0 until one appears.
+    downloaded_mb: u64,
+    // No new data for STALL_SECS: the download server has likely stopped sending.
+    stalled: bool,
+}
+
+const STALL_SECS: u64 = 60;
+
+// The phase a line of `brew install --cask --adopt` output starts. Pure → unit-tested.
+fn adopt_phase(line: &str) -> Option<&'static str> {
+    let rest = line.strip_prefix("==> ")?;
+    if rest.starts_with("Downloading") || rest.starts_with("Fetching") {
+        Some("Downloading")
+    } else if rest.starts_with("Adopting")
+        || rest.starts_with("Moving")
+        || rest.starts_with("Installing")
+        || rest.starts_with("Linking")
+    {
+        Some("Adopting")
+    } else {
+        None
+    }
+}
+
+// Whether a download has stalled: it has started, and its size hasn't moved for STALL_SECS.
+// Pure → unit-tested.
+const fn download_stalled(bytes: u64, unchanged_for_secs: u64) -> bool {
+    bytes > 0 && unchanged_for_secs >= STALL_SECS
+}
+
+// Size of the newest partial download in Homebrew's cache (`*.incomplete`) that started after
+// `since` — i.e. the one this adoption is fetching.
+fn current_download_bytes(downloads: &Path, since: std::time::SystemTime) -> u64 {
+    std::fs::read_dir(downloads).map_or(0, |rd| {
+        rd.flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".incomplete"))
+            .filter_map(|e| e.metadata().ok())
+            .filter(|m| m.modified().is_ok_and(|t| t >= since))
+            .map(|m| m.len())
+            .max()
+            .unwrap_or(0)
+    })
+}
+
+// `brew install --cask <token> --adopt`. Despite the name, --adopt still downloads the whole
+// app (Homebrew checks it against the installed copy); it only skips moving it into place. A
+// big app on a slow or stalled server can take a long time, so: stream brew's output for the
+// phase, watch the partial download's size once a second for progress and stalls, and run it
+// as the tracked child so cancel_adoption can interrupt it safely.
+fn adopt_one(token: &str, progress: &(dyn Fn(AdoptProgress) + Sync)) -> UpdateResult {
     if !is_valid_cask_token(token) {
         return UpdateResult {
             kind: "cask".into(),
@@ -1534,28 +1895,82 @@ fn adopt_one(token: &str) -> UpdateResult {
             action: None,
             elapsed_ms: None,
             skipped: false,
+            steps: Vec::new(),
         };
     }
+    let event = |phase: &str, downloaded: u64, stalled: bool| AdoptProgress {
+        token: token.to_string(),
+        phase: phase.into(),
+        downloaded_mb: downloaded / 1_048_576,
+        stalled,
+    };
+    progress(event("Starting", 0, false));
+    let phase = std::sync::Mutex::new("Starting");
+    let done = AtomicBool::new(false);
+    let started_at = std::time::SystemTime::now();
+    let started = std::time::Instant::now();
+    let downloads = run_cmd("brew", &["--cache"])
+        .ok()
+        .map(|c| PathBuf::from(c.trim()).join("downloads"));
     let args = adopt_args(token);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let (success, output) = run_update_cmd("brew", &arg_refs);
+
+    let (success, output) = std::thread::scope(|scope| {
+        // Watcher: download size, and whether it has stopped growing.
+        scope.spawn(|| {
+            let (mut last, mut last_change) = (0_u64, std::time::Instant::now());
+            while !done.load(Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                let Some(dir) = &downloads else { continue };
+                let bytes = current_download_bytes(dir, started_at);
+                if bytes != last {
+                    (last, last_change) = (bytes, std::time::Instant::now());
+                }
+                let current = *phase
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if current != "Adopting" && bytes > 0 {
+                    let stalled = download_stalled(bytes, last_change.elapsed().as_secs());
+                    progress(event("Downloading", bytes, stalled));
+                }
+            }
+        });
+        let result = run_update_cmd_streaming("brew", &arg_refs, &[], &mut |line| {
+            if let Some(p) = adopt_phase(line) {
+                *phase
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = p;
+                progress(event(p, 0, false));
+            }
+        });
+        done.store(true, Ordering::SeqCst);
+        result
+    });
+    let cancelled = STOP_REQUESTED.load(Ordering::SeqCst);
     UpdateResult {
         kind: "cask".into(),
         name: token.to_string(),
         success,
-        output,
+        output: if cancelled && !success {
+            "Cancelled. Nothing was changed; the app stays as it was.".into()
+        } else {
+            output
+        },
         action: None,
-        elapsed_ms: None,
-        skipped: false,
+        elapsed_ms: Some(elapsed_ms(started)),
+        skipped: cancelled && !success,
+        steps: Vec::new(),
     }
 }
 
-// Adopt an existing (manually-installed) app into Homebrew without redownloading it.
+// Adopt an existing (manually-installed) app into Homebrew, so it updates from Freshet.
 #[tauri::command]
-async fn adopt_cask(token: String) -> UpdateResult {
-    tauri::async_runtime::spawn_blocking(move || adopt_one(&token))
+async fn adopt_cask(app: tauri::AppHandle, token: String) -> UpdateResult {
+    adopt_casks(app, vec![token])
         .await
-        .unwrap_or_else(|_| UpdateResult {
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| UpdateResult {
             kind: "cask".into(),
             name: "adopt".into(),
             success: false,
@@ -1563,15 +1978,49 @@ async fn adopt_cask(token: String) -> UpdateResult {
             action: None,
             elapsed_ms: None,
             skipped: false,
+            steps: Vec::new(),
         })
 }
 
-// Adopt several apps in one batch, returning a result per token.
+// Adopt several apps in one batch, returning a result per token. Cancelling stops the one in
+// progress (safely, see interrupt_running_child) and skips the rest.
 #[tauri::command]
-async fn adopt_casks(tokens: Vec<String>) -> Vec<UpdateResult> {
-    tauri::async_runtime::spawn_blocking(move || tokens.iter().map(|t| adopt_one(t)).collect())
-        .await
-        .unwrap_or_default()
+async fn adopt_casks(app: tauri::AppHandle, tokens: Vec<String>) -> Vec<UpdateResult> {
+    STOP_REQUESTED.store(false, Ordering::SeqCst);
+    tauri::async_runtime::spawn_blocking(move || {
+        let emit = |p: AdoptProgress| {
+            let _ = app.emit("adopt-progress", p);
+        };
+        tokens
+            .iter()
+            .map(|t| {
+                if STOP_REQUESTED.load(Ordering::SeqCst) {
+                    UpdateResult {
+                        kind: "cask".into(),
+                        name: t.clone(),
+                        success: false,
+                        output: "Not started: you cancelled the adoption.".into(),
+                        action: None,
+                        elapsed_ms: None,
+                        skipped: true,
+                        steps: Vec::new(),
+                    }
+                } else {
+                    adopt_one(t, &emit)
+                }
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_default()
+}
+
+// Cancel a running adoption now (not at a package boundary, as Stop does for updates: an
+// adoption is one package, and until brew starts adopting, all it has done is download).
+#[tauri::command]
+fn cancel_adoption() {
+    STOP_REQUESTED.store(true, Ordering::SeqCst);
+    interrupt_running_child();
 }
 
 // mas 7 needs root to install App Store updates and gets it by running `sudo` itself — without
@@ -1669,6 +2118,8 @@ struct UpdateProgress {
     // Packages finished so far, out of `total` selected.
     done: usize,
     total: usize,
+    // The `==> …` step brew is on (see step_label), for the live run view.
+    step: Option<String>,
 }
 
 type ProgressFn<'a> = &'a (dyn Fn(UpdateProgress) + Sync);
@@ -1679,6 +2130,7 @@ fn progress_event(phase: &str, current: Option<&str>, done: usize, total: usize)
         current: current.map(String::from),
         done,
         total,
+        step: None,
     }
 }
 
@@ -1751,6 +2203,10 @@ fn install_selections(
 
     let mut formulae = Vec::new();
     let mut casks = Vec::new();
+    let mut npm_versions: Option<Versions> = None;
+    let npm_approved = load_settings()
+        .map(|s| s.npm_scripts_approved)
+        .unwrap_or_default();
     for (i, sel) in selections.iter().enumerate() {
         match build_update_command(&sel.kind, &sel.id) {
             None => {
@@ -1761,6 +2217,19 @@ fn install_selections(
             }
             Some(_) if sel.kind == "brew" => formulae.push(i),
             Some(_) if sel.kind == "cask" => casks.push(i),
+            Some(_) if sel.kind == "npm" => {
+                if stopped() {
+                    results[i] = Some(not_started(sel));
+                    continue;
+                }
+                progress(progress_event("Installing", Some(&sel.name), done, total));
+                done += 1;
+                let versions = npm_versions.get_or_insert_with(versions_last_shown);
+                let latest = versions
+                    .get(&(sel.kind.clone(), sel.id.clone()))
+                    .map(|(_, latest)| latest.as_str());
+                results[i] = Some(npm::update(sel, latest, &npm_approved, "npm"));
+            }
             Some((cmd, args)) => {
                 if stopped() {
                     results[i] = Some(not_started(sel));
@@ -1789,6 +2258,7 @@ fn install_selections(
                     action: None,
                     elapsed_ms: Some(elapsed_ms(started)),
                     skipped: false,
+                    steps: Vec::new(),
                 });
             }
         }
@@ -1840,13 +2310,29 @@ fn install_selections(
         }
     }
 
-    let formula_results = upgrade_batch("--formula", &formulae, selections, progress, done, total);
+    let formula_results = upgrade_batch(
+        "brew",
+        "--formula",
+        &formulae,
+        selections,
+        progress,
+        done,
+        total,
+    );
     done += formulae.len();
     for (i, r) in formulae.iter().zip(formula_results) {
         results[*i] = Some(r);
     }
     let cask_indices: Vec<usize> = cleared_casks.iter().map(|(i, _, _)| *i).collect();
-    let cask_results = upgrade_batch("--cask", &cask_indices, selections, progress, done, total);
+    let cask_results = upgrade_batch(
+        "brew",
+        "--cask",
+        &cask_indices,
+        selections,
+        progress,
+        done,
+        total,
+    );
     for ((i, note, snapshotted), mut r) in cleared_casks.into_iter().zip(cask_results) {
         if let Some(note) = note {
             r.output = format!("{note}\n{}", r.output).trim().to_string();
@@ -1875,6 +2361,7 @@ fn failed_result(sel: &UpdateSelection, output: String) -> UpdateResult {
         action: None,
         elapsed_ms: None,
         skipped: false,
+        steps: Vec::new(),
     }
 }
 
@@ -1883,6 +2370,7 @@ const NOT_STARTED: &str = "Not started: you stopped the update.";
 fn not_started(sel: &UpdateSelection) -> UpdateResult {
     UpdateResult {
         skipped: true,
+        steps: Vec::new(),
         ..failed_result(sel, NOT_STARTED.into())
     }
 }
@@ -1895,6 +2383,7 @@ fn skipped_open(sel: &UpdateSelection, bundle: &Path) -> UpdateResult {
     let shown = app.trim_end_matches(".app");
     UpdateResult {
         skipped: true,
+        steps: Vec::new(),
         action: Some(ResultAction::QuitAndUpdate {
             kind: sel.kind.clone(),
             id: sel.id.clone(),
@@ -1936,7 +2425,9 @@ fn bundle_is_running(bundle: &Path, executables: &[String]) -> bool {
 // One `brew upgrade <kind_flag> a b c …` for the given selections; one result per index, in order.
 // `done_before`/`total` place this batch within the whole run for progress reporting.
 #[tracing::instrument(skip(indices, selections, progress), fields(count = indices.len()))]
+// `brew` is the program to run: "brew" (resolved to the trusted Homebrew), or a stand-in in tests.
 fn upgrade_batch(
+    brew: &str,
     kind_flag: &str,
     indices: &[usize],
     selections: &[UpdateSelection],
@@ -1964,7 +2455,21 @@ fn upgrade_batch(
     let wanted: std::collections::HashSet<&str> = ids.iter().copied().collect();
     let mut seen = std::collections::HashSet::new();
     let mut interrupted = false;
-    let (batch_ok, output) = run_update_cmd_streaming("brew", &args, &mut |line| {
+    // Formula bottles: have Homebrew verify each one's build provenance (a signed record that it
+    // was built by Homebrew's own CI from the published formula) when it can — see
+    // provenance_env.
+    let envs = if kind_flag == "--formula" {
+        provenance_env(github_credentials_available())
+    } else {
+        Vec::new()
+    };
+    // Each line with when it arrived, for the per-step timing in the results (brew_steps).
+    let mut timed: Vec<(u64, String)> = Vec::new();
+    let mut current: Option<&str> = None;
+    let (batch_ok, output) = run_update_cmd_streaming(brew, &args, &envs, &mut |line| {
+        if line.starts_with("==> ") {
+            timed.push((elapsed_ms(started), line.to_string()));
+        }
         if interrupted {
             return;
         }
@@ -1975,9 +2480,15 @@ fn upgrade_batch(
         }
         if let Some(name) = upgrading_name(line, &wanted) {
             if seen.insert(name.to_string()) {
-                let done = done_before + seen.len() - 1;
-                progress(progress_event("Upgrading", Some(name), done, total));
+                current = Some(name);
             }
+        }
+        // Every step, so the window can show what brew is doing right now and for how long.
+        if let Some(header) = line.strip_prefix("==> ") {
+            let done = done_before + seen.len().saturating_sub(1);
+            let mut event = progress_event("Upgrading", current, done, total);
+            event.step = Some(step_label(header));
+            progress(event);
         }
     });
     let elapsed = elapsed_ms(started);
@@ -1992,11 +2503,12 @@ fn upgrade_batch(
     let still_outdated: Option<std::collections::HashSet<String>> = if batch_ok {
         Some(std::collections::HashSet::new())
     } else {
-        run_cmd("brew", &["outdated", "--json=v2", "--greedy"])
+        run_cmd(brew, &["outdated", "--json=v2", "--greedy"])
             .ok()
             .map(|json| outdated_names(&json))
     };
     let sections = split_brew_sections(&output, &ids);
+    let mut timings = brew_steps(&timed, elapsed, &ids);
 
     indices
         .iter()
@@ -2018,17 +2530,90 @@ fn upgrade_batch(
             } else {
                 output.clone()
             };
+            // Its own time when brew's output says where it went; else the batch's.
+            let (steps, ms) = timings.remove(*id).unwrap_or((Vec::new(), elapsed));
             UpdateResult {
                 kind: sel.kind.clone(),
                 name: sel.name.clone(),
                 success,
                 output: item_output,
                 action: None,
-                elapsed_ms: Some(elapsed),
+                elapsed_ms: Some(ms),
                 skipped: false,
+                steps,
             }
         })
         .collect()
+}
+
+// A step's label: the `==> ` line without its marker, a bottle file name shortened to the package
+// ("Pouring python@3.15--3.15.1.arm64_tahoe.bottle.tar.gz" → "Pouring python@3.15"). Pure.
+fn step_label(header: &str) -> String {
+    let text = header.trim();
+    text.strip_prefix("Pouring ").map_or_else(
+        || text.to_string(),
+        |file| format!("Pouring {}", file.split("--").next().unwrap_or(file)),
+    )
+}
+
+// Per-package steps and time for a batched `brew upgrade`, from its output lines and when each
+// arrived (ms since start; `total_ms` is when brew exited). A step runs from its `==> ` line to the
+// next one, so "Pouring awscli" covers unpacking, relocating and linking. Lines are attributed to
+// packages as split_brew_sections does; steps before the first requested package (the batch's
+// up-front downloads) are shared by every item. Returns name → (steps, ms), where ms is the
+// item's own steps plus the shared ones. Pure → unit-tested.
+fn brew_steps(
+    lines: &[(u64, String)],
+    total_ms: u64,
+    names: &[&str],
+) -> HashMap<String, (Vec<Step>, u64)> {
+    let wanted: std::collections::HashSet<&str> = names.iter().copied().collect();
+    // (owner, step); owner None = before any requested package = shared.
+    let mut steps: Vec<(Option<String>, Step, u64)> = Vec::new();
+    let mut current: Option<String> = None;
+    for (at, line) in lines {
+        let Some(header) = line.strip_prefix("==> ") else {
+            continue;
+        };
+        if let Some(rest) = header.strip_prefix("Upgrading ") {
+            if let Some(name) = rest
+                .split_whitespace()
+                .next()
+                .filter(|n| wanted.contains(n))
+            {
+                current = Some(name.to_string());
+            }
+        }
+        if let Some((_, last, start)) = steps.last_mut() {
+            last.ms = at.saturating_sub(*start);
+        }
+        let step = Step {
+            label: step_label(header),
+            ms: 0,
+            shared: current.is_none(),
+        };
+        steps.push((current.clone(), step, *at));
+    }
+    if let Some((_, last, start)) = steps.last_mut() {
+        last.ms = total_ms.saturating_sub(*start);
+    }
+    let shared: Vec<Step> = steps
+        .iter()
+        .filter(|(owner, ..)| owner.is_none())
+        .map(|(_, s, _)| s.clone())
+        .collect();
+    let shared_ms: u64 = shared.iter().map(|s| s.ms).sum();
+    let mut out: HashMap<String, (Vec<Step>, u64)> = HashMap::new();
+    for (owner, step, _) in steps {
+        if let Some(name) = owner {
+            let entry = out
+                .entry(name)
+                .or_insert_with(|| (shared.clone(), shared_ms));
+            entry.1 += step.ms;
+            entry.0.push(step);
+        }
+    }
+    out
 }
 
 // Names of everything (formulae + casks) in `brew outdated --json=v2 --greedy` output.
@@ -2271,6 +2856,70 @@ fn select_verify_results(
 // caller-provided baseline store (which is mutated in place to record the new Team IDs). The
 // caller is responsible for holding signing_store_lock across load → here → save so two verify
 // runs can't race the signing.json file.
+// --- Who should have signed an app ---
+//
+// Signer drift is judged against a baseline, normally the first Team ID Freshet saw for the app
+// ("trust on first use"). That misses an app that was already compromised before Freshet was
+// installed. For widely used, often-targeted apps, Freshet instead knows the publisher up front:
+// these pins apply from the very first sighting. Each was confirmed two independent ways — the
+// app's real signature and the publisher's known identity — and only apps verified that way are
+// listed. An explicit "Trust new publisher" from the user still overrides a pin (a real change of
+// ownership), recorded under an `explicit:` key.
+const PINNED_PUBLISHERS: &[(&str, &str, &str)] = &[
+    (
+        "com.tinyspeck.slackmacgap",
+        "BQR82RBBHL",
+        "Slack Technologies",
+    ),
+    ("com.hnc.Discord", "53Q6R32WPB", "Discord"),
+    ("com.google.Chrome", "EQHXZ8M8AV", "Google"),
+    ("com.microsoft.VSCode", "UBF8T346G9", "Microsoft"),
+    ("com.microsoft.Excel", "UBF8T346G9", "Microsoft"),
+    ("com.microsoft.Word", "UBF8T346G9", "Microsoft"),
+    ("com.microsoft.Powerpoint", "UBF8T346G9", "Microsoft"),
+    ("us.zoom.xos", "BJ4HAAB9B3", "Zoom"),
+    ("com.spotify.client", "2FNC3A47ZF", "Spotify"),
+    ("com.figma.Desktop", "T8RA8NE3B7", "Figma"),
+    ("com.docker.docker", "9BNSXJN65R", "Docker"),
+    ("com.postmanlabs.mac", "H7H8Q7M5CK", "Postman"),
+    ("WhatsApp", "57T9237FN3", "WhatsApp"),
+    ("com.anthropic.claudefordesktop", "Q6L2SF6YDW", "Anthropic"),
+    ("com.github.GitHubClient", "VEKTX9H2N7", "GitHub"),
+    ("com.obsproject.obs-studio", "2MMRE5MTB8", "OBS Project"),
+    ("ch.protonmail.desktop", "6UN54H93QT", "Proton"),
+];
+
+const EXPLICIT_PREFIX: &str = "explicit:";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Basis {
+    // The user pressed "Trust new publisher" for this team.
+    UserTrusted,
+    // Freshet's pinned publisher for this app.
+    Pinned(&'static str),
+    // The first Team ID Freshet saw.
+    FirstSeen,
+}
+
+// The Team ID an app is expected to be signed by, and why. Explicit user trust beats a pin; a
+// pin beats whatever was first seen. Pure → unit-tested.
+fn expected_signer(
+    key: &str,
+    legacy_name: &str,
+    store: &HashMap<String, String>,
+) -> Option<(String, Basis)> {
+    if let Some(team) = store.get(&format!("{EXPLICIT_PREFIX}{key}")) {
+        return Some((team.clone(), Basis::UserTrusted));
+    }
+    if let Some((_, team, publisher)) = PINNED_PUBLISHERS.iter().find(|(id, ..)| *id == key) {
+        return Some(((*team).to_string(), Basis::Pinned(publisher)));
+    }
+    store
+        .get(key)
+        .or_else(|| store.get(legacy_name))
+        .map(|team| (team.clone(), Basis::FirstSeen))
+}
+
 fn build_verify_entries(
     sigs: &[AppSig],
     store: &mut HashMap<String, String>,
@@ -2280,7 +2929,12 @@ fn build_verify_entries(
         // Keyed by bundle id (survives renames, no collisions between same-named apps). Older
         // stores were keyed by app name; those entries are read as a fallback and migrated.
         let key = sig.bundle_id.clone().unwrap_or_else(|| sig.name.clone());
-        let prev = store.get(&key).or_else(|| store.get(&sig.name)).cloned();
+        let expected = expected_signer(&key, &sig.name, store);
+        let prev = expected.as_ref().map(|(team, _)| team.clone());
+        let pinned_publisher = match &expected {
+            Some((_, Basis::Pinned(publisher))) => Some(*publisher),
+            _ => None,
+        };
         let changed = cert_changed(prev.as_deref(), sig.team_id.as_deref());
         // The baseline only moves when nothing changed. On drift it stays put, so the warning
         // repeats on every check until the user explicitly trusts the new publisher
@@ -2298,7 +2952,15 @@ fn build_verify_entries(
         let ok = sig.signed && !changed;
 
         let mut out = String::new();
-        if changed {
+        if let (true, Some(publisher)) = (changed, pinned_publisher) {
+            let was = prev.clone().unwrap_or_default();
+            let now = sig.team_id.clone().unwrap_or_default();
+            let _ = writeln!(
+                out,
+                "⚠ Not signed by {publisher}: this copy is signed by Team {now}, but {} is published by {publisher} (Team {was}). Don't open it until you know why.",
+                sig.name
+            );
+        } else if changed {
             let was = prev.clone().unwrap_or_default();
             let now = sig.team_id.clone().unwrap_or_default();
             let _ = writeln!(
@@ -2337,6 +2999,7 @@ fn build_verify_entries(
                 action,
                 elapsed_ms: None,
                 skipped: false,
+                steps: Vec::new(),
             },
             changed,
         ));
@@ -2345,11 +3008,12 @@ fn build_verify_entries(
 }
 
 // The trusted Team ID for a bundle id, if one has been recorded.
+// The Team ID an app should be signed by: explicit trust, else a pin, else first seen.
 fn trusted_team(bundle_id: &str) -> Option<String> {
     let _guard = signing_store_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    load_signing_store().get(bundle_id).cloned()
+    expected_signer(bundle_id, bundle_id, &load_signing_store()).map(|(team, _)| team)
 }
 
 // Shapes we accept from the frontend before writing them into the trust baseline.
@@ -2379,6 +3043,8 @@ fn trust_signer(bundle_id: String, team: String) -> Result<(), String> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut store = load_signing_store();
+    // The explicit entry is what lets a user's decision override a pin.
+    store.insert(format!("{EXPLICIT_PREFIX}{bundle_id}"), team.clone());
     store.insert(bundle_id, team);
     save_signing_store(&store);
     Ok(())
@@ -2583,10 +3249,46 @@ async fn verify_signatures(app: tauri::AppHandle, only_changed: Option<bool>) ->
 // non-cask updates (formulae, mas, npm have no `.app` bundle to inspect), unknown tokens,
 // and tokens whose `.app` isn't actually installed in /Applications.
 #[tauri::command]
-async fn verify_updated_casks(tokens: Vec<String>) -> Vec<UpdateResult> {
-    tauri::async_runtime::spawn_blocking(move || verify_updated_casks_blocking(&tokens))
-        .await
-        .unwrap_or_default()
+// `apps`: App Store apps just updated, by bundle name ("Notability.app"). They're signed by the
+// developer's Team ID like any other app, so the same publisher-change check applies.
+async fn verify_updated_casks(tokens: Vec<String>, apps: Option<Vec<String>>) -> Vec<UpdateResult> {
+    tauri::async_runtime::spawn_blocking(move || {
+        verify_updated_apps_blocking(&tokens, &apps.unwrap_or_default())
+    })
+    .await
+    .unwrap_or_default()
+}
+
+// App bundle names → their paths in /Applications, skipping anything that isn't a plain
+// "Name.app" or isn't installed. Pure apart from the existence check → unit-tested.
+fn app_store_bundles(apps_dir: &Path, names: &[String]) -> Vec<PathBuf> {
+    names
+        .iter()
+        .filter(|n| is_valid_app_name(n))
+        .map(|n| apps_dir.join(n))
+        .filter(|p| p.is_dir())
+        .collect()
+}
+
+fn verify_updated_apps_blocking(tokens: &[String], app_store_apps: &[String]) -> Vec<UpdateResult> {
+    let mut results = verify_updated_casks_blocking(tokens);
+    let paths = app_store_bundles(Path::new("/Applications"), app_store_apps);
+    if paths.is_empty() {
+        return results;
+    }
+    let sigs: Vec<AppSig> = paths.iter().map(|p| inspect_app(p, None)).collect();
+    let entries = {
+        let _guard = signing_store_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut store = load_signing_store();
+        let entries = build_verify_entries(&sigs, &mut store);
+        save_signing_store(&store);
+        entries
+    };
+    results.extend(select_verify_results(entries, true));
+    results.sort_by_key(|r| r.success);
+    results
 }
 
 fn verify_updated_casks_blocking(tokens: &[String]) -> Vec<UpdateResult> {
@@ -2644,6 +3346,7 @@ fn history_path() -> Option<PathBuf> {
 
 fn outcome_of(r: &UpdateResult) -> &'static str {
     match &r.action {
+        _ if !r.success && provenance_failed(&r.output) => "blocked",
         Some(ResultAction::TrustSigner { .. }) => "blocked",
         Some(ResultAction::QuitAndUpdate { .. }) => "skipped_open",
         _ if r.success => "updated",
@@ -2719,12 +3422,7 @@ fn append_history(entries: &[HistoryEntry]) {
 // rows that line up with the selections.
 fn record_manual_history(selections: &[UpdateSelection], results: &[UpdateResult]) {
     let offset = results.len().saturating_sub(selections.len());
-    // The versions the user saw when they pressed Update — even if a scheduled run has run since.
-    let versions = cached_check_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|t| serde_json::from_str::<CachedCheck>(&t).ok())
-        .map(|c| versions_of(&c.categories))
-        .unwrap_or_default();
+    let versions = versions_last_shown();
     append_history(&history_entries(
         selections,
         &results[offset..],
@@ -2732,6 +3430,16 @@ fn record_manual_history(selections: &[UpdateSelection], results: &[UpdateResult
         "manual",
         unix_now(),
     ));
+}
+
+// The versions the user saw when they pressed Update — from the last check, even if a scheduled
+// run has run since (so not get_cached_check, which drops a stale list).
+fn versions_last_shown() -> Versions {
+    cached_check_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| serde_json::from_str::<CachedCheck>(&t).ok())
+        .map(|c| versions_of(&c.categories))
+        .unwrap_or_default()
 }
 
 // Newest first.
@@ -2878,6 +3586,9 @@ struct Settings {
     check_vulnerabilities: bool,
     // ignore_key()s of skipped versions.
     skipped: Vec<String>,
+    // "name@version" npm packages the user allowed to run install scripts (see npm.rs). Managed
+    // by approve_npm_scripts only; save_settings carries it over unchanged.
+    npm_scripts_approved: Vec<String>,
 }
 
 // Must match `ignoreKey` in src/logic.ts. Keyed by version, so a newer release is not skipped.
@@ -2902,6 +3613,23 @@ fn write_private_atomic(path: &Path, contents: &str) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
+// The user allows `name@version` to run its install scripts (from the results panel).
+#[allow(clippy::needless_pass_by_value)] // Tauri hands command arguments over by value.
+#[tauri::command]
+fn approve_npm_scripts(name: String, version: String) -> Result<(), String> {
+    if !is_valid_npm_package(&name) || !npm::is_valid_version(&version) {
+        return Err("invalid package or version".into());
+    }
+    let spec = format!("{name}@{version}");
+    let mut settings = load_settings().unwrap_or_default();
+    if !settings.npm_scripts_approved.contains(&spec) {
+        settings.npm_scripts_approved.push(spec);
+    }
+    let path = settings_path().ok_or_else(|| "could not resolve ~/.freshet".to_string())?;
+    let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
+    write_private_atomic(&path, &json).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn get_settings() -> Option<Settings> {
     load_settings()
@@ -2912,6 +3640,13 @@ fn get_settings() -> Option<Settings> {
 #[tauri::command]
 fn save_settings(settings: Settings) -> Result<(), String> {
     let path = settings_path().ok_or_else(|| "could not resolve ~/.freshet".to_string())?;
+    // The frontend doesn't manage npm approvals; never let its save erase them.
+    let settings = Settings {
+        npm_scripts_approved: load_settings()
+            .map(|s| s.npm_scripts_approved)
+            .unwrap_or_default(),
+        ..settings
+    };
     let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
     write_private_atomic(&path, &json).map_err(|e| e.to_string())
 }
@@ -2965,6 +3700,8 @@ struct ScheduledRunSummary {
     failed: Vec<String>,
     // Casks whose code-signing Team ID changed with this update.
     signer_changed: Vec<String>,
+    // Formula bottles Homebrew refused because their build provenance didn't verify.
+    blocked: Vec<String>,
 }
 
 // Sort install results into the summary's buckets. Pure → unit-tested.
@@ -2972,6 +3709,8 @@ fn summarize_results(summary: &mut ScheduledRunSummary, results: &[UpdateResult]
     for r in results {
         if matches!(r.action, Some(ResultAction::TrustSigner { .. })) {
             summary.signer_changed.push(r.name.clone());
+        } else if !r.success && provenance_failed(&r.output) {
+            summary.blocked.push(r.name.clone());
         } else if r.success {
             summary.updated.push(r.name.clone());
         } else if needs_admin(&r.output) {
@@ -3001,6 +3740,12 @@ fn summary_message(s: &ScheduledRunSummary) -> String {
     let mut parts = Vec::new();
     if !s.signer_changed.is_empty() {
         parts.push(format!("Signer changed: {}.", s.signer_changed.join(", ")));
+    }
+    if !s.blocked.is_empty() {
+        parts.push(format!(
+            "Blocked (failed build verification): {}.",
+            s.blocked.join(", ")
+        ));
     }
     if !s.updated.is_empty() {
         parts.push(format!(
@@ -3193,7 +3938,9 @@ fn run_scheduled_inner(dir: &Path) -> i32 {
                 summary.failed.push(update.name);
             }
         }
-        None => log.line(">>> brew update: skipped, ran within the last hour"),
+        None => log.line(
+            ">>> brew update: skipped (ran within the last hour, or another brew update was running)",
+        ),
     }
 
     let categories: [CategoryStatus; 2] = check_homebrew().into();
@@ -3253,6 +4000,7 @@ fn run_scheduled_inner(dir: &Path) -> i32 {
             action: None,
             elapsed_ms: None,
             skipped: false,
+            steps: Vec::new(),
         };
         log.result(&cleanup);
         if !cleanup.success {
@@ -3318,7 +4066,8 @@ fn run_scheduled_inner(dir: &Path) -> i32 {
     i32::from(
         !summary.failed.is_empty()
             || !summary.needs_admin.is_empty()
-            || !summary.signer_changed.is_empty(),
+            || !summary.signer_changed.is_empty()
+            || !summary.blocked.is_empty(),
     )
 }
 
@@ -3334,10 +4083,7 @@ const fn valid_schedule_time(hour: u32, minute: u32) -> bool {
 }
 
 fn find_brew() -> Option<PathBuf> {
-    ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"]
-        .iter()
-        .map(PathBuf::from)
-        .find(|p| p.is_file())
+    trusted_brew()
 }
 
 // macOS runs a quarantined app opened from Downloads from a randomized read-only mount that
@@ -3573,6 +4319,13 @@ fn get_schedule() -> ScheduleStatus {
     )
 }
 
+// Earlier versions kept a persistent ~/.freshet/askpass.sh; it's now created per use.
+fn remove_legacy_askpass() {
+    if let Some(dir) = freshet_dir() {
+        let _ = std::fs::remove_file(dir.join("askpass.sh"));
+    }
+}
+
 fn main() {
     // Timings for every check/update phase: `RUST_LOG=freshet=info pnpm tauri dev`.
     tracing_subscriber::fmt()
@@ -3583,6 +4336,7 @@ fn main() {
         .with_writer(std::io::stderr)
         .init();
     augment_path();
+    remove_legacy_askpass();
     if std::env::args().any(|a| a == RUN_SCHEDULED_FLAG) {
         std::process::exit(run_scheduled());
     }
@@ -3598,10 +4352,12 @@ fn main() {
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&quit])?;
 
-            let icon = app
-                .default_window_icon()
-                .ok_or("no default window icon")?
-                .clone();
+            // The menu bar gets its own single-colour drop (icons/source/menubar-icon.svg), drawn
+            // as a template: black on transparent, which macOS tints to match a light or dark
+            // menu bar. 36px = 18pt at 2x. Reusing the full-colour app icon here would show up as
+            // a solid rounded square.
+            let icon =
+                tauri::image::Image::from_bytes(include_bytes!("../icons/tray-template.png"))?;
             let _tray = TrayIconBuilder::with_id("main-tray")
                 .icon(icon)
                 .icon_as_template(true)
@@ -3647,7 +4403,7 @@ fn main() {
             suggest_adoptions,
             cask_info,
             open_url,
-            set_badge,
+            set_tray_state,
             adopt_cask,
             adopt_casks,
             run_selected_updates,
@@ -3666,8 +4422,11 @@ fn main() {
             rollback::restore_snapshot,
             vulns::check_vulnerabilities,
             stop_updates,
+            cancel_adoption,
             get_history,
             get_scheduled_state,
+            homebrew_provenance_active,
+            approve_npm_scripts,
             quit_and_update,
             check_app_update,
             install_app_update,
@@ -3691,6 +4450,8 @@ fn main() {
 #[allow(clippy::unwrap_used, clippy::needless_raw_string_hashes)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
 
     // npm: packages whose installed version is >= the registry's "latest" must be filtered out
     // (corepack/pnpm here are ahead of latest); genuinely-behind packages are kept.
@@ -3824,6 +4585,7 @@ mod tests {
             action: None,
             elapsed_ms: None,
             skipped: false,
+            steps: Vec::new(),
         };
         let unsigned_unchanged = UpdateResult {
             kind: "verify".into(),
@@ -3833,6 +4595,7 @@ mod tests {
             action: None,
             elapsed_ms: None,
             skipped: false,
+            steps: Vec::new(),
         };
         let drifted = UpdateResult {
             kind: "verify".into(),
@@ -3842,6 +4605,7 @@ mod tests {
             action: None,
             elapsed_ms: None,
             skipped: false,
+            steps: Vec::new(),
         };
         let entries = vec![
             (stable_ok.clone(), false),
@@ -4140,6 +4904,7 @@ mod tests {
             action: None,
             elapsed_ms: None,
             skipped: false,
+            steps: Vec::new(),
         }
     }
 
@@ -4374,6 +5139,53 @@ mod tests {
     fn badge_shows_count_or_nothing() {
         assert_eq!(badge_title(0), None);
         assert_eq!(badge_title(3).as_deref(), Some("3"));
+    }
+
+    #[test]
+    fn tray_shows_running_then_attention_then_count() {
+        let base = TrayState {
+            count: 4,
+            attention: false,
+            running: false,
+            done: 0,
+            total: 0,
+        };
+        assert_eq!(tray_look(&base), (TrayLook::Normal, Some("4".into())));
+        let idle = TrayState { count: 0, ..base };
+        assert_eq!(tray_look(&idle), (TrayLook::Normal, None));
+        let flagged = TrayState {
+            attention: true,
+            ..base
+        };
+        assert_eq!(tray_look(&flagged), (TrayLook::Attention, Some("4".into())));
+        let running = TrayState {
+            running: true,
+            attention: true,
+            done: 3,
+            total: 12,
+            ..base
+        };
+        assert_eq!(
+            tray_look(&running),
+            (TrayLook::Running, Some("3/12".into())),
+            "running wins over attention"
+        );
+        let scheduled = TrayState {
+            running: true,
+            ..base
+        };
+        assert_eq!(
+            tray_look(&scheduled),
+            (TrayLook::Running, None),
+            "a scheduled run has no count to show"
+        );
+        let overshoot = TrayState {
+            running: true,
+            done: 13,
+            total: 12,
+            ..base
+        };
+        assert_eq!(tray_look(&overshoot).1.as_deref(), Some("12/12"));
     }
 
     #[test]
@@ -4930,8 +5742,16 @@ mod tests {
 
         let (_, changed) = &build_verify_entries(&[sig("EVILEVIL99")], &mut store)[0];
         assert!(changed);
-        // What trust_signer does:
+        // Overwriting the baseline (what tampering with signing.json would do) doesn't beat
+        // Slack's pin...
         store.insert("com.tinyspeck.slackmacgap".into(), "EVILEVIL99".into());
+        let (_, changed) = &build_verify_entries(&[sig("EVILEVIL99")], &mut store)[0];
+        assert!(changed, "a rewritten baseline can't vouch for a pinned app");
+        // ...only an explicit trust decision does (what trust_signer records).
+        store.insert(
+            format!("{EXPLICIT_PREFIX}com.tinyspeck.slackmacgap"),
+            "EVILEVIL99".into(),
+        );
         let (_, changed) = &build_verify_entries(&[sig("EVILEVIL99")], &mut store)[0];
         assert!(!changed, "trusted publisher is quiet");
     }
@@ -4981,6 +5801,148 @@ mod tests {
         );
     }
 
+    // ---------- one `brew update` at a time ----------
+
+    // Homebrew's exact output when another `brew update` holds its lock (seen in `tauri dev`).
+    const BREW_LOCKED: &str =
+        "lockf: 200: already locked\nError: Another `brew update` process is \
+                               already running.\nPlease wait for it to finish or terminate it to \
+                               continue.";
+
+    #[test]
+    fn recognises_homebrews_update_lock() {
+        assert!(brew_update_locked(BREW_LOCKED));
+        assert!(!brew_update_locked("Already up-to-date."));
+        assert!(!brew_update_locked(
+            "fatal: unable to access 'https://github.com/Homebrew/brew/'"
+        ));
+    }
+
+    // A fake `brew update`: plays back `outcomes` in order and counts calls and sleeps.
+    fn scripted(outcomes: &[(bool, &str)]) -> (impl FnMut() -> (bool, String), Rc<Cell<usize>>) {
+        let calls = Rc::new(Cell::new(0));
+        let queue: Vec<(bool, String)> = outcomes
+            .iter()
+            .map(|(ok, o)| (*ok, (*o).to_string()))
+            .collect();
+        let counter = Rc::clone(&calls);
+        let run = move || {
+            let i = counter.get();
+            counter.set(i + 1);
+            queue[i.min(queue.len() - 1)].clone()
+        };
+        (run, calls)
+    }
+
+    const SEC: std::time::Duration = std::time::Duration::from_secs(1);
+
+    #[test]
+    fn waits_out_another_brew_update_then_runs() {
+        let (mut run, calls) = scripted(&[
+            (false, BREW_LOCKED),
+            (false, BREW_LOCKED),
+            (true, "Updated 2 taps."),
+        ]);
+        let mut slept = Vec::new();
+        let got = update_waiting_for_lock(&mut run, &mut |d| slept.push(d), 60 * SEC, 2 * SEC);
+        assert_eq!(got, Some((true, "Updated 2 taps.".to_string())));
+        assert_eq!(calls.get(), 3);
+        assert_eq!(slept, [2 * SEC, 2 * SEC]);
+    }
+
+    #[test]
+    fn gives_up_quietly_when_the_lock_outlasts_the_wait() {
+        let (mut run, calls) = scripted(&[(false, BREW_LOCKED)]);
+        let mut slept = std::time::Duration::ZERO;
+        let got = update_waiting_for_lock(&mut run, &mut |d| slept += d, 10 * SEC, 2 * SEC);
+        assert_eq!(got, None, "still locked: not reported as a failure");
+        assert_eq!(slept, 10 * SEC, "waited the full time, no longer");
+        assert_eq!(calls.get(), 6, "the first try plus one every 2s for 10s");
+    }
+
+    #[test]
+    fn real_failures_and_successes_return_at_once() {
+        for outcome in [
+            (false, "fatal: unable to access github.com"),
+            (true, "Already up-to-date."),
+        ] {
+            let (mut run, calls) = scripted(&[outcome]);
+            let mut slept = 0;
+            let got = update_waiting_for_lock(&mut run, &mut |_| slept += 1, 60 * SEC, 2 * SEC);
+            assert_eq!(got, Some((outcome.0, outcome.1.to_string())));
+            assert_eq!((calls.get(), slept), (1, 0), "no retry for {outcome:?}");
+        }
+    }
+
+    fn temp_stamp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("freshet-stamp-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("brew-update.stamp")
+    }
+
+    #[test]
+    fn stale_stamp_runs_and_records_success() {
+        let stamp = temp_stamp("stale");
+        let (mut run, calls) = scripted(&[(true, "Updated 1 tap.")]);
+        let r = brew_update_if_stale_with(Some(stamp.clone()), &mut run, &mut |_| {}).unwrap();
+        assert!(r.success);
+        assert_eq!(calls.get(), 1);
+        let written: u64 = std::fs::read_to_string(&stamp)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(unix_now() - written < 5);
+        // Within the hour: skipped without running brew.
+        let (mut run, calls) = scripted(&[(true, "")]);
+        assert!(brew_update_if_stale_with(Some(stamp.clone()), &mut run, &mut |_| {}).is_none());
+        assert_eq!(calls.get(), 0);
+        let _ = std::fs::remove_dir_all(stamp.parent().unwrap());
+    }
+
+    #[test]
+    fn locked_out_or_failed_leaves_the_stamp_alone() {
+        let stamp = temp_stamp("locked");
+        let (mut run, _) = scripted(&[(false, BREW_LOCKED)]);
+        assert!(
+            brew_update_if_stale_with(Some(stamp.clone()), &mut run, &mut |_| {}).is_none(),
+            "someone else's update is not our failure"
+        );
+        assert!(!stamp.exists(), "but it isn't our success either");
+        let (mut run, _) = scripted(&[(false, "fatal: unable to access github.com")]);
+        let r = brew_update_if_stale_with(Some(stamp.clone()), &mut run, &mut |_| {}).unwrap();
+        assert!(!r.success && r.output.contains("unable to access"));
+        assert!(!stamp.exists());
+        let _ = std::fs::remove_dir_all(stamp.parent().unwrap());
+    }
+
+    // Two callers at once (a check and an update, or React's doubled dev startup): brew runs once,
+    // the second waits for it and skips instead of hitting Homebrew's lock.
+    #[test]
+    fn concurrent_callers_run_brew_update_once() {
+        let stamp = temp_stamp("concurrent");
+        let runs = std::sync::Arc::new(AtomicUsize::new(0));
+        let spawn = || {
+            let (stamp, runs) = (stamp.clone(), std::sync::Arc::clone(&runs));
+            std::thread::spawn(move || {
+                let mut run = || {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    (true, "Updated 1 tap.".to_string())
+                };
+                brew_update_if_stale_with(Some(stamp), &mut run, &mut |_| {})
+            })
+        };
+        // Both started before either is joined, so they really overlap.
+        let callers = [spawn(), spawn()];
+        let results: Vec<_> = callers.into_iter().map(|t| t.join().unwrap()).collect();
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "brew update ran once");
+        assert_eq!(results.iter().filter(|r| r.is_some()).count(), 1);
+        assert!(results.iter().flatten().all(|r| r.success));
+        let _ = std::fs::remove_dir_all(stamp.parent().unwrap());
+    }
+
     // brew's batched output: "==> Upgrading <name>" opens each package's section (Homebrew
     // upgrade.rb / cask/upgrade.rb); failures are "Error: <name>: …", often at the very end.
     #[test]
@@ -4995,6 +5957,97 @@ mod tests {
                 && sections["wget"].ends_with("Error: wget: post-install step failed")
         );
         assert!(!sections.contains_key("absent"));
+    }
+
+    // The `==> ` lines of a real awscli upgrade (2.37.12_2 → 2.38.5, Homebrew 7), with made-up
+    // arrival times: dependencies' steps count toward awscli, and the slow step is visible.
+    fn awscli_timed() -> Vec<(u64, String)> {
+        [
+            (0, "==> Upgrading awscli"),
+            (900, "==> Installing dependencies for awscli: ca-certificates, s2n, aws-c-http, aws-c-mqtt, sqlite and python@3.15"),
+            (1_000, "==> Upgrading awscli dependency: ca-certificates (2026-09-25 -> 2026-10-20)"),
+            (1_500, "==> Pouring ca-certificates--2026-10-20.all.bottle.tar.gz"),
+            (3_000, "==> Installing awscli dependency: python@3.15 (3.15.1)"),
+            (4_000, "==> Pouring python@3.15--3.15.1.arm64_tahoe.bottle.tar.gz"),
+            (45_000, "==> Installing awscli"),
+            (45_500, "==> Pouring awscli--2.38.5.arm64_tahoe.bottle.tar.gz"),
+            (100_000, "==> Cleanup"),
+            (118_000, "==> Caveats"),
+            (118_100, "==> awscli"),
+            (118_200, "==> Upgraded 1 requested outdated package"),
+        ]
+        .into_iter()
+        .map(|(at, l)| (at, l.to_string()))
+        .collect()
+    }
+
+    #[test]
+    fn steps_time_each_brew_stage_including_dependencies() {
+        let timings = brew_steps(&awscli_timed(), 119_000, &["awscli"]);
+        let (steps, ms) = &timings["awscli"];
+        assert_eq!(*ms, 119_000, "a lone package owns all of the batch's time");
+        let find = |label: &str| steps.iter().find(|s| s.label == label).map(|s| s.ms);
+        assert_eq!(find("Pouring python@3.15"), Some(41_000));
+        assert_eq!(find("Pouring awscli"), Some(54_500));
+        assert_eq!(find("Cleanup"), Some(18_000));
+        assert_eq!(
+            find("Upgraded 1 requested outdated package"),
+            Some(800),
+            "the last step runs until brew exits"
+        );
+        assert!(steps.iter().all(|s| !s.shared));
+        assert_eq!(steps.iter().map(|s| s.ms).sum::<u64>(), 119_000);
+    }
+
+    #[test]
+    fn steps_split_a_batch_and_share_its_up_front_downloads() {
+        let timed: Vec<(u64, String)> = [
+            (0, "==> Fetching downloads for: git and wget"),
+            (6_000, "==> Upgrading git"),
+            (6_100, "==> Pouring git--2.56.0.arm64_tahoe.bottle.tar.gz"),
+            (8_000, "==> Upgrading wget"),
+            (8_200, "==> Pouring wget--1.25.1.arm64_tahoe.bottle.tar.gz"),
+        ]
+        .into_iter()
+        .map(|(at, l)| (at, l.to_string()))
+        .collect();
+        let timings = brew_steps(&timed, 9_000, &["git", "wget", "absent"]);
+        let (git, git_ms) = &timings["git"];
+        let (wget, wget_ms) = &timings["wget"];
+        assert_eq!(
+            (*git_ms, *wget_ms),
+            (8_000, 7_000),
+            "own steps + the shared 6s"
+        );
+        assert_eq!(git[0].label, "Fetching downloads for: git and wget");
+        assert!(git[0].shared && wget[0].shared);
+        assert_eq!(git[0].ms, 6_000);
+        assert!(git.iter().all(|s| !s.label.contains("wget") || s.shared));
+        assert_eq!(wget.last().map(|s| s.ms), Some(800));
+        assert!(!timings.contains_key("absent"));
+    }
+
+    #[test]
+    fn steps_need_brew_headers() {
+        assert!(brew_steps(&[], 5_000, &["git"]).is_empty());
+        let only_shared = vec![(0, "==> Fetching downloads for: git".to_string())];
+        assert!(
+            brew_steps(&only_shared, 5_000, &["git"]).is_empty(),
+            "no section of its own → fall back to the batch time"
+        );
+    }
+
+    #[test]
+    fn step_labels_shorten_bottle_names() {
+        assert_eq!(
+            step_label("Pouring python@3.15--3.15.1.arm64_tahoe.bottle.tar.gz"),
+            "Pouring python@3.15"
+        );
+        assert_eq!(
+            step_label("Pouring ca-certificates--2026-10-20.all.bottle.tar.gz"),
+            "Pouring ca-certificates"
+        );
+        assert_eq!(step_label("Installing Cask zoom"), "Installing Cask zoom");
     }
 
     #[test]
@@ -5020,6 +6073,113 @@ mod tests {
     // Tests that spawn through run_update_cmd_streaming share the global RUNNING_CHILD slot.
     static CHILD_SLOT: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    // A whole batch through a stand-in brew that prints Homebrew's real step lines with pauses
+    // between them: every step reaches the window as a live progress event (with the package it
+    // belongs to), and each item's result carries its own steps and time, the up-front downloads
+    // shared.
+    #[test]
+    fn batch_reports_live_steps_and_per_item_times() {
+        let _slot = CHILD_SLOT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        STOP_REQUESTED.store(false, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("freshet-steps-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let brew = dir.join("brew");
+        std::fs::write(
+            &brew,
+            "#!/bin/sh\n\
+             echo '==> Fetching downloads for: slowapp and quickapp'; sleep 0.3\n\
+             echo '==> Upgrading slowapp'; echo '  1.0 -> 1.1'\n\
+             echo '==> Installing Cask slowapp'; sleep 0.6\n\
+             echo '==> Upgrading quickapp'\n\
+             echo '==> Installing Cask quickapp'; sleep 0.1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&brew, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let selections: Vec<UpdateSelection> = ["slowapp", "quickapp"]
+            .iter()
+            .map(|id| UpdateSelection {
+                kind: "cask".into(),
+                id: (*id).into(),
+                name: (*id).into(),
+            })
+            .collect();
+        let events = std::sync::Mutex::new(Vec::new());
+        let record = |p: UpdateProgress| events.lock().unwrap().push(p);
+        let results = upgrade_batch(
+            brew.to_str().unwrap(),
+            "--cask",
+            &[0, 1],
+            &selections,
+            &record,
+            0,
+            2,
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Live: one event per step, in order, each naming its package and the count so far.
+        let steps: Vec<(Option<String>, Option<String>, usize)> = events
+            .into_inner()
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.step.is_some())
+            .map(|e| (e.step, e.current, e.done))
+            .collect();
+        let s = |x: &str| Some(x.to_string());
+        assert_eq!(
+            steps,
+            [
+                (s("Fetching downloads for: slowapp and quickapp"), None, 0),
+                (s("Upgrading slowapp"), s("slowapp"), 0),
+                (s("Installing Cask slowapp"), s("slowapp"), 0),
+                (s("Upgrading quickapp"), s("quickapp"), 1),
+                (s("Installing Cask quickapp"), s("quickapp"), 1),
+            ]
+        );
+
+        // Results: own steps after the shared download step, and times that follow the sleeps.
+        let (slow, quick) = (&results[0], &results[1]);
+        assert!(slow.success && quick.success);
+        let labels = |r: &UpdateResult| r.steps.iter().map(|x| x.label.clone()).collect::<Vec<_>>();
+        assert_eq!(
+            labels(slow),
+            [
+                "Fetching downloads for: slowapp and quickapp",
+                "Upgrading slowapp",
+                "Installing Cask slowapp"
+            ]
+        );
+        assert_eq!(
+            labels(quick),
+            [
+                "Fetching downloads for: slowapp and quickapp",
+                "Upgrading quickapp",
+                "Installing Cask quickapp"
+            ]
+        );
+        assert!(slow.steps[0].shared && quick.steps[0].shared);
+        assert!(slow.steps[1..].iter().all(|x| !x.shared));
+        let install = slow.steps[2].ms;
+        assert!(
+            (500..2_000).contains(&install),
+            "slowapp's install slept 0.6s, measured {install}ms"
+        );
+        let (slow_ms, quick_ms) = (slow.elapsed_ms.unwrap(), quick.elapsed_ms.unwrap());
+        assert!(
+            slow_ms >= 800 && quick_ms >= 300 && slow_ms > quick_ms + 300,
+            "each item's own time, plus the shared 0.3s: slow {slow_ms}ms, quick {quick_ms}ms"
+        );
+        for r in &results {
+            assert_eq!(
+                r.elapsed_ms,
+                Some(r.steps.iter().map(|x| x.ms).sum()),
+                "an item's time is the sum of its steps"
+            );
+        }
+    }
+
     // Lines arrive one at a time while the process runs, stdout and stderr interleaved in order.
     #[test]
     fn streaming_runner_delivers_lines_in_order() {
@@ -5033,6 +6193,7 @@ mod tests {
                 "-c",
                 "echo '==> Upgrading a'; echo oops >&2; echo '==> Upgrading b'; exit 3",
             ],
+            &[],
             &mut |l| lines.push(l.to_string()),
         );
         assert!(!ok);
@@ -5109,7 +6270,7 @@ mod tests {
                       echo '==> Upgrading c'";
         let started = std::time::Instant::now();
         let mut lines = Vec::new();
-        let (ok, _) = run_update_cmd_streaming("/bin/bash", &["-c", script], &mut |l| {
+        let (ok, _) = run_update_cmd_streaming("/bin/bash", &["-c", script], &[], &mut |l| {
             lines.push(l.to_string());
             if l == "==> Upgrading b" {
                 interrupt_running_child();
@@ -5197,6 +6358,386 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    // Homebrew's record vs. what the app says about itself.
+    #[test]
+    fn cask_and_bundle_versions_agree() {
+        assert!(versions_agree("4.52.178", "4.52.178"));
+        assert!(
+            versions_agree("2025.2.1,252.25557.131", "2025.2.1"),
+            "cask build suffix"
+        );
+        assert!(versions_agree("26.0", "26"), "app reports fewer components");
+        assert!(
+            versions_agree("1.2", "1.2.0.4"),
+            "app reports more components"
+        );
+        // The case that misled the list: rolled back to 0.0.414, Homebrew still says 0.0.415.
+        assert!(!versions_agree("0.0.415", "0.0.414"));
+        assert!(!versions_agree("4.52.178", "4.51.185"));
+        assert!(!versions_agree("1.2", "1.20"), "not a dotted prefix");
+    }
+
+    // Reads a real Info.plist the way macOS stores it.
+    #[test]
+    fn bundle_version_reads_info_plist() {
+        let app = std::env::temp_dir().join(format!("freshet-bv-{}/Demo.app", std::process::id()));
+        std::fs::create_dir_all(app.join("Contents")).unwrap();
+        std::fs::write(
+            app.join("Contents/Info.plist"),
+            r#"<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>CFBundleShortVersionString</key><string>0.0.414</string><key>CFBundleVersion</key><string>414</string></dict></plist>"#,
+        )
+        .unwrap();
+        assert_eq!(bundle_version(&app).as_deref(), Some("0.0.414"));
+        assert_eq!(bundle_version(Path::new("/nonexistent/X.app")), None);
+        std::fs::remove_dir_all(app.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn adopt_phases_from_brew_output() {
+        assert_eq!(
+            adopt_phase("==> Downloading https://web.whatsapp.com/desktop/..."),
+            Some("Downloading")
+        );
+        assert_eq!(
+            adopt_phase("==> Fetching downloads for: whatsapp"),
+            Some("Downloading")
+        );
+        assert_eq!(
+            adopt_phase("==> Adopting existing App at '/Applications/WhatsApp.app'"),
+            Some("Adopting")
+        );
+        assert_eq!(
+            adopt_phase("==> Installing Cask whatsapp"),
+            Some("Adopting")
+        );
+        assert_eq!(
+            adopt_phase("🍺  whatsapp was successfully installed!"),
+            None
+        );
+    }
+
+    #[test]
+    fn stall_detection() {
+        assert!(
+            !download_stalled(0, 600),
+            "nothing downloaded yet: still connecting, not stalled"
+        );
+        assert!(!download_stalled(155_000_000, 59));
+        assert!(download_stalled(155_000_000, 60));
+    }
+
+    // The newest partial download that started during this adoption is the one measured; older
+    // leftovers in the cache are ignored.
+    #[test]
+    fn download_size_comes_from_this_adoptions_partial_file() {
+        let dir = std::env::temp_dir().join(format!("freshet-dl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("old--Other-1.0.zip.incomplete"), vec![0; 4096]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let since = std::time::SystemTime::now();
+        assert_eq!(
+            current_download_bytes(&dir, since),
+            0,
+            "old partial file is ignored"
+        );
+        std::fs::write(dir.join("abc--WhatsApp-2.26.zip.incomplete"), vec![0; 2048]).unwrap();
+        std::fs::write(dir.join("done--Thing.zip"), vec![0; 9999]).unwrap();
+        assert_eq!(
+            current_download_bytes(&dir, since - std::time::Duration::from_millis(500)),
+            2048
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // Real /Applications and ~/.freshet: what the list and Settings now show for rolled-back apps.
+    //   cargo test -- --ignored rollback_state_live --nocapture
+    #[test]
+    #[ignore = "reads the real /Applications, Homebrew and ~/.freshet/rollback"]
+    fn rollback_state_live() {
+        let recorded = check_homebrew().1;
+        for item in &recorded.items {
+            let apps = cask_apps(std::slice::from_ref(&item.id));
+            let names = apps.get(&item.id).cloned().unwrap_or_default();
+            let on_disk = installed_cask_apps(&names)
+                .first()
+                .and_then(|a| bundle_version(a));
+            eprintln!(
+                "{:10} Homebrew record {:10} on disk {:10} latest {:10} → list shows from {}",
+                item.id,
+                item.current,
+                on_disk.clone().unwrap_or_default(),
+                item.latest,
+                on_disk
+                    .filter(|v| !versions_agree(&item.current, v))
+                    .unwrap_or_else(|| item.current.clone())
+            );
+        }
+        for snap in rollback::list_snapshots() {
+            eprintln!(
+                "snapshot {:8} version {:10} in_use {}",
+                snap.token, snap.version, snap.in_use
+            );
+        }
+    }
+
+    // ---------- #5 same-user tampering ----------
+
+    #[test]
+    fn executable_ownership_rules() {
+        let me = 501;
+        assert!(owned_safely(me, 0o100_755, me));
+        assert!(owned_safely(0, 0o100_755, me), "root-owned is fine");
+        assert!(!owned_safely(502, 0o100_755, me), "another user's brew");
+        assert!(!owned_safely(me, 0o100_775, me), "group-writable");
+        assert!(!owned_safely(me, 0o100_757, me), "world-writable");
+    }
+
+    #[test]
+    fn freshet_dir_must_be_the_users_own_real_directory() {
+        assert!(dir_is_safe(false, 501, 501));
+        assert!(
+            !dir_is_safe(true, 501, 501),
+            "a symlink could point anywhere"
+        );
+        assert!(!dir_is_safe(false, 0, 501), "owned by someone else");
+    }
+
+    // The password helper is created per use: owner-only, exactly Freshet's script, a new file each
+    // time, and gone as soon as the command that used it is done.
+    #[test]
+    fn askpass_is_fresh_private_and_removed_after_use() {
+        let dir = std::env::temp_dir().join(format!("freshet-askpass-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = fresh_askpass_in(&dir).unwrap();
+        let b = fresh_askpass_in(&dir).unwrap();
+        assert_ne!(a.0, b.0, "a new file for every use");
+        let meta = std::fs::metadata(&a.0).unwrap();
+        assert_eq!(meta.mode() & 0o777, 0o700);
+        assert_eq!(std::fs::read_to_string(&a.0).unwrap(), ASKPASS_SCRIPT);
+        let path = a.0.clone();
+        drop(a);
+        assert!(!path.exists(), "deleted when the command is done");
+        drop(b);
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            0,
+            "nothing left behind"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn update_commands_get_a_live_askpass_that_disappears_afterwards() {
+        let (cmd, guard) = update_command("/usr/bin/true", &[]);
+        let askpass = cmd
+            .get_envs()
+            .find(|(k, _)| *k == "SUDO_ASKPASS")
+            .and_then(|(_, v)| v)
+            .map(PathBuf::from)
+            .expect("SUDO_ASKPASS set");
+        assert!(askpass.is_file());
+        assert!(askpass.starts_with(freshet_dir().unwrap()));
+        drop(guard);
+        assert!(!askpass.exists());
+    }
+
+    // brew never comes from PATH: a fixed Homebrew location (or, in debug builds only, the
+    // FRESHET_BREW test override). Other programs pass through.
+    #[test]
+    fn brew_is_resolved_to_a_fixed_location() {
+        assert_eq!(resolve_program("npm"), "npm");
+        assert_eq!(resolve_program("/usr/bin/true"), "/usr/bin/true");
+        if std::env::var_os("FRESHET_BREW").is_none() {
+            let brew = resolve_program("brew");
+            if let Some(trusted) = trusted_brew() {
+                assert_eq!(brew, trusted.to_string_lossy());
+                assert!(BREW_LOCATIONS.contains(&brew.as_str()));
+            }
+        }
+    }
+
+    // ---------- #4 pinned publishers ----------
+
+    #[test]
+    fn pins_are_well_formed_and_unique() {
+        let mut ids = std::collections::HashSet::new();
+        for (id, team, publisher) in PINNED_PUBLISHERS {
+            assert!(is_valid_team_id(team), "{id}: {team}");
+            assert!(is_valid_bundle_id(id), "{id}");
+            assert_ne!(*publisher, "");
+            assert!(ids.insert(*id), "duplicate pin for {id}");
+        }
+    }
+
+    #[test]
+    fn expected_signer_precedence() {
+        let slack = "com.tinyspeck.slackmacgap";
+        let mut store: HashMap<String, String> = HashMap::new();
+        // Pinned, never seen: the pin applies from the start.
+        assert_eq!(
+            expected_signer(slack, "Slack", &store),
+            Some(("BQR82RBBHL".into(), Basis::Pinned("Slack Technologies")))
+        );
+        // A first-seen baseline doesn't override the pin...
+        store.insert(slack.into(), "EVILEVIL99".into());
+        assert_eq!(
+            expected_signer(slack, "Slack", &store).unwrap().0,
+            "BQR82RBBHL"
+        );
+        // ...but the user's explicit trust does.
+        store.insert(format!("{EXPLICIT_PREFIX}{slack}"), "NEWOWNER11".into());
+        assert_eq!(
+            expected_signer(slack, "Slack", &store),
+            Some(("NEWOWNER11".into(), Basis::UserTrusted))
+        );
+        // Unpinned apps keep trust-on-first-use, including legacy name keys.
+        let other: HashMap<String, String> = HashMap::from([("Anki".into(), "7ZM8SLJM4P".into())]);
+        assert_eq!(
+            expected_signer("net.ankiweb.dtop", "Anki", &other),
+            Some(("7ZM8SLJM4P".into(), Basis::FirstSeen))
+        );
+        assert_eq!(expected_signer("com.unknown.app", "Unknown", &other), None);
+    }
+
+    fn slack_sig(team: &str) -> AppSig {
+        AppSig {
+            name: "Slack".into(),
+            bundle_id: Some("com.tinyspeck.slackmacgap".into()),
+            team_id: Some(team.into()),
+            authority: None,
+            signed: true,
+            notarized: true,
+        }
+    }
+
+    // The trust-on-first-use gap: a copy that was already wrong when Freshet first saw it is
+    // flagged anyway, because the pin knows who should have signed it.
+    #[test]
+    fn pinned_app_with_wrong_signer_is_flagged_on_first_sight() {
+        let mut store = HashMap::new();
+        let (r, changed) = build_verify_entries(&[slack_sig("EVILEVIL99")], &mut store).remove(0);
+        assert!(changed && !r.success);
+        assert!(
+            r.output.contains("Not signed by Slack Technologies"),
+            "{}",
+            r.output
+        );
+        assert!(r.output.contains("EVILEVIL99") && r.output.contains("BQR82RBBHL"));
+        assert!(
+            !store.values().any(|t| t == "EVILEVIL99"),
+            "the wrong signer never becomes a baseline"
+        );
+
+        let (r, changed) = build_verify_entries(&[slack_sig("BQR82RBBHL")], &mut store).remove(0);
+        assert!(!changed && r.success, "the real publisher passes");
+    }
+
+    #[test]
+    fn explicit_trust_overrides_a_pin() {
+        let mut store = HashMap::from([(
+            format!("{EXPLICIT_PREFIX}com.tinyspeck.slackmacgap"),
+            "NEWOWNER11".to_string(),
+        )]);
+        let (_, changed) = build_verify_entries(&[slack_sig("NEWOWNER11")], &mut store).remove(0);
+        assert!(!changed);
+    }
+
+    // ---------- #3 formula provenance and App Store apps ----------
+
+    #[test]
+    fn provenance_verification_only_with_github_credentials() {
+        assert_eq!(
+            provenance_env(true),
+            [("HOMEBREW_VERIFY_ATTESTATIONS", "1")]
+        );
+        assert!(
+            provenance_env(false).is_empty(),
+            "without credentials Homebrew would refuse every bottle"
+        );
+    }
+
+    // Homebrew's own wording (utils/attestation.rb) for a bottle that fails verification.
+    #[test]
+    fn provenance_failures_count_as_blocked() {
+        let out = "Error: The bottle for xz has an invalid build provenance attestation.\n\nThis may indicate that the bottle was not produced by the expected\ntap, or was maliciously inserted into the expected tap's bottle\nstorage.";
+        assert!(provenance_failed(out));
+        assert!(!provenance_failed("Error: Download failed: 404"));
+        let r = UpdateResult {
+            kind: "brew".into(),
+            name: "xz".into(),
+            success: false,
+            output: out.into(),
+            action: None,
+            elapsed_ms: None,
+            skipped: false,
+            steps: Vec::new(),
+        };
+        assert_eq!(outcome_of(&r), "blocked");
+        let mut summary = ScheduledRunSummary::default();
+        summarize_results(&mut summary, &[r]);
+        assert_eq!(summary.blocked, ["xz"]);
+        assert_eq!(summary.failed, Vec::<String>::new());
+        assert!(summary_message(&summary).contains("Blocked (failed build verification): xz"));
+    }
+
+    #[test]
+    fn app_store_bundles_resolve_only_real_app_names() {
+        let dir = std::env::temp_dir().join(format!("freshet-mas-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("Notability.app")).unwrap();
+        let names = vec![
+            "Notability.app".to_string(),
+            "Missing.app".to_string(),
+            "../etc.app".to_string(),
+            "Notability".to_string(),
+        ];
+        assert_eq!(
+            app_store_bundles(&dir, &names),
+            [dir.join("Notability.app")]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // Real /Applications, read-only: every installed pinned app must match its pin (no false
+    // alarms), and App Store apps resolve and carry a developer Team ID.
+    //   cargo test -- --ignored security_live --nocapture
+    #[test]
+    #[ignore = "reads the real /Applications"]
+    fn security_live_pins_and_app_store() {
+        let mut checked = 0;
+        for app in list_applications() {
+            let signer = read_signer(&app);
+            let Some(id) = signer.bundle_id.as_deref() else {
+                continue;
+            };
+            if let Some((_, team, publisher)) = PINNED_PUBLISHERS.iter().find(|(p, ..)| *p == id) {
+                eprintln!(
+                    "pinned {:32} expects {team} ({publisher}), signed {:?}",
+                    id, signer.team
+                );
+                assert_eq!(signer.team.as_deref(), Some(*team), "{id}");
+                checked += 1;
+            }
+        }
+        eprintln!("{checked} installed pinned apps match their pins");
+        let mas = app_store_bundles(
+            Path::new("/Applications"),
+            &["Notability.app".into(), "Microsoft Excel.app".into()],
+        );
+        for app in &mas {
+            let s = read_signer(app);
+            eprintln!(
+                "App Store {} → {:?} team {:?}",
+                app.display(),
+                s.bundle_id,
+                s.team
+            );
+            assert!(s.team.is_some());
+        }
+    }
+
     #[test]
     fn package_boundaries() {
         assert!(is_package_boundary("==> Upgrading ffmpeg"));
@@ -5254,6 +6795,7 @@ mod tests {
             action: None,
             elapsed_ms: Some(1200),
             skipped: false,
+            steps: Vec::new(),
         };
         let open = skipped_open(&selections[1], Path::new("/Applications/Slack.app"));
         let admin = failed_result(&selections[2], "sudo: a password is required".into());
@@ -5336,6 +6878,7 @@ mod tests {
                 }),
                 elapsed_ms: None,
                 skipped: false,
+                steps: Vec::new(),
             }],
         );
         assert_eq!(summary.signer_changed, ["discord"]);

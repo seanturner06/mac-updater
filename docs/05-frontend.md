@@ -52,7 +52,15 @@ exactly the rows currently visible — skipped versions excluded, self-updating 
 unless the greedy toggle is on, read-only kinds excluded — and runs those as individual
 selections. **The button updates what you can see, and nothing else.** A blanket upgrade would
 be faster and would occasionally update something the user had explicitly hidden, which is the
-single worst thing a tool with admin rights can do.
+single worst thing a tool with admin rights can do. The filter (⌘F) follows the same rule: while it's
+active the button reads "Update N shown" and runs only the rows the filter leaves visible.
+
+**Keyboard cursor.** The row the arrow keys are on is App state (`cursor`, a `data-nav-id` of
+`cat:<section>` or `row:<kind>::<id>`), drawn with a `.kb-cursor` class. It is deliberately not
+browser focus: in the app's WKWebView, whether `:focus-visible` matches after a script moves focus
+varies, so the highlight showed on some rows and not others. Navigating never leaves anything in
+the list focused, and Space acts on the cursor row, so a checkbox the mouse last clicked can't
+also toggle. A click hides the cursor but moves it, so ↓ continues from the clicked row.
 
 **`prunedSelfUpdating`** is called when the greedy toggle is turned *off*. Without it, an item
 you selected while greedy was on stays in the selection map after disappearing from the screen,

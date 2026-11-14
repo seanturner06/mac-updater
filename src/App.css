@@ -34,10 +34,10 @@
      brown-gray #5c4e4e. black→bg, brown-gray→surfaces, silver→text, mauve→accent + dim text.
      Err = gothic crimson (only non-palette color, for failure visibility). Easy swap below.
      (Cobalt Sky ⭐ favorite + Sage/Slate/Pine/Lavender/Obsidian saved in memory, restorable.) */
-  --bg: rgba(4, 3, 3, 0.94);
-  --bg-elev: rgba(94, 80, 80, 0.26);
-  --bg-hover: rgba(94, 80, 80, 0.42);
-  --border: rgba(160, 142, 142, 0.28);
+  --bg: rgba(3, 2, 2, 0.96);
+  --bg-elev: rgba(94, 80, 80, 0.36);
+  --bg-hover: rgba(94, 80, 80, 0.54);
+  --border: rgba(160, 142, 142, 0.38);
   --text: rgba(230, 229, 229, 0.98);
   --text-dim: #a08e8e;
   --text-faint: rgba(160, 142, 142, 0.55);
@@ -54,12 +54,74 @@
      means "failed", so a breaking-change heads-up gets a muted amber instead. */
   --caution: #d6a878;
   --caution-bg: rgba(214, 168, 120, 0.14);
-  --surface: rgba(94, 80, 80, 0.16);
+  --surface: rgba(94, 80, 80, 0.24);
   --shadow: 0 1px 0 rgba(255, 255, 255, 0.03) inset, 0 8px 24px rgba(0, 0, 0, 0.25);
   --radius: 10px;
   --font-display: "Fraunces", Georgia, serif;
   --font-body: "Inter Tight", -apple-system, sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, monospace;
+}
+
+/* ---- Colour themes (Settings › Appearance). Gothic Noir above is the default; each block below
+   redefines the same tokens. Surfaces are tinted with the theme's own hue (not neutral white) so
+   switching changes the whole window, not just the buttons. Cards sit clearly off the background
+   (surface tints ~0.12–0.28, borders ~0.25) so the themes don't read as washed out. Ids must match
+   THEMES in logic.ts. */
+:root[data-theme="cobalt"] {
+  --bg: rgba(3, 5, 16, 0.96);
+  --bg-elev: rgba(0, 71, 171, 0.38); --bg-hover: rgba(0, 71, 171, 0.57); --border: rgba(130, 200, 229, 0.35);
+  --text: rgba(228, 238, 247, 0.96); --text-dim: #93a7bd; --text-faint: rgba(130, 152, 176, 0.75);
+  --accent: #82c8e5; --on-accent: #052338; --warn: #e0b574; --ok: #82c8e5; --err: #e07a7a;
+  --ok-bg: rgba(130, 200, 229, 0.14); --warn-bg: rgba(224, 181, 116, 0.15);
+  --err-bg: rgba(224, 122, 122, 0.14); --err-border: rgba(224, 122, 122, 0.32);
+  --caution: #e0b574; --caution-bg: rgba(224, 181, 116, 0.14); --surface: rgba(0, 71, 171, 0.24);
+}
+:root[data-theme="obsidian"] {
+  --bg: rgba(7, 8, 11, 0.96);
+  --bg-elev: rgba(91, 158, 255, 0.16); --bg-hover: rgba(91, 158, 255, 0.27); --border: rgba(91, 158, 255, 0.32);
+  --text: rgba(228, 233, 242, 0.95); --text-dim: rgba(228, 233, 242, 0.62); --text-faint: rgba(228, 233, 242, 0.4);
+  --accent: #5b9eff; --on-accent: #08111f; --warn: #e0b574; --ok: #5fc28a; --err: #e07a7a;
+  --ok-bg: rgba(95, 194, 138, 0.13); --warn-bg: rgba(224, 181, 116, 0.15);
+  --err-bg: rgba(224, 122, 122, 0.14); --err-border: rgba(224, 122, 122, 0.32);
+  --caution: #e0b574; --caution-bg: rgba(224, 181, 116, 0.14); --surface: rgba(91, 158, 255, 0.11);
+}
+:root[data-theme="sage"] {
+  --bg: rgba(13, 13, 11, 0.96);
+  --bg-elev: rgba(156, 175, 136, 0.18); --bg-hover: rgba(156, 175, 136, 0.28); --border: rgba(156, 175, 136, 0.34);
+  --text: rgba(240, 238, 232, 0.95); --text-dim: rgba(240, 238, 232, 0.62); --text-faint: rgba(240, 238, 232, 0.4);
+  --accent: #9caf88; --on-accent: #1c2116; --warn: #c9a87c; --ok: #93ad77; --err: #c0897c;
+  --ok-bg: rgba(147, 173, 119, 0.14); --warn-bg: rgba(201, 168, 124, 0.16);
+  --err-bg: rgba(192, 137, 124, 0.16); --err-border: rgba(192, 137, 124, 0.34);
+  --caution: #c9a87c; --caution-bg: rgba(201, 168, 124, 0.14); --surface: rgba(156, 175, 136, 0.11);
+}
+:root[data-theme="pine"] {
+  --bg: rgba(9, 11, 11, 0.96);
+  --bg-elev: rgba(108, 174, 157, 0.18); --bg-hover: rgba(108, 174, 157, 0.28); --border: rgba(108, 174, 157, 0.34);
+  --text: rgba(231, 237, 235, 0.95); --text-dim: rgba(231, 237, 235, 0.62); --text-faint: rgba(231, 237, 235, 0.4);
+  --accent: #6cae9d; --on-accent: #0f1a17; --warn: #d6b182; --ok: #82b48f; --err: #d28f8f;
+  --ok-bg: rgba(130, 180, 143, 0.14); --warn-bg: rgba(214, 177, 130, 0.16);
+  --err-bg: rgba(210, 143, 143, 0.16); --err-border: rgba(210, 143, 143, 0.34);
+  --caution: #d6b182; --caution-bg: rgba(214, 177, 130, 0.14); --surface: rgba(108, 174, 157, 0.11);
+}
+/* New: blue-black with brass. Warm accent on a cool ground, like an old instrument panel. */
+:root[data-theme="ink"] {
+  --bg: rgba(5, 7, 10, 0.96);
+  --bg-elev: rgba(194, 168, 106, 0.16); --bg-hover: rgba(194, 168, 106, 0.27); --border: rgba(194, 168, 106, 0.35);
+  --text: rgba(236, 232, 222, 0.96); --text-dim: rgba(214, 205, 184, 0.68); --text-faint: rgba(214, 205, 184, 0.44);
+  --accent: #c2a86a; --on-accent: #1a1508; --warn: #d9b46e; --ok: #8fb98a; --err: #d77f74;
+  --ok-bg: rgba(143, 185, 138, 0.14); --warn-bg: rgba(217, 180, 110, 0.15);
+  --err-bg: rgba(215, 127, 116, 0.15); --err-border: rgba(215, 127, 116, 0.34);
+  --caution: #d9b46e; --caution-bg: rgba(217, 180, 110, 0.14); --surface: rgba(194, 168, 106, 0.11);
+}
+/* New: pure greys, colour only where it means something (the accent = "go"). */
+:root[data-theme="graphite"] {
+  --bg: rgba(8, 8, 8, 0.96);
+  --bg-elev: rgba(255, 255, 255, 0.11); --bg-hover: rgba(255, 255, 255, 0.18); --border: rgba(255, 255, 255, 0.22);
+  --text: rgba(240, 240, 240, 0.96); --text-dim: rgba(240, 240, 240, 0.62); --text-faint: rgba(240, 240, 240, 0.4);
+  --accent: #7fd49a; --on-accent: #0b1a10; --warn: #e3c07a; --ok: #7fd49a; --err: #ef8578;
+  --ok-bg: rgba(127, 212, 154, 0.13); --warn-bg: rgba(227, 192, 122, 0.15);
+  --err-bg: rgba(239, 133, 120, 0.14); --err-border: rgba(239, 133, 120, 0.32);
+  --caution: #e3c07a; --caution-bg: rgba(227, 192, 122, 0.14); --surface: rgba(255, 255, 255, 0.07);
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -480,7 +542,7 @@ html, body, #root {
   border-radius: 50%;
   color: var(--ok);
   background: var(--ok-bg);
-  box-shadow: 0 0 0 8px rgba(182, 160, 160, 0.05);
+  box-shadow: 0 0 0 8px color-mix(in srgb, var(--accent) 5%, transparent);
 }
 .all-current-title {
   margin-top: 18px;
@@ -755,6 +817,40 @@ html, body, #root {
 
 .result-name { flex: 1; word-break: break-all; }
 
+/* Per-step timing: a one-line hint while collapsed, bars when expanded. */
+.result-sub {
+  padding: 0 11px 9px 39px;
+  margin-top: -4px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+.step-times { padding: 2px 11px 8px 39px; display: grid; gap: 3px; }
+.step-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 64px 44px;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-dim);
+}
+.step-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.step-shared {
+  margin-left: 6px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--bg-hover);
+  color: var(--text-faint);
+  font-size: 9.5px;
+}
+.step-bar { height: 4px; border-radius: 2px; background: var(--bg-hover); overflow: hidden; }
+.step-bar > span { display: block; height: 100%; border-radius: 2px; background: var(--text-faint); }
+.step-row.slowest { color: var(--text); }
+.step-row.slowest .step-bar > span { background: var(--accent); }
+.step-row.other { color: var(--text-faint); }
+.step-ms { text-align: right; font-variant-numeric: tabular-nums; }
+
 .result-chevron {
   color: var(--text-faint);
   font-size: 14px;
@@ -831,7 +927,7 @@ html, body, #root {
 }
 .schedule-card.on {
   background: linear-gradient(160deg, var(--bg-hover), var(--surface) 70%);
-  border-color: rgba(182, 160, 160, 0.4);
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
 }
 .schedule-top { display: flex; align-items: center; gap: 12px; }
 .schedule-icon {
@@ -1117,7 +1213,7 @@ html, body, #root {
   padding: 9px 10px 9px 12px;
   border-radius: var(--radius);
   background: var(--ok-bg);
-  border: 1px solid rgba(182, 160, 160, 0.35);
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
   font-size: 12px;
 }
 .app-update-text { flex: 1; min-width: 0; color: var(--text); }
@@ -1154,3 +1250,144 @@ html, body, #root {
   color: var(--text-dim);
 }
 .history-took { font-family: var(--font-mono); font-size: 9.5px; color: var(--text-faint); }
+
+/* ---------------- adoption status, rollback note ---------------- */
+.adopt-status { margin-left: auto; font-size: 11px; color: var(--text-dim); text-align: right; flex-shrink: 1; min-width: 0; }
+.adopt-status.stalled { color: var(--caution); }
+.adopt-status-row { display: flex; align-items: center; justify-content: flex-end; gap: 10px; padding: 6px 11px 0; }
+.pkg-detail-note { color: var(--text-dim); margin-top: 6px; }
+.status-off { font-size: 11px; font-weight: 600; color: var(--text-faint); padding: 3px 9px; border-radius: 999px; background: var(--surface); }
+
+/* ---------------- live run view ---------------- */
+/* The running step with a ticking clock, and the last few finished steps fading above it. */
+.live-run { display: grid; gap: 3px; margin-bottom: 2px; }
+.live-step {
+  display: grid;
+  grid-template-columns: 12px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-dim);
+  animation: live-in 0.2s ease-out;
+}
+.live-step.running { color: var(--text); }
+.live-mark { color: var(--ok); font-size: 9px; text-align: center; }
+.live-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.live-time { font-variant-numeric: tabular-nums; color: var(--text-faint); }
+.live-step.running .live-time { color: var(--accent); }
+.live-pulse {
+  width: 6px; height: 6px;
+  justify-self: center;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: live-pulse 1.4s ease-in-out infinite;
+}
+@keyframes live-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.35; transform: scale(0.7); }
+}
+@keyframes live-in {
+  from { opacity: 0; transform: translateY(3px); }
+}
+
+/* ---------------- filter + keyboard ---------------- */
+.filter-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 14px 6px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-elev);
+}
+.filter-bar:focus-within { border-color: color-mix(in srgb, var(--accent) 55%, transparent); }
+.filter-input {
+  flex: 1;
+  min-width: 0;
+  padding: 7px 0;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+}
+.filter-input::placeholder { color: var(--text-faint); }
+.filter-count { font-family: var(--font-mono); font-size: 10.5px; color: var(--text-faint); white-space: nowrap; }
+.icon-btn.active { color: var(--accent); }
+
+/* The row the keyboard cursor is on (App state, not browser focus; see stepCursor in logic.ts). */
+.pkg.kb-cursor,
+.cat-toggle.kb-cursor { background: var(--bg-hover); box-shadow: inset 2px 0 0 var(--accent); }
+
+.footer-keys {
+  margin-left: auto;
+  width: 16px; height: 16px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-faint);
+  font: inherit;
+  font-size: 9.5px;
+  line-height: 1;
+  cursor: pointer;
+}
+.footer-keys:hover { color: var(--text); border-color: var(--text-faint); }
+
+.help-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 30;
+  display: grid;
+  place-items: center;
+  background: rgba(0, 0, 0, 0.35);
+  border-radius: 12px;
+  animation: results-in 0.15s ease-out;
+}
+.help-card {
+  width: min(300px, calc(100% - 40px));
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.4);
+  -webkit-backdrop-filter: blur(40px);
+  backdrop-filter: blur(40px);
+}
+.help-title { font-family: var(--font-display); font-size: 16px; margin-bottom: 8px; }
+.help-row { display: flex; align-items: baseline; gap: 10px; padding: 3px 0; font-size: 11.5px; color: var(--text-dim); }
+.help-row kbd {
+  flex: 0 0 96px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text);
+}
+
+/* ---------------- appearance ---------------- */
+.theme-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; margin-bottom: 4px; }
+.theme-swatch {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-elev);
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 11.5px;
+  text-align: left;
+  cursor: pointer;
+}
+.theme-swatch:hover { background: var(--bg-hover); color: var(--text); }
+.theme-swatch.on { border-color: var(--accent); color: var(--text); box-shadow: inset 0 0 0 1px var(--accent); }
+.theme-chips { display: flex; flex-shrink: 0; }
+.theme-chips > span {
+  width: 13px; height: 13px;
+  border-radius: 50%;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+}
+.theme-chips > span + span { margin-left: -4px; }
+.theme-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

@@ -265,3 +265,48 @@ the adversarial validator cases, all run in CI on every push and pull request.
 Transitive dev-tool dependencies with available fixes are pinned to patched floors with scoped
 `pnpm.overrides` (e.g. `"postcss@8": "^8.5.23"`), each limited to the affected major line.
 
+## Hardening added 2026-10-25
+
+### npm install scripts (src-tauri/src/npm.rs)
+`npm install -g` runs the package's and every dependency's pre/install/post-install scripts with
+the user's full access. Freshet now:
+- installs the **exact version** the list showed (`name@version`); never `@latest`, and never a
+  dist-tag (versions must start with a digit);
+- asks the registry (`npm view name@version scripts`) **before** installing; if that version
+  declares install scripts and the user hasn't approved that exact `name@version`, nothing is
+  installed and the result shows the scripts with **Allow install scripts**;
+- otherwise installs with `--ignore-scripts`, then lists dependency scripts that were skipped
+  (`npm query -g`), with the same approve action.
+Approvals live in `settings.json` (`npm_scripts_approved`), per exact version, so a new release with
+new scripts asks again. The frontend can't overwrite them.
+
+### Formula and App Store provenance
+- **Formulae:** when GitHub credentials exist (`HOMEBREW_GITHUB_API_TOKEN` or a signed-in `gh`),
+  formula upgrades run with `HOMEBREW_VERIFY_ATTESTATIONS=1`: Homebrew checks each bottle's build
+  provenance attestation and refuses one not built by its CI. Without credentials Homebrew would
+  refuse *every* bottle, so it stays off; Settings shows the state and how to enable it. A refused
+  bottle is reported as **blocked**, not failed.
+- **App Store apps** carry the developer's Team ID like any app, so they're now included in the
+  post-update publisher-change check.
+
+### Trust on first use → pinned publishers
+`PINNED_PUBLISHERS` (main.rs) maps 17 widely used apps' bundle IDs to their publisher's Team ID.
+A pin applies from the first sighting, so a copy that was already wrong when Freshet was
+installed is flagged ("Not signed by Slack Technologies…"). Each pin was confirmed two ways: the
+app's real signature on a development Mac and the publisher's known identity. Precedence:
+explicit user trust (`explicit:<bundle id>`, written only by **Trust new publisher**) → pin →
+first-seen baseline. Rewriting the baseline in `signing.json` can't vouch for a pinned app.
+
+### Same-user tampering
+- The askpass helper is created **per command**, with `O_EXCL` and mode 0700, checked (owner,
+  mode, exact contents) and deleted when the command finishes; the old persistent
+  `~/.freshet/askpass.sh` is removed at startup.
+- `brew` always runs from `/opt/homebrew/bin/brew` or `/usr/local/bin/brew` (owned by the user or
+  root, not group/world-writable), never "first on PATH". `FRESHET_BREW` overrides this in debug
+  builds only, for tests.
+- `~/.freshet` is refused if it is a symlink or owned by another user.
+These raise the bar; malware already running as the user remains out of scope.
+
+Remaining: Developer ID signing + notarization of Freshet itself, and a password on the updater
+signing key (docs/14-release-signing.md).
+
