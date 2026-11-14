@@ -126,8 +126,7 @@ fn check_cask_inner(token: &str, installed_apps: &[PathBuf]) -> Verdict {
 
     let app_name = installed_app
         .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
+        .map_or_default(|n| n.to_string_lossy().into_owned());
     let incoming = cached_download(token).map_or_else(
         || Incoming::Unknown("the download wasn't in Homebrew's cache".into()),
         |path| inspect_download(&path, &app_name),
@@ -144,8 +143,7 @@ fn cached_download(token: &str) -> Option<PathBuf> {
 fn inspect_download(path: &Path, app_name: &str) -> Incoming {
     let ext = path
         .extension()
-        .map(|e| e.to_string_lossy().to_lowercase())
-        .unwrap_or_default();
+        .map_or_default(|e| e.to_string_lossy().to_lowercase());
     match ext.as_str() {
         "dmg" => inspect_dmg(path, app_name),
         "zip" => inspect_zip(path, app_name),

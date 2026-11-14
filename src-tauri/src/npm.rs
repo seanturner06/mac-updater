@@ -38,8 +38,7 @@ pub(crate) fn skipped_scripts_in(query_json: &str, name: &str) -> Vec<String> {
     let v: serde_json::Value = serde_json::from_str(query_json).unwrap_or_default();
     let own = format!("/node_modules/{name}");
     v.as_array()
-        .map(Vec::as_slice)
-        .unwrap_or_default()
+        .map_or_default(Vec::as_slice)
         .iter()
         .filter(|p| {
             p["path"]
@@ -126,8 +125,7 @@ pub(crate) fn update(
     if !allowed {
         // What the registry says this exact version runs at install time.
         let declared = crate::run_cmd(npm, &["view", &spec, "scripts", "--json"])
-            .map(|json| parse_install_scripts(&json))
-            .unwrap_or_default();
+            .map_or_default(|json| parse_install_scripts(&json));
         if !declared.is_empty() {
             let listed: Vec<String> = declared
                 .iter()
@@ -167,8 +165,7 @@ pub(crate) fn update(
             .collect::<Vec<_>>()
             .join(", ");
         let skipped = crate::run_cmd(npm, &["query", "-g", &selector])
-            .map(|json| skipped_scripts_in(&json, name))
-            .unwrap_or_default();
+            .map_or_default(|json| skipped_scripts_in(&json, name));
         if !skipped.is_empty() {
             output = format!(
                 "{output}\n\nInstalled without running these install scripts:\n{}\nIf {name} \

@@ -62,8 +62,7 @@ pub(crate) fn parse_batch(json: &str) -> Option<Vec<Vec<String>>> {
             .map(|r| {
                 r["vulns"]
                     .as_array()
-                    .map(Vec::as_slice)
-                    .unwrap_or_default()
+                    .map_or_default(Vec::as_slice)
                     .iter()
                     .filter_map(|x| x["id"].as_str().map(String::from))
                     .collect()

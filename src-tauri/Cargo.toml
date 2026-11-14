@@ -10,7 +10,10 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = ["tray-icon", "macos-private-api", "image-png"] }
 tauri-plugin-positioner = { version = "2", features = ["tray-icon"] }
-tauri-plugin-updater = "2"
+# Default features minus "zip": that only adds Windows .zip/.msi support (and the zip crate, with
+# its RUSTSEC-2026-0367/0368/0369/0429 extraction advisories). macOS updates are .app.tar.gz, read
+# with tar + flate2, which the plugin depends on unconditionally on macOS.
+tauri-plugin-updater = { version = "2", default-features = false, features = ["rustls-tls", "system-proxy"] }
 tauri-plugin-autostart = "2"
 mac-notification-sys = "0.6"
 serde = { version = "1", features = ["derive"] }

@@ -121,8 +121,7 @@ fn read_meta(dir: &Path) -> Option<Snapshot> {
 // Snapshots in `root`, newest first; ones older than KEEP_DAYS are deleted along the way.
 pub(crate) fn list_in(root: &Path, apps_dir: &Path, now: u64) -> Vec<Snapshot> {
     let mut snaps: Vec<Snapshot> = std::fs::read_dir(root)
-        .map(|rd| rd.flatten().map(|e| e.path()).collect::<Vec<_>>())
-        .unwrap_or_default()
+        .map_or_default(|rd| rd.flatten().map(|e| e.path()).collect::<Vec<_>>())
         .into_iter()
         .filter_map(|dir| {
             let meta = read_meta(&dir)?;
@@ -203,9 +202,7 @@ pub(crate) fn snapshot_cask(token: &str, apps: &[PathBuf]) -> bool {
 
 #[tauri::command]
 pub(crate) fn list_snapshots() -> Vec<Snapshot> {
-    root()
-        .map(|r| list_in(&r, Path::new("/Applications"), crate::unix_now()))
-        .unwrap_or_default()
+    root().map_or_default(|r| list_in(&r, Path::new("/Applications"), crate::unix_now()))
 }
 
 #[tauri::command]
@@ -239,8 +236,7 @@ pub(crate) async fn restore_snapshot(token: String) -> Result<String, String> {
 fn verify_snapshot(snapshot_app: &Path, installed_app: &Path) -> Result<(), String> {
     let name = snapshot_app
         .file_stem()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
+        .map_or_default(|n| n.to_string_lossy().into_owned());
     if !signature_intact(snapshot_app) {
         return Err(format!(
             "Didn't restore {name}: the saved copy's code signature doesn't verify, so it may have \

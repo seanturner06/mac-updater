@@ -901,7 +901,7 @@ fn check_homebrew() -> (CategoryStatus, CategoryStatus) {
     });
     match greedy {
         Ok(stdout) => {
-            let normal = normal.map(|n| parse_cask_names(&n)).unwrap_or_default();
+            let normal = normal.map_or_default(|n| parse_cask_names(&n));
             (
                 CategoryStatus {
                     category: "Homebrew".into(),
@@ -1305,8 +1305,7 @@ async fn search_casks(query: String) -> Vec<CaskSuggestion> {
             return vec![];
         }
         let installed: std::collections::HashSet<String> = run_cmd("brew", &["list", "--cask"])
-            .map(|s| parse_cask_tokens(&s).into_iter().collect())
-            .unwrap_or_default();
+            .map_or_default(|s| parse_cask_tokens(&s).into_iter().collect());
         run_cmd("brew", &["search", "--cask", query.trim()]).map_or_else(
             |_| vec![],
             |out| {
@@ -1422,8 +1421,7 @@ fn parse_formula_infos(json: &str) -> HashMap<String, PackageInfo> {
     let parsed: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
     parsed["formulae"]
         .as_array()
-        .map(Vec::as_slice)
-        .unwrap_or_default()
+        .map_or_default(Vec::as_slice)
         .iter()
         .map(|f| {
             let homepage = json_str(&f["homepage"]);
@@ -1451,8 +1449,7 @@ fn parse_cask_infos(json: &str) -> HashMap<String, PackageInfo> {
     let parsed: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
     parsed["casks"]
         .as_array()
-        .map(Vec::as_slice)
-        .unwrap_or_default()
+        .map_or_default(Vec::as_slice)
         .iter()
         .map(|c| {
             let homepage = json_str(&c["homepage"]);
@@ -1507,10 +1504,8 @@ async fn package_details(
             let c = info("--cask", &casks);
             (f.join().ok().flatten(), c)
         });
-        let formula = formula_json
-            .map(|j| parse_formula_infos(&j))
-            .unwrap_or_default();
-        let mut cask = cask_json.map(|j| parse_cask_infos(&j)).unwrap_or_default();
+        let formula = formula_json.map_or_default(|j| parse_formula_infos(&j));
+        let mut cask = cask_json.map_or_default(|j| parse_cask_infos(&j));
         let installed = installed.unwrap_or_default();
         for (token, info) in &mut cask {
             let (Some(recorded), false) = (installed.get(token), info.app.is_empty()) else {
@@ -1779,15 +1774,13 @@ async fn suggest_adoptions() -> Vec<AdoptableApp> {
 fn suggest_adoptions_blocking() -> Vec<AdoptableApp> {
     {
         let all_casks: std::collections::HashSet<String> = run_cmd("brew", &["casks"])
-            .map(|s| s.lines().map(|l| l.trim().to_string()).collect())
-            .unwrap_or_default();
+            .map_or_default(|s| s.lines().map(|l| l.trim().to_string()).collect());
         if all_casks.is_empty() {
             return vec![];
         }
         // Apps Homebrew already manages: whatever bundles the installed casks own.
-        let managed_tokens: Vec<String> = run_cmd("brew", &["list", "--cask"])
-            .map(|s| parse_cask_tokens(&s))
-            .unwrap_or_default();
+        let managed_tokens: Vec<String> =
+            run_cmd("brew", &["list", "--cask"]).map_or_default(|s| parse_cask_tokens(&s));
         let managed_apps: std::collections::HashSet<String> = cask_apps(&managed_tokens)
             .into_values()
             .flatten()
@@ -2204,9 +2197,7 @@ fn install_selections(
     let mut formulae = Vec::new();
     let mut casks = Vec::new();
     let mut npm_versions: Option<Versions> = None;
-    let npm_approved = load_settings()
-        .map(|s| s.npm_scripts_approved)
-        .unwrap_or_default();
+    let npm_approved = load_settings().map_or_default(|s| s.npm_scripts_approved);
     for (i, sel) in selections.iter().enumerate() {
         match build_update_command(&sel.kind, &sel.id) {
             None => {
@@ -2378,8 +2369,7 @@ fn not_started(sel: &UpdateSelection) -> UpdateResult {
 fn skipped_open(sel: &UpdateSelection, bundle: &Path) -> UpdateResult {
     let app = bundle
         .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
+        .map_or_default(|n| n.to_string_lossy().into_owned());
     let shown = app.trim_end_matches(".app");
     UpdateResult {
         skipped: true,
@@ -2407,13 +2397,12 @@ fn running_executables() -> Vec<String> {
     Command::new("/bin/ps")
         .args(["-axo", "comm="])
         .output()
-        .map(|o| {
+        .map_or_default(|o| {
             String::from_utf8_lossy(&o.stdout)
                 .lines()
                 .map(|l| l.trim().to_string())
                 .collect()
         })
-        .unwrap_or_default()
 }
 
 // Any process (the app or one of its helpers) running from inside `bundle`. Pure → tested.
@@ -2953,7 +2942,7 @@ fn build_verify_entries(
 
         let mut out = String::new();
         if let (true, Some(publisher)) = (changed, pinned_publisher) {
-            let was = prev.clone().unwrap_or_default();
+            let was = prev.unwrap_or_default();
             let now = sig.team_id.clone().unwrap_or_default();
             let _ = writeln!(
                 out,
@@ -2961,7 +2950,7 @@ fn build_verify_entries(
                 sig.name
             );
         } else if changed {
-            let was = prev.clone().unwrap_or_default();
+            let was = prev.unwrap_or_default();
             let now = sig.team_id.clone().unwrap_or_default();
             let _ = writeln!(
                 out,
@@ -2985,7 +2974,7 @@ fn build_verify_entries(
 
         let action = match (changed, &sig.team_id) {
             (true, Some(team)) => Some(ResultAction::TrustSigner {
-                bundle_id: key.clone(),
+                bundle_id: key,
                 team: team.clone(),
             }),
             _ => None,
@@ -3061,15 +3050,13 @@ fn parse_cask_apps(json: &str) -> HashMap<String, Vec<String>> {
     let parsed: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
     parsed["casks"]
         .as_array()
-        .map(Vec::as_slice)
-        .unwrap_or_default()
+        .map_or_default(Vec::as_slice)
         .iter()
         .filter_map(|c| {
             let token = c["token"].as_str()?.to_string();
             let apps = c["artifacts"]
                 .as_array()
-                .map(Vec::as_slice)
-                .unwrap_or_default()
+                .map_or_default(Vec::as_slice)
                 .iter()
                 .filter_map(|a| a["app"].as_array())
                 .flatten()
@@ -3410,9 +3397,8 @@ fn append_history(entries: &[HistoryEntry]) {
     if entries.is_empty() {
         return;
     }
-    let mut lines: Vec<String> = std::fs::read_to_string(&path)
-        .map(|s| s.lines().map(String::from).collect())
-        .unwrap_or_default();
+    let mut lines: Vec<String> =
+        std::fs::read_to_string(&path).map_or_default(|s| s.lines().map(String::from).collect());
     lines.extend(entries.iter().filter_map(|e| serde_json::to_string(e).ok()));
     let start = lines.len().saturating_sub(HISTORY_KEEP);
     let _ = write_private_atomic(&path, &(lines[start..].join("\n") + "\n"));
@@ -3438,8 +3424,7 @@ fn versions_last_shown() -> Versions {
     cached_check_path()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|t| serde_json::from_str::<CachedCheck>(&t).ok())
-        .map(|c| versions_of(&c.categories))
-        .unwrap_or_default()
+        .map_or_default(|c| versions_of(&c.categories))
 }
 
 // Newest first.
@@ -3642,9 +3627,7 @@ fn save_settings(settings: Settings) -> Result<(), String> {
     let path = settings_path().ok_or_else(|| "could not resolve ~/.freshet".to_string())?;
     // The frontend doesn't manage npm approvals; never let its save erase them.
     let settings = Settings {
-        npm_scripts_approved: load_settings()
-            .map(|s| s.npm_scripts_approved)
-            .unwrap_or_default(),
+        npm_scripts_approved: load_settings().map_or_default(|s| s.npm_scripts_approved),
         ..settings
     };
     let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
@@ -3920,8 +3903,7 @@ fn run_scheduled_inner(dir: &Path) -> i32 {
     let mut log = RunLog::open(&dir.join("run.log"));
     let started = Command::new("/bin/date")
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
+        .map_or_default(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
     log.line(&format!("===== scheduled run {started} ====="));
     let settings = load_settings().unwrap_or_default();
     let mut summary = ScheduledRunSummary {

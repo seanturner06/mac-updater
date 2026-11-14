@@ -230,6 +230,14 @@ Freshet ships macOS-only. Remove this ignore if a Linux target is ever added.
 high-severity `quick-xml` DoS advisories reachable through `plist`; they were fixed by a
 dependency bump, not an ignore.
 
+November 2026: ten advisories, fixed the same way rather than ignored. `rustls`, `rustls-webpki`
+and `webpki-root-certs` (TLS for the self-updater and OSV lookups) took patch bumps; `rustix` and
+`tokio` (unsound, warnings) too. The four critical/high `zip` extraction advisories
+(RUSTSEC-2026-0367/0368/0369/0429, patched only in zip 9) came in through
+`tauri-plugin-updater`'s default `zip` feature, which only serves Windows `.zip`/`.msi` updates.
+Freshet now turns that feature off (see `Cargo.toml`), so `zip` is gone from `Cargo.lock`; macOS
+updates are `.app.tar.gz`, which the plugin reads with `tar` + `flate2` regardless of features.
+
 `unsafe_code = "deny"` at the crate level. There is no unsafe code and no FFI.
 
 ## Reviewing a security-relevant change
