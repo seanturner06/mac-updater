@@ -47,12 +47,14 @@ jobs:
           branch: 'cla-signatures'
 
           # Pin to a COMMIT, not to `main`. A signature has to reference the exact text that
-          # was agreed to; a moving link means nobody can prove what they signed.
-          # Replace <COMMIT-SHA> after committing CLA.md — see .github/workflows/README-cla.md
-          path-to-document: 'https://github.com/seanturner06/mac-updater/blob/<COMMIT-SHA>/.github/CLA.md'
+          # was agreed to; a moving link means nobody can prove what they signed. This is the
+          # commit that added CLA.md (8cbad0e); see .github/workflows/README-cla.md.
+          path-to-document: 'https://github.com/seanturner06/mac-updater/blob/8cbad0e742c11f0690ec1a9ead5a1a47bb2d6652/.github/CLA.md'
 
-          # People who never need to sign: the copyright holder, and bots.
-          allowlist: 'seanturner06,dependabot[bot],github-actions[bot],renovate[bot]'
+          # People who never need to sign: the copyright holder, and bots. `claude` is the GitHub
+          # account behind the "Co-Authored-By: Claude <noreply@anthropic.com>" trailer on
+          # AI-assisted commits; the action counts co-authors, but that work is the committer's.
+          allowlist: 'seanturner06,claude,dependabot[bot],github-actions[bot],renovate[bot]'
 
           custom-notsigned-prcomment: >
             Thanks for the pull request — before it can be merged, please sign the
