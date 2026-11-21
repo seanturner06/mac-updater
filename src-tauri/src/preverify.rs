@@ -7,14 +7,21 @@
 // app — blocks the install. That's the 3CX / HandBrake / Transmission scenario: validly signed,
 // sometimes notarized, by the wrong people.
 //
-// Only the claimed signature is read (`codesign -dvv`), not a full `--verify --deep`: tampered
-// contents under a copied signature fail Gatekeeper on first launch anyway (casks keep the
-// quarantine flag), while the hijack Gatekeeper *doesn't* catch is a valid signature by a
-// different team — which is exactly what this compares. It keeps the check to ~1s per cask.
+// The download's Team ID has to be proven, not just stated: after reading what the signature
+// claims (`codesign -dvv`), the bundle is verified against a requirement naming that team
+// (crate::signing::signature_proves_team), so a signature hand-built to *say* the right team doesn't pass.
+// That used to be left to Gatekeeper on first launch; now nothing is installed first.
+//
+// When the download can't be inspected at all (an archive format we don't open, a disk image
+// that won't mount), the install normally goes ahead with a note. Not for an app with a pinned
+// publisher (crate::signing::PINNED_PUBLISHERS): there Freshet knows who must have signed it, so "couldn't
+// check" blocks — otherwise choosing awkward packaging would be a way around the check.
 
+use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, PartialEq, Eq)]
@@ -40,18 +47,23 @@ pub(crate) struct Signer {
 // What we learned about the download.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Incoming {
+    // Signed by this team, and the signature verifies.
     Signed(String),
     Unsigned,
+    // Claims this team, but the signature doesn't verify as it.
+    Invalid(String),
     // Couldn't be inspected (format, mount failure, app not found inside); the reason is shown.
     Unknown(String),
 }
 
 // The decision, separated from all I/O. `baseline` is the trusted Team ID for this app (stored
-// baseline, else the installed app's own). Pure → unit-tested.
+// baseline, else the installed app's own); `pinned` the publisher's name when that baseline is
+// one of Freshet's pins. Pure → unit-tested.
 pub(crate) fn decide(
     token: &str,
     installed: &Signer,
     baseline: Option<&str>,
+    pinned: Option<&str>,
     incoming: Incoming,
 ) -> Verdict {
     let allowed = |note: Option<String>| Verdict::Allowed { note };
@@ -78,12 +90,54 @@ pub(crate) fn decide(
             bundle_id: None,
             team: String::new(),
         },
-        Incoming::Unknown(why) => allowed(Some(format!("Pre-install check skipped: {why}."))),
+        Incoming::Invalid(team) => Verdict::Blocked {
+            reason: format!(
+                "Blocked before install: the new {token} download says it is signed by Team {team}, but \
+                 its signature doesn't verify. A signature that only claims a publisher is what a forged \
+                 release looks like. Nothing was installed."
+            ),
+            bundle_id: None,
+            team: String::new(),
+        },
+        Incoming::Unknown(why) => pinned.map_or_else(
+            || allowed(Some(format!("Pre-install check skipped: {why}."))),
+            |publisher| Verdict::Blocked {
+                reason: format!(
+                    "Blocked before install: the new {token} download couldn't be checked ({why}), and \
+                     {token} must come from {publisher} (Team {expected}). Freshet only installs it when it \
+                     can confirm that. Nothing was installed; try again, or update it from the app itself."
+                ),
+                bundle_id: None,
+                team: String::new(),
+            },
+        ),
     }
 }
 
-// `pkgutil --check-signature` lists the certificate chain; the leaf is
-// "1. Developer ID Installer: Name (TEAMID)". Pure → unit-tested.
+// What `pkgutil --check-signature` says about an installer package. pkgutil validates the
+// signature itself and reports the outcome on its "Status:" line; only a certificate issued by
+// Apple counts ("signed by a developer certificate issued by Apple for distribution", "signed
+// Apple Software"). Anything else that is signed — "signed by untrusted certificate", an expired
+// or revoked one — is Invalid: a self-made certificate can be *named* "Developer ID Installer:
+// Zoom (BJ4HAAB9B3)". Pure → unit-tested.
+pub(crate) fn parse_pkgutil(output: &str) -> Incoming {
+    let status = output
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("Status: "))
+        .unwrap_or("");
+    if status.is_empty() || status.contains("no signature") {
+        return Incoming::Unsigned;
+    }
+    let team = parse_pkgutil_team(output);
+    let apple_issued = status.contains("issued by Apple") || status.contains("Apple Software");
+    match team {
+        Some(team) if apple_issued => Incoming::Signed(team),
+        Some(team) => Incoming::Invalid(team),
+        None => Incoming::Unknown("the installer package's signer couldn't be read".into()),
+    }
+}
+
+// The certificate chain's leaf is "1. Developer ID Installer: Name (TEAMID)". Pure → unit-tested.
 pub(crate) fn parse_pkgutil_team(output: &str) -> Option<String> {
     if output.contains("Status: no signature") {
         return None;
@@ -100,44 +154,86 @@ pub(crate) fn parse_pkgutil_team(output: &str) -> Option<String> {
 // --- I/O ---
 
 // `installed_apps`: this cask's bundles currently in /Applications (see installed_cask_apps).
-pub(crate) fn check_cask(token: &str, installed_apps: &[PathBuf]) -> Verdict {
+// `download`: where Homebrew cached the new version, if it's there (see cached_downloads).
+pub(crate) fn check_cask(
+    token: &str,
+    installed_apps: &[PathBuf],
+    download: Option<&Path>,
+) -> Verdict {
     let started = Instant::now();
-    let verdict = check_cask_inner(token, installed_apps);
+    let verdict = check_cask_inner(token, installed_apps, download);
     tracing::info!(
         cask = token,
-        elapsed_ms = crate::elapsed_ms(started),
+        elapsed_ms = crate::process::elapsed_ms(started),
         ?verdict,
         "pre-install check"
     );
     verdict
 }
 
-fn check_cask_inner(token: &str, installed_apps: &[PathBuf]) -> Verdict {
+fn check_cask_inner(token: &str, installed_apps: &[PathBuf], download: Option<&Path>) -> Verdict {
     let Some(installed_app) = installed_apps.first() else {
         // Not installed in /Applications (or a cask with no app): nothing to compare against.
         return Verdict::Allowed { note: None };
     };
-    let installed = crate::read_signer(installed_app);
-    let baseline = installed
+    let installed = crate::signing::read_signer(installed_app);
+    let trusted = installed
         .bundle_id
         .as_deref()
-        .and_then(crate::trusted_team)
+        .and_then(crate::signing::trusted_signer);
+    let pinned = match &trusted {
+        Some((_, crate::signing::Basis::Pinned(publisher))) => Some(*publisher),
+        _ => None,
+    };
+    let baseline = trusted
+        .map(|(team, _)| team)
         .or_else(|| installed.team.clone());
 
     let app_name = installed_app
         .file_name()
         .map_or_default(|n| n.to_string_lossy().into_owned());
-    let incoming = cached_download(token).map_or_else(
+    let incoming = download.map_or_else(
         || Incoming::Unknown("the download wasn't in Homebrew's cache".into()),
-        |path| inspect_download(&path, &app_name),
+        |path| inspect_download(path, &app_name),
     );
-    decide(token, &installed, baseline.as_deref(), incoming)
+    decide(token, &installed, baseline.as_deref(), pinned, incoming)
 }
 
-fn cached_download(token: &str) -> Option<PathBuf> {
-    let out = crate::run_cmd("brew", &["--cache", "--cask", token]).ok()?;
-    let path = PathBuf::from(out.trim());
-    path.is_file().then_some(path)
+// `brew --cache --cask a b c` prints one path per line, in argument order. None if the answer
+// doesn't line up with the question (brew refused one of the casks). Pure → unit-tested.
+pub(crate) fn parse_cache_paths(stdout: &str, tokens: &[&str]) -> Option<Vec<(String, PathBuf)>> {
+    let lines: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+    (lines.len() == tokens.len()).then(|| {
+        tokens
+            .iter()
+            .zip(lines)
+            .map(|(token, line)| ((*token).to_string(), PathBuf::from(line.trim())))
+            .collect()
+    })
+}
+
+// Where Homebrew cached each cask's download, for the ones that are actually there. One brew
+// process for the whole batch rather than one per cask (each start-up costs about a second);
+// if brew won't answer for the batch, ask per cask so one bad token only costs itself.
+pub(crate) fn cached_downloads(tokens: &[String]) -> HashMap<String, PathBuf> {
+    let tokens: Vec<&str> = tokens
+        .iter()
+        .map(String::as_str)
+        .filter(|t| crate::validate::is_valid_cask_token(t))
+        .collect();
+    if tokens.is_empty() {
+        return HashMap::new();
+    }
+    let ask = |tokens: &[&str]| -> Option<Vec<(String, PathBuf)>> {
+        let mut args = vec!["--cache", "--cask"];
+        args.extend(tokens);
+        parse_cache_paths(&crate::process::run_cmd("brew", &args).ok()?, tokens)
+    };
+    ask(&tokens)
+        .unwrap_or_else(|| tokens.iter().filter_map(|t| ask(&[t])).flatten().collect())
+        .into_iter()
+        .filter(|(_, path)| path.is_file())
+        .collect()
 }
 
 fn inspect_download(path: &Path, app_name: &str) -> Incoming {
@@ -152,13 +248,17 @@ fn inspect_download(path: &Path, app_name: &str) -> Incoming {
     }
 }
 
+// A new, empty directory of our own: unique per call (two casks checked in the same second must
+// not share a mount point), and `create_dir` refuses one that already exists.
 fn scratch_dir(label: &str) -> Option<PathBuf> {
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!(
-        "freshet-{label}-{}-{}",
+        "freshet-{label}-{}-{}-{}",
         std::process::id(),
-        crate::unix_now()
+        crate::store::unix_now(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
     ));
-    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::create_dir(&dir).ok()?;
     Some(dir)
 }
 
@@ -244,17 +344,17 @@ fn inspect_pkg(path: &Path) -> Incoming {
         .arg(path)
         .output()
     {
-        Ok(out) => {
-            let text = crate::combine_output(&out.stdout, &out.stderr);
-            parse_pkgutil_team(&text).map_or(Incoming::Unsigned, Incoming::Signed)
-        }
+        Ok(out) => parse_pkgutil(&crate::process::combine_output(&out.stdout, &out.stderr)),
         Err(e) => Incoming::Unknown(format!("pkgutil failed: {e}")),
     }
 }
 
 fn incoming_from_bundle(app: &Path) -> Incoming {
-    let signer = crate::read_signer(app);
-    signer.team.map_or(Incoming::Unsigned, Incoming::Signed)
+    match crate::signing::read_signer(app).team {
+        None => Incoming::Unsigned,
+        Some(team) if crate::signing::signature_proves_team(app, &team) => Incoming::Signed(team),
+        Some(team) => Incoming::Invalid(team),
+    }
 }
 
 // Case-insensitive search for `name` up to `depth` directories down.
@@ -350,6 +450,7 @@ mod tests {
                 "app",
                 &installed("AAAAAAAAAA"),
                 Some("AAAAAAAAAA"),
+                None,
                 Incoming::Signed("AAAAAAAAAA".into())
             ),
             Verdict::Allowed { note: None }
@@ -362,6 +463,7 @@ mod tests {
             "app",
             &installed("AAAAAAAAAA"),
             Some("AAAAAAAAAA"),
+            None,
             Incoming::Signed("EVILEVIL99".into()),
         );
         let Verdict::Blocked {
@@ -386,6 +488,7 @@ mod tests {
                 "app",
                 &installed("OLDOLDOLD1"),
                 Some("NEWNEWNEW1"),
+                None,
                 Incoming::Signed("NEWNEWNEW1".into())
             ),
             Verdict::Allowed { note: None }
@@ -399,6 +502,7 @@ mod tests {
                 "app",
                 &installed("AAAAAAAAAA"),
                 Some("AAAAAAAAAA"),
+                None,
                 Incoming::Unsigned
             ),
             Verdict::Blocked { .. }
@@ -411,6 +515,7 @@ mod tests {
             "app",
             &installed("AAAAAAAAAA"),
             Some("AAAAAAAAAA"),
+            None,
             Incoming::Unknown("x".into()),
         );
         assert!(matches!(v, Verdict::Allowed { note: Some(_) }));
@@ -421,9 +526,93 @@ mod tests {
                 team: None,
             },
             None,
+            None,
             Incoming::Signed("AAAAAAAAAA".into()),
         );
         assert!(matches!(v, Verdict::Allowed { note: Some(_) }));
+    }
+
+    // A download that only *claims* the right publisher is blocked, with nothing to "trust".
+    #[test]
+    fn a_signature_that_does_not_verify_is_blocked() {
+        let v = decide(
+            "app",
+            &installed("AAAAAAAAAA"),
+            Some("AAAAAAAAAA"),
+            None,
+            Incoming::Invalid("AAAAAAAAAA".into()),
+        );
+        let Verdict::Blocked {
+            reason, bundle_id, ..
+        } = v
+        else {
+            panic!("expected Blocked")
+        };
+        assert!(reason.contains("doesn't verify"), "{reason}");
+        assert_eq!(bundle_id, None, "no publisher to trust");
+    }
+
+    // "Couldn't check" lets an ordinary app through with a note, but not one whose publisher
+    // Freshet pins: there it must be confirmed.
+    #[test]
+    fn an_uninspectable_download_is_blocked_only_for_a_pinned_publisher() {
+        let unknown = || Incoming::Unknown("can't inspect .tar downloads".into());
+        let ordinary = decide(
+            "app",
+            &installed("AAAAAAAAAA"),
+            Some("AAAAAAAAAA"),
+            None,
+            unknown(),
+        );
+        assert!(matches!(ordinary, Verdict::Allowed { note: Some(_) }));
+        let pinned = decide(
+            "slack",
+            &installed("BQR82RBBHL"),
+            Some("BQR82RBBHL"),
+            Some("Slack Technologies"),
+            unknown(),
+        );
+        let Verdict::Blocked { reason, .. } = pinned else {
+            panic!("expected Blocked")
+        };
+        assert!(
+            reason.contains("Slack Technologies") && reason.contains("can't inspect .tar"),
+            "{reason}"
+        );
+        // A pinned app whose download checks out is unaffected.
+        assert_eq!(
+            decide(
+                "slack",
+                &installed("BQR82RBBHL"),
+                Some("BQR82RBBHL"),
+                Some("Slack Technologies"),
+                Incoming::Signed("BQR82RBBHL".into())
+            ),
+            Verdict::Allowed { note: None }
+        );
+    }
+
+    // pkgutil's own verdict decides whether the named team counts.
+    #[test]
+    fn installer_packages_need_an_apple_issued_certificate() {
+        let chain = "   Certificate Chain:\n    1. Developer ID Installer: Zoom Video Communications, Inc. (BJ4HAAB9B3)\n";
+        let genuine = format!("Package \"z.pkg\":\n   Status: signed by a developer certificate issued by Apple for distribution\n{chain}");
+        assert_eq!(
+            parse_pkgutil(&genuine),
+            Incoming::Signed("BJ4HAAB9B3".into())
+        );
+        // A self-made certificate with the right *name*.
+        let forged =
+            format!("Package \"z.pkg\":\n   Status: signed by untrusted certificate\n{chain}");
+        assert_eq!(
+            parse_pkgutil(&forged),
+            Incoming::Invalid("BJ4HAAB9B3".into())
+        );
+        assert_eq!(
+            parse_pkgutil("Package \"x.pkg\":\n   Status: no signature\n"),
+            Incoming::Unsigned
+        );
+        assert_eq!(parse_pkgutil(""), Incoming::Unsigned);
     }
 
     // Format of `pkgutil --check-signature` on a Developer ID-signed installer.
@@ -435,6 +624,45 @@ mod tests {
             parse_pkgutil_team("Package \"x.pkg\":\n   Status: no signature\n"),
             None
         );
+    }
+
+    // Real `brew --cache --cask firefox google-chrome` output: one path per line, in order, and
+    // file names can contain spaces.
+    #[test]
+    fn cache_paths_pair_up_with_their_casks_in_order() {
+        let out = "/Users/u/Library/Caches/Homebrew/downloads/8ee1--Firefox 160.0.dmg\n\
+                   /Users/u/Library/Caches/Homebrew/downloads/8888--googlechrome.dmg\n";
+        let paired = parse_cache_paths(out, &["firefox", "google-chrome"]).unwrap();
+        assert_eq!(
+            paired,
+            [
+                (
+                    "firefox".to_string(),
+                    PathBuf::from(
+                        "/Users/u/Library/Caches/Homebrew/downloads/8ee1--Firefox 160.0.dmg"
+                    )
+                ),
+                (
+                    "google-chrome".to_string(),
+                    PathBuf::from(
+                        "/Users/u/Library/Caches/Homebrew/downloads/8888--googlechrome.dmg"
+                    )
+                ),
+            ]
+        );
+        // A line short (brew refused a cask) or over: don't guess which path is whose.
+        assert_eq!(parse_cache_paths(out, &["firefox"]), None);
+        assert_eq!(parse_cache_paths(out, &["a", "b", "c"]), None);
+        assert_eq!(parse_cache_paths("", &["a"]), None);
+    }
+
+    #[test]
+    fn scratch_dirs_are_unique_within_a_second() {
+        let a = scratch_dir("test").unwrap();
+        let b = scratch_dir("test").unwrap();
+        assert_ne!(a, b);
+        std::fs::remove_dir(&a).unwrap();
+        std::fs::remove_dir(&b).unwrap();
     }
 
     #[test]
@@ -450,38 +678,78 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    // Pinned publishers fail closed when a download can't be inspected, so their real downloads
+    // had better be inspectable. Checks whichever of these are in Homebrew's cache right now.
+    //   cargo test -- --ignored pinned_downloads_live --nocapture
+    #[test]
+    #[ignore = "inspects real cached downloads of pinned apps"]
+    fn pinned_downloads_live() {
+        let casks = [
+            ("slack", "Slack.app", "BQR82RBBHL"),
+            ("discord", "Discord.app", "53Q6R32WPB"),
+            ("figma", "Figma.app", "T8RA8NE3B7"),
+            ("google-chrome", "Google Chrome.app", "EQHXZ8M8AV"),
+            ("visual-studio-code", "Visual Studio Code.app", "UBF8T346G9"),
+            ("zoom", "zoom.us.app", "BJ4HAAB9B3"),
+            ("docker-desktop", "Docker.app", "9BNSXJN65R"),
+            ("spotify", "Spotify.app", "2FNC3A47ZF"),
+            ("postman", "Postman.app", "H7H8Q7M5CK"),
+            ("github", "GitHub Desktop.app", "VEKTX9H2N7"),
+            ("obs", "OBS.app", "2MMRE5MTB8"),
+        ];
+        let tokens: Vec<String> = casks.iter().map(|(t, ..)| (*t).to_string()).collect();
+        let cached = cached_downloads(&tokens);
+        eprintln!("{} of {} in the cache", cached.len(), casks.len());
+        for (token, app, team) in casks {
+            let Some(path) = cached.get(token) else {
+                continue;
+            };
+            let started = Instant::now();
+            let incoming = inspect_download(path, app);
+            eprintln!(
+                "{token}: {incoming:?} in {}ms",
+                crate::process::elapsed_ms(started)
+            );
+            assert_eq!(incoming, Incoming::Signed(team.into()), "{token}");
+        }
+    }
+
     // Real I/O: mounts the cached Discord DMG (if present) and reads its signer. Same-publisher
     // vs the installed Discord → allowed; compared against Slack's Team ID → blocked.
     //   cargo test -- --ignored real_dmg
     #[test]
     #[ignore = "mounts a real cached download; needs Discord installed and its update fetched"]
     fn real_dmg_preinstall_check() {
-        let dmg = cached_download("discord").expect("run `brew fetch --cask discord` first");
+        let dmg = cached_downloads(&["discord".to_string()])
+            .remove("discord")
+            .expect("run `brew fetch --cask discord` first");
         let started = Instant::now();
         let incoming = inspect_download(&dmg, "Discord.app");
         eprintln!(
             "inspected {} in {}ms: {incoming:?}",
             dmg.display(),
-            crate::elapsed_ms(started)
+            crate::process::elapsed_ms(started)
         );
         let Incoming::Signed(new_team) = &incoming else {
             panic!("expected a signed download")
         };
 
-        let discord = crate::read_signer(Path::new("/Applications/Discord.app"));
+        let discord = crate::signing::read_signer(Path::new("/Applications/Discord.app"));
         let same = decide(
             "discord",
             &discord,
             discord.team.as_deref(),
+            None,
             Incoming::Signed(new_team.clone()),
         );
         assert_eq!(same, Verdict::Allowed { note: None });
 
-        let slack = crate::read_signer(Path::new("/Applications/Slack.app"));
+        let slack = crate::signing::read_signer(Path::new("/Applications/Slack.app"));
         let other = decide(
             "discord",
             &slack,
             slack.team.as_deref(),
+            None,
             Incoming::Signed(new_team.clone()),
         );
         eprintln!("{other:?}");

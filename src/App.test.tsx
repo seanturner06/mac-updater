@@ -8,7 +8,7 @@ import { clearMocks, mockIPC } from "@tauri-apps/api/mocks";
 import { emit } from "@tauri-apps/api/event";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
-import { SHORTCUTS, THEMES, type CategoryStatus, type TrayState, type UpdateResult } from "./logic";
+import { SHORTCUTS, THEMES, formatClock, uses12HourClock, type CategoryStatus, type Selection, type TrayState, type UpdateResult } from "./logic";
 
 const item = (id: string, current: string, latest: string, name = id) => ({
   id,
@@ -39,7 +39,17 @@ type Call = { cmd: string; args: Record<string, unknown> };
 
 // The fake backend. `options` changes what it reports; `calls` records every command.
 let calls: Call[];
-let options: { notifyOnly: boolean; checkVulns: boolean; holdUpdates: boolean };
+let options: {
+  notifyOnly: boolean;
+  checkVulns: boolean;
+  holdUpdates: boolean;
+  // Answers for the next check_outdated calls, in order (then back to CATEGORIES).
+  checks: Promise<CategoryStatus[]>[];
+  // finished_at of the last scheduled run the backend reports, if any.
+  lastRunAt: number | null;
+  // Fields to put on every update result (e.g. a failure with a follow-up action).
+  resultOverride?: Partial<UpdateResult>;
+};
 let releaseUpdate: ((r: UpdateResult[]) => void) | null;
 
 function installBackend() {
@@ -51,7 +61,7 @@ function installBackend() {
       calls.push({ cmd, args });
       switch (cmd) {
         case "check_outdated":
-          return CATEGORIES;
+          return options.checks.shift() ?? CATEGORIES;
         case "check_sparkle_apps":
           return { category: "Other apps", kind: "sparkle", items: [], error: null };
         case "get_settings":
@@ -66,15 +76,30 @@ function installBackend() {
         case "get_schedule":
           return { installed: false, hour: 10, minute: 0 };
         case "get_scheduled_state":
-          return { running: false, last: null };
+          return {
+            running: false,
+            last:
+              options.lastRunAt === null
+                ? null
+                : {
+                    finished_at: options.lastRunAt,
+                    notify_only: false,
+                    available: 0,
+                    updated: [],
+                    needs_admin: [],
+                    failed: [],
+                    signer_changed: [],
+                  },
+          };
         case "run_selected_updates": {
-          const selections = args.selections as { kind: string; id: string; name: string }[];
+          const selections = args.selections as Selection[];
           const results: UpdateResult[] = selections.map((s) => ({
             kind: s.kind,
             name: s.name,
             success: true,
             output: `==> Upgrading ${s.id}`,
             elapsed_ms: 1000,
+            ...options.resultOverride,
           }));
           if (!options.holdUpdates) return results;
           return new Promise<UpdateResult[]>((resolve) => {
@@ -141,7 +166,7 @@ beforeAll(() => {
 });
 
 beforeEach(() => {
-  options = { notifyOnly: false, checkVulns: false, holdUpdates: false };
+  options = { notifyOnly: false, checkVulns: false, holdUpdates: false, checks: [], lastRunAt: null };
   localStorage.clear();
   delete document.documentElement.dataset.theme;
   installBackend();
@@ -399,6 +424,21 @@ describe("keyboard: actions", () => {
     expect(callsOf("run_selected_updates")[0].args.selections).toEqual([{ kind: "brew", id: "git", name: "git" }]);
   });
 
+  it("an app macOS wouldn't let Freshet change offers to open App Management", async () => {
+    options.resultOverride = {
+      success: false,
+      output: "macOS didn't let Freshet change Postman.app",
+      action: { type: "allow_app_management", app: "Postman.app" },
+    };
+    const user = await setup();
+    await user.keyboard("{ArrowDown}{ArrowRight}{ArrowDown}{ArrowDown} ");
+    await user.keyboard("{Meta>}{Enter}{/Meta}");
+    expect(await screen.findByText("Turn Freshet on there so it can update Postman.")).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Open App Management" }));
+    await waitFor(() => expect(callsOf("open_app_management_settings")).toHaveLength(1));
+    expect(await screen.findByText("Opened System Settings. Turn Freshet on, then try again.")).toBeTruthy();
+  });
+
   it("⌘↩ with nothing selected updates everything shown", async () => {
     const user = await setup();
     await user.keyboard("{Meta>}{Enter}{/Meta}");
@@ -451,6 +491,23 @@ describe("keyboard: actions", () => {
     expect(nothingHighlighted()).toBe(true);
     await user.keyboard("{Escape}");
     expect(screen.queryByText("Appearance")).toBeNull();
+  });
+
+  it("the header mark is the app's drop, with the update chevron while updates wait", async () => {
+    await setup();
+    const mark = screen.getByRole("img", { name: "Updates available" });
+    expect(mark.querySelector(".status-chevron")).not.toBeNull();
+  });
+
+  it("an open panel takes the whole window, however short the list is", async () => {
+    const user = await setup();
+    const app = document.querySelector(".app")!;
+    expect(app.classList.contains("panel-open")).toBe(false);
+    await user.keyboard("{Meta>},{/Meta}");
+    await screen.findByText("Appearance");
+    expect(app.classList.contains("panel-open")).toBe(true);
+    await user.keyboard("{Escape}");
+    expect(app.classList.contains("panel-open")).toBe(false);
   });
 
   it("? lists every shortcut; the list underneath doesn't move; Esc closes it", async () => {
@@ -708,5 +765,149 @@ describe("theme picker", () => {
     localStorage.setItem("freshet.theme", "ink");
     await openAppearance();
     expect(screen.getByRole("radio", { name: "Ink & Gold" }).getAttribute("aria-checked")).toBe("true");
+  });
+});
+
+describe("checking again in the background", () => {
+  it("keeps what's ticked when the list is refreshed", async () => {
+    const user = await setup();
+    await user.keyboard("{ArrowDown}{ArrowRight}{ArrowDown}{ArrowDown}");
+    await user.keyboard(" ");
+    expect(screen.getByRole("button", { name: "Update 1 selected" })).toBeTruthy();
+    act(() => {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "r", metaKey: true, cancelable: true }));
+    });
+    await waitFor(() => expect(callsOf("check_outdated")).toHaveLength(2));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Update 1 selected" })).toBeTruthy());
+    expect(screen.getByLabelText<HTMLInputElement>("Select git").checked).toBe(true);
+  });
+
+  it("drops a ticked item that is no longer on the list", async () => {
+    const user = await setup();
+    await user.keyboard("{ArrowDown}{ArrowRight}{ArrowDown}{ArrowDown}");
+    await user.keyboard(" ");
+    // git was updated elsewhere: the next check no longer lists it.
+    options.checks = [
+      Promise.resolve([{ ...CATEGORIES[0], items: [CATEGORIES[0].items[0]] }, ...CATEGORIES.slice(1)]),
+    ];
+    act(() => {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "r", metaKey: true, cancelable: true }));
+    });
+    await waitFor(() => expect(screen.queryByLabelText("Select git")).toBeNull());
+    expect(screen.getByRole("button", { name: /^Update all/ })).toBeTruthy();
+  });
+
+  // The 10-minute timer behind the 3-hourly refresh: set up once, not on every render (when it
+  // was, each re-render restarted it and it never fired), and it does check once the list is old.
+  it("the periodic refresh timer survives re-renders and fires", async () => {
+    const setInterval = vi.spyOn(window, "setInterval");
+    const user = await setup();
+    await user.keyboard("{ArrowDown}{ArrowDown}{ArrowUp}");
+    const timers = setInterval.mock.calls.filter(([, ms]) => ms === 10 * 60_000);
+    expect(timers, "one timer, however often the window re-renders").toHaveLength(1);
+    await waitFor(() => expect(callsOf("check_outdated")).toHaveLength(1));
+
+    const tick = timers[0][0] as () => void;
+    act(() => tick());
+    expect(callsOf("check_outdated"), "a fresh list is left alone").toHaveLength(1);
+
+    const fourHoursOn = Date.now() + 4 * 3_600_000;
+    vi.spyOn(Date, "now").mockReturnValue(fourHoursOn);
+    vi.useFakeTimers({ toFake: ["Date"], now: fourHoursOn });
+    try {
+      act(() => tick());
+    } finally {
+      vi.useRealTimers();
+    }
+    await waitFor(() => expect(callsOf("check_outdated")).toHaveLength(2));
+  });
+
+  // Two checks in flight (two scheduled runs noticed in a row): the older one answers last, and
+  // must not put its out-of-date list back on screen.
+  it("an older check that answers late doesn't overwrite a newer one", async () => {
+    await setup();
+    const noticeScheduledRun = async (finishedAt: number, expectedChecks: number) => {
+      options.lastRunAt = finishedAt;
+      act(() => {
+        window.dispatchEvent(new Event("focus"));
+      });
+      await waitFor(() => expect(callsOf("check_outdated")).toHaveLength(expectedChecks));
+    };
+    let answerOlder: (c: CategoryStatus[]) => void = () => undefined;
+    let answerNewer: (c: CategoryStatus[]) => void = () => undefined;
+    options.checks = [
+      new Promise<CategoryStatus[]>((resolve) => (answerOlder = resolve)),
+      new Promise<CategoryStatus[]>((resolve) => (answerNewer = resolve)),
+    ];
+    await noticeScheduledRun(100, 1); // the first run seen is only remembered
+    await noticeScheduledRun(200, 2);
+    await noticeScheduledRun(300, 3);
+
+    const afterUpdates = [{ ...CATEGORIES[0], items: [CATEGORIES[0].items[1]] }];
+    await act(async () => {
+      answerNewer(afterUpdates);
+      await Promise.resolve();
+    });
+    await screen.findByText("1 update available");
+    await act(async () => {
+      answerOlder(CATEGORIES);
+      await Promise.resolve();
+    });
+    expect(screen.getByText("1 update available")).toBeTruthy();
+  });
+});
+
+describe("schedule time picker", () => {
+  const openSettings = async () => {
+    await setup();
+    act(() => {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: ",", metaKey: true, cancelable: true }));
+    });
+    return screen.findByLabelText<HTMLSelectElement>("Hour");
+  };
+  const optionTexts = (select: HTMLSelectElement) => [...select.options].map((o) => o.textContent);
+
+  // The picker reads in the order the time is said — hour, minute, AM/PM — like the "10:00 AM"
+  // beside it. The hour menu used to say "10 AM" itself, so it read "10 AM : 00".
+  it("reads hour : minute then AM/PM, matching the time shown beside it", async () => {
+    const hour = await openSettings();
+    const minute = screen.getByLabelText<HTMLSelectElement>("Minute");
+    expect(screen.getByText(`Time · ${formatClock(10, 0)}`)).toBeTruthy();
+    expect(optionTexts(hour).every((t) => /^\d+$/.test(t ?? "")), "hours are just numbers").toBe(true);
+    expect(minute.value).toBe("0");
+    if (uses12HourClock()) {
+      const period = screen.getByLabelText<HTMLSelectElement>("AM or PM");
+      expect(optionTexts(hour)).toEqual(["12", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11"]);
+      expect(hour.value).toBe("10");
+      expect(period.value).toBe("am");
+      // In reading order: hour, then minute, then AM/PM.
+      const order = [...document.querySelectorAll(".time-select select")].map((s) => s.getAttribute("aria-label"));
+      expect(order).toEqual(["Hour", "Minute", "AM or PM"]);
+    } else {
+      expect(screen.queryByLabelText("AM or PM")).toBeNull();
+      expect(optionTexts(hour)).toHaveLength(24);
+      expect(hour.value).toBe("10");
+    }
+  });
+
+  it("choosing hour, minute and AM/PM sets the time it shows", async () => {
+    const hour = await openSettings();
+    const user = userEvent.setup();
+    if (uses12HourClock()) {
+      await user.selectOptions(hour, "2");
+      await user.selectOptions(screen.getByLabelText("Minute"), "45");
+      await user.selectOptions(screen.getByLabelText("AM or PM"), "pm");
+    } else {
+      await user.selectOptions(hour, "14");
+      await user.selectOptions(screen.getByLabelText("Minute"), "45");
+    }
+    expect(screen.getByText(`Time · ${formatClock(14, 45)}`)).toBeTruthy();
+    // Midnight and noon, the two that trip 12-hour arithmetic.
+    if (uses12HourClock()) {
+      await user.selectOptions(screen.getByLabelText("Hour"), "12");
+      expect(screen.getByText(`Time · ${formatClock(12, 45)}`)).toBeTruthy();
+      await user.selectOptions(screen.getByLabelText("AM or PM"), "am");
+      expect(screen.getByText(`Time · ${formatClock(0, 45)}`)).toBeTruthy();
+    }
   });
 });

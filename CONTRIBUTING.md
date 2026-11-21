@@ -78,7 +78,7 @@ This is the core convention. Every decision lives in a function that takes value
 values, with no process spawning, no filesystem, no network — and every one of those functions
 has tests.
 
-**Rust** (`src-tauri/src/main.rs`) is three layers:
+**Rust** (`src-tauri/src/`, one module per concern; see `docs/04-backend.md`) is three layers:
 
 ```
 Layer 3  #[tauri::command]              thin: spawn_blocking + a safe fallback
@@ -222,8 +222,8 @@ unwind:
   hard part, and the answer must not involve hand-curated data.
 - **Anything that downloads or runs an artifact.** See above.
 - **A new dependency**, particularly in Rust. The tree is deliberately tiny.
-- **Splitting `main.rs` into modules.** Worth doing eventually, but as a mechanical move with no
-  behaviour change, in its own commit — not bundled into a feature.
+- **Moving code between modules.** As a mechanical move with no behaviour change, in its own
+  commit — not bundled into a feature.
 
 ## Things that are out of scope
 

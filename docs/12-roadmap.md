@@ -109,8 +109,7 @@ binary. See [08 — Scheduling](08-scheduling.md).
   already runs.
 - **Absolute paths for system tools** — `/usr/bin/codesign`, `/usr/bin/curl`, `/usr/bin/spctl`,
   `/usr/bin/defaults`, `/bin/launchctl`. Cheap hardening against `PATH` manipulation.
-- **Split `main.rs`** into modules — when a second contributor is regularly editing a different
-  concern, not before. Seams identified in [04 — Backend](04-backend.md).
+- ~~**Split `main.rs`** into modules.~~ **Done 2026-11-14**; layout in [04 — Backend](04-backend.md).
 - **Overlay accessibility** — `Escape` to close, focus trap, `aria-modal`, `aria-label` coverage.
   Small, well-defined, and a good first contribution.
 - **Light mode.** The token structure supports it; see

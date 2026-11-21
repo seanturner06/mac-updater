@@ -1,5 +1,11 @@
 // Pure UI logic, extracted so it can be unit-tested without rendering React.
 
+// What a row is, and so how it's checked and updated (Rust `Kind`): a Homebrew formula, a
+// Homebrew cask, a Mac App Store app, a global npm package, or an app with its own Sparkle
+// updater. A union rather than `string`, so a misspelt kind is a type error, not a comparison
+// that never matches.
+export type Kind = "brew" | "cask" | "mas" | "npm" | "sparkle";
+
 export type OutdatedItem = {
   id: string;
   name: string;
@@ -11,15 +17,15 @@ export type OutdatedItem = {
 
 export type CategoryStatus = {
   category: string;
-  kind: string;
+  kind: Kind;
   items: OutdatedItem[];
   error: string | null;
 };
 
-export const selKey = (kind: string, id: string) => `${kind}::${id}`;
+export const selKey = (kind: Kind, id: string) => `${kind}::${id}`;
 
 // Keyed by version too, so skipping a version auto-clears when a newer one ships.
-export const ignoreKey = (kind: string, id: string, latest: string) => `${kind}::${id}::${latest}`;
+export const ignoreKey = (kind: Kind, id: string, latest: string) => `${kind}::${id}::${latest}`;
 
 // Self-updating casks are hidden unless the "include self-updating apps" (greedy) toggle is on.
 export function visibleItems(cat: CategoryStatus, greedy: boolean): OutdatedItem[] {
@@ -38,7 +44,7 @@ export function displayItems(
 }
 
 // A row is read-only (no checkbox, not updatable from here) for Sparkle apps, or in notify-only mode.
-export function isReadOnly(kind: string, notifyOnly: boolean): boolean {
+export function isReadOnly(kind: Kind, notifyOnly: boolean): boolean {
   return kind === "sparkle" || notifyOnly;
 }
 
@@ -50,7 +56,7 @@ export function countDisplayed(
   return categories.reduce((sum, c) => sum + displayItems(c, greedy, ignored).length, 0);
 }
 
-export type Selection = { kind: string; id: string; name: string };
+export type Selection = { kind: Kind; id: string; name: string };
 
 // Every displayed, updatable item as a Selection — what "Update all" actually runs. Read-only
 // kinds (sparkle) are excluded, as are skipped versions and (unless greedy) self-updating casks,
@@ -70,7 +76,7 @@ export function allDisplayedSelections(
 // Toggle one item in the selection map (pure — returns a new map).
 export function toggleSelected(
   selected: Record<string, Selection>,
-  kind: string,
+  kind: Kind,
   id: string,
   name: string
 ): Record<string, Selection> {
@@ -84,7 +90,7 @@ export function toggleSelected(
 // Select all of `items` for a category, or clear them if they're already all selected.
 export function toggleCategorySelected(
   selected: Record<string, Selection>,
-  kind: string,
+  kind: Kind,
   items: OutdatedItem[]
 ): Record<string, Selection> {
   const keys = items.map((i) => selKey(kind, i.id));
@@ -107,6 +113,18 @@ export function prunedSelfUpdating(
     })
   );
   return next;
+}
+
+// The selection after a fresh check: whatever is still on the list stays selected. A background
+// refresh (the window regaining focus, a scheduled run ending) must not undo the ticks the user
+// is in the middle of making; items that are gone (updated, or no longer outdated) drop out.
+export function keepSelection(
+  selected: Record<string, Selection>,
+  categories: CategoryStatus[]
+): Record<string, Selection> {
+  const present = new Set(categories.flatMap((c) => c.items.map((i) => selKey(c.kind, i.id))));
+  const kept = Object.entries(selected).filter(([key]) => present.has(key));
+  return kept.length === Object.keys(selected).length ? selected : Object.fromEntries(kept);
 }
 
 // Settings shared with the backend (~/.freshet/settings.json) so the scheduled run honours them.
@@ -148,8 +166,11 @@ export type ScheduledRunSummary = {
   needs_admin: string[];
   failed: string[];
   signer_changed: string[];
-  // Formula bottles Homebrew refused because their build provenance didn't verify.
+  // Refused before install by a safety check other than a changed signer: a formula's build
+  // provenance, or a cask download that is unsigned, forged or (for a pinned app) uncheckable.
   blocked?: string[];
+  // Left alone because the app was open; a later run picks them up. Not a failure.
+  skipped_open?: string[];
 };
 
 const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
@@ -163,12 +184,13 @@ export function lastRunText(s: ScheduledRunSummary): string {
   }
   const parts: string[] = [];
   if (s.signer_changed.length > 0) parts.push(`signer changed: ${s.signer_changed.join(", ")}`);
-  if (s.blocked && s.blocked.length > 0) parts.push(`blocked (failed build verification): ${s.blocked.join(", ")}`);
+  if (s.blocked && s.blocked.length > 0) parts.push(`blocked before install: ${s.blocked.join(", ")}`);
   if (s.updated.length > 0) parts.push(`${s.updated.length} updated`);
   if (s.needs_admin.length > 0) {
     parts.push(`${plural(s.needs_admin.length, "needs", "need")} your password: ${s.needs_admin.join(", ")}`);
   }
   if (s.failed.length > 0) parts.push(`${s.failed.length} failed`);
+  if (s.skipped_open && s.skipped_open.length > 0) parts.push(`skipped (open): ${s.skipped_open.join(", ")}`);
   return parts.length > 0 ? parts.join(" · ") : "up to date";
 }
 
@@ -216,7 +238,7 @@ export function versionBump(current: string, latest: string): Bump | null {
 // Formulae the user asked for vs. ones only installed to satisfy them. Until details load,
 // everything counts as primary so nothing is hidden.
 export function splitDependencies(
-  kind: string,
+  kind: Kind,
   items: OutdatedItem[],
   details: Partial<Record<string, PackageInfo>>
 ): { primary: OutdatedItem[]; deps: OutdatedItem[] } {
@@ -227,7 +249,7 @@ export function splitDependencies(
 // The .app bundle whose icon represents a row: a cask's declared app, or for App Store and
 // Sparkle apps the app's own name. Formulae and npm packages have none.
 export function iconAppName(
-  kind: string,
+  kind: Kind,
   item: OutdatedItem,
   details: Partial<Record<string, PackageInfo>>
 ): string | null {
@@ -239,7 +261,7 @@ export function iconAppName(
   return null;
 }
 
-const KIND_BLURB: Record<string, string> = {
+const KIND_BLURB: Record<Kind, string> = {
   brew: "command-line tools & libraries",
   cask: "apps installed with Homebrew",
   mas: "Mac App Store",
@@ -249,14 +271,14 @@ const KIND_BLURB: Record<string, string> = {
 
 // The line under a category name: what it is, then what's notable about its updates.
 export function categorySummary(
-  kind: string,
+  kind: Kind,
   items: OutdatedItem[],
   details: Partial<Record<string, PackageInfo>>
 ): string {
   const parts: string[] = [];
   const { primary, deps } = splitDependencies(kind, items, details);
   if (deps.length > 0) parts.push(`${primary.length} yours · ${deps.length} ${deps.length === 1 ? "dependency" : "dependencies"}`);
-  else parts.push(KIND_BLURB[kind] ?? "");
+  else parts.push(KIND_BLURB[kind]);
   const majors = items.filter((i) => versionBump(i.current, i.latest) === "major").length;
   if (majors > 0) parts.push(`${majors} major`);
   return parts.filter(Boolean).join(" · ");
@@ -297,11 +319,12 @@ export function parseSkipped(keys: Iterable<string>): SkippedVersion[] {
 export type ResultAction =
   | { type: "trust_signer"; bundle_id: string; team: string }
   | { type: "rollback"; token: string }
-  | { type: "quit_and_update"; kind: string; id: string; name: string; app: string }
-  | { type: "allow_npm_scripts"; name: string; version: string; scripts: string };
+  | { type: "quit_and_update"; kind: Kind; id: string; name: string; app: string }
+  | { type: "allow_npm_scripts"; name: string; version: string; scripts: string }
+  | { type: "allow_app_management"; app: string };
 
 export type UpdateResult = {
-  kind: string;
+  kind: Kind | "verify";
   name: string;
   success: boolean;
   output: string;
@@ -309,6 +332,8 @@ export type UpdateResult = {
   elapsed_ms?: number;
   // Deliberately not attempted (app was open, or the run was stopped).
   skipped?: boolean;
+  // Refused by the pre-install publisher check (a safety block, not an ordinary failure).
+  blocked?: boolean;
   steps?: Step[];
 };
 
@@ -430,7 +455,8 @@ export function formatElapsed(ms: number): string {
 export type TrayState = { count: number; attention: boolean; running: boolean; done: number; total: number };
 
 // Something the user should look at, beyond "updates are available": a known vulnerability in an
-// installed npm package, a publisher change waiting in the results, or a scheduled run that
+// installed npm package, a publisher change (or any other pre-install block) waiting in the
+// results, or a scheduled run that
 // failed, was blocked or found a publisher change. Pure.
 export function needsAttention(o: {
   vulns: Record<string, VulnReport>;
@@ -439,7 +465,7 @@ export function needsAttention(o: {
   results: UpdateResult[] | null;
 }): boolean {
   const vulnerable = o.checkVulns && Object.values(o.vulns).some((v) => v.current.length > 0);
-  const signer = (o.results ?? []).some((r) => r.action?.type === "trust_signer");
+  const signer = (o.results ?? []).some((r) => r.action?.type === "trust_signer" || r.blocked === true);
   const run = o.lastRun;
   const runProblem =
     run !== null && (run.failed.length > 0 || run.signer_changed.length > 0 || (run.blocked ?? []).length > 0);
@@ -581,7 +607,7 @@ export function routeKey(action: KeyAction, c: KeyContext): { cmd: KeyCommand; p
 // row. Each navigable element carries data-nav-id: "cat:<section>" or "row:<kind>::<id>".
 
 export const catNavId = (category: string) => `cat:${category}`;
-export const rowNavId = (kind: string, id: string) => `row:${selKey(kind, id)}`;
+export const rowNavId = (kind: Kind, id: string) => `row:${selKey(kind, id)}`;
 
 export type NavTarget = { type: "cat"; cat: string } | { type: "row"; key: string };
 
@@ -626,7 +652,7 @@ export function matchText(n: number): string {
 export type Theme = { id: string; name: string; note: string; swatch: [string, string, string] };
 
 export const THEMES: Theme[] = [
-  { id: "noir", name: "Gothic Noir", note: "Black, silver, mauve", swatch: ["#040303", "#5e5050", "#b6a0a0"] },
+  { id: "noir", name: "Gothic Noir", note: "Black, silver, mauve", swatch: ["#040303", "#5e5050", "#d4a5a5"] },
   { id: "cobalt", name: "Cobalt Sky", note: "Navy, cobalt, sky blue", swatch: ["#090c1e", "#0047ab", "#82c8e5"] },
   { id: "obsidian", name: "Obsidian", note: "Near-black, electric blue", swatch: ["#0f1116", "#1d2a44", "#5b9eff"] },
   { id: "sage", name: "Sage & Stone", note: "Warm charcoal, sage", swatch: ["#1a1a18", "#3a4033", "#9caf88"] },
@@ -691,7 +717,7 @@ export const OUTCOME_LABEL: Record<HistoryEntry["outcome"], string> = {
   updated: "updated",
   failed: "failed",
   needs_admin: "needed password",
-  blocked: "blocked: publisher changed",
+  blocked: "blocked before install",
   skipped_open: "skipped: app was open",
 };
 
@@ -704,9 +730,39 @@ export function formatClock(hour: number, minute: number): string {
   return new Date(2000, 0, 1, hour, minute).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
 }
 
-// The hour alone in the same format, for the picker: "2 PM" or "14".
-export function hourLabel(hour: number): string {
-  return new Date(2000, 0, 1, hour).toLocaleTimeString([], { hour: "numeric" });
+// --- The schedule's time picker ---
+// Laid out the way the time is read: hour, minute, then AM/PM — "2 : 45 PM", matching the
+// "2:45 PM" shown beside it. (The hour menu used to carry the AM/PM itself, so the picker read
+// "2 PM : 45".) On a 24-hour clock there is no AM/PM menu and the hours run 00–23.
+
+// Whether this user's clock is 12-hour ("2:45 PM") or 24-hour ("14:45"), from their locale.
+export function uses12HourClock(locale?: string): boolean {
+  return new Intl.DateTimeFormat(locale, { hour: "numeric" }).resolvedOptions().hour12 ?? false;
+}
+
+// A 24-hour hour as the 12-hour picker shows it: 0 → 12 AM, 14 → 2 PM. Pure.
+export function splitHour(hour: number): { hour12: number; pm: boolean } {
+  return { hour12: hour % 12 === 0 ? 12 : hour % 12, pm: hour >= 12 };
+}
+
+// And back: 12 AM → 0, 2 PM → 14, 12 PM → 12. Pure.
+export function joinHour(hour12: number, pm: boolean): number {
+  return (hour12 % 12) + (pm ? 12 : 0);
+}
+
+// "AM" / "PM" as the user's locale writes them.
+export function dayPeriodLabel(pm: boolean, locale?: string): string {
+  const parts = new Intl.DateTimeFormat(locale, { hour: "numeric", hour12: true }).formatToParts(
+    new Date(2000, 0, 1, pm ? 15 : 9)
+  );
+  return parts.find((p) => p.type === "dayPeriod")?.value ?? (pm ? "PM" : "AM");
+}
+
+// The minute menu: every five minutes, plus the current minute when it isn't one of those (a
+// hand-edited schedule at :07 must still show as :07, not as a blank menu). Pure.
+export function minuteOptions(minute: number): number[] {
+  const fives = Array.from({ length: 12 }, (_, i) => i * 5);
+  return fives.includes(minute) ? fives : [...fives, minute].sort((a, b) => a - b);
 }
 
 // Rust `AdoptProgress` ("adopt-progress" events).

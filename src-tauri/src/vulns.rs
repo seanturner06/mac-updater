@@ -128,7 +128,7 @@ fn post_json(url: &str, body: &str) -> Result<String, String> {
 pub(crate) async fn check_vulnerabilities(
     packages: Vec<VulnQuery>,
 ) -> Result<HashMap<String, VulnReport>, String> {
-    if !crate::load_settings()
+    if !crate::settings::load_settings()
         .unwrap_or_default()
         .check_vulnerabilities
     {
@@ -137,7 +137,7 @@ pub(crate) async fn check_vulnerabilities(
     let queries: Vec<VulnQuery> = packages
         .into_iter()
         .filter(|q| {
-            crate::is_valid_npm_package(&q.name)
+            crate::validate::is_valid_npm_package(&q.name)
                 && is_valid_version(&q.current)
                 && is_valid_version(&q.latest)
         })
@@ -152,7 +152,7 @@ pub(crate) async fn check_vulnerabilities(
         let results = parse_batch(&json).ok_or("unexpected response from osv.dev")?;
         tracing::info!(
             packages = queries.len(),
-            elapsed_ms = crate::elapsed_ms(started),
+            elapsed_ms = crate::process::elapsed_ms(started),
             "osv lookup"
         );
         Ok(queries

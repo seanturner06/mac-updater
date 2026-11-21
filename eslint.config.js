@@ -65,6 +65,16 @@ export default tseslint.config(
       "@typescript-eslint/no-dynamic-delete": "off",
     },
   },
+  // The demo film's page script runs in the browser, and its Vite config in Node. Neither is
+  // type-checked (plain JS outside the app), but both are linted with the right globals.
+  {
+    files: ["demo/**/*.js"],
+    languageOptions: { ecmaVersion: 2022, sourceType: "module", globals: globals.browser },
+  },
+  {
+    files: ["demo/**/*.mjs"],
+    languageOptions: { ecmaVersion: 2022, sourceType: "module", globals: globals.node },
+  },
   {
     files: ["src/**/*.test.{ts,tsx}"],
     rules: {

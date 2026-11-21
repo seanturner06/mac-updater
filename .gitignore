@@ -24,3 +24,8 @@ dist-ssr
 *.sw?
 
 .claude
+
+# Demo film renders (frames, binary, video)
+demo/out/
+# Third-party app icons copied from /Applications for the demo; not ours to redistribute
+demo/assets/icons/

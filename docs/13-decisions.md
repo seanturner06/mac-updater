@@ -330,6 +330,9 @@ editing it simultaneously will conflict.
 mechanical move with no behaviour change, in its own commit. Seams are listed in
 [04 — Backend](04-backend.md).
 
+**Superseded 2026-11-14:** the file had grown to ~7,500 lines (a third of it tests) and was split
+into modules, one per concern, tests beside their code. Layout in [04 — Backend](04-backend.md).
+
 ---
 
 ## D21 — Open-source the client

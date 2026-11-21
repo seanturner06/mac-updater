@@ -14,7 +14,7 @@
 // Approving reinstalls that exact version with scripts. Approval is per name@version, so a new
 // release with new scripts asks again.
 
-use crate::{ResultAction, UpdateResult, UpdateSelection};
+use crate::model::{ResultAction, UpdateResult, UpdateSelection};
 
 const INSTALL_SCRIPTS: [&str; 3] = ["preinstall", "install", "postinstall"];
 
@@ -80,7 +80,7 @@ pub(crate) fn is_valid_version(v: &str) -> bool {
 
 fn result(sel: &UpdateSelection, success: bool, output: String) -> UpdateResult {
     UpdateResult {
-        kind: sel.kind.clone(),
+        kind: sel.kind,
         name: sel.name.clone(),
         success,
         output,
@@ -88,6 +88,7 @@ fn result(sel: &UpdateSelection, success: bool, output: String) -> UpdateResult 
         elapsed_ms: None,
         skipped: false,
         steps: Vec::new(),
+        blocked: false,
     }
 }
 
@@ -108,7 +109,7 @@ pub(crate) fn update(
     npm: &str,
 ) -> UpdateResult {
     let name = sel.id.as_str();
-    if !crate::is_valid_npm_package(name) {
+    if !crate::validate::is_valid_npm_package(name) {
         return result(sel, false, format!("invalid npm package name {name:?}"));
     }
     let Some(version) = version.filter(|v| is_valid_version(v)) else {
@@ -124,7 +125,7 @@ pub(crate) fn update(
 
     if !allowed {
         // What the registry says this exact version runs at install time.
-        let declared = crate::run_cmd(npm, &["view", &spec, "scripts", "--json"])
+        let declared = crate::process::run_cmd(npm, &["view", &spec, "scripts", "--json"])
             .map_or_default(|json| parse_install_scripts(&json));
         if !declared.is_empty() {
             let listed: Vec<String> = declared
@@ -151,9 +152,9 @@ pub(crate) fn update(
     let args = install_args(&spec, allowed);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let started = std::time::Instant::now();
-    let (success, mut output) = crate::run_update_cmd(npm, &arg_refs);
+    let (success, mut output) = crate::process::run_update_cmd(npm, &arg_refs);
     let mut r = UpdateResult {
-        elapsed_ms: Some(crate::elapsed_ms(started)),
+        elapsed_ms: Some(crate::process::elapsed_ms(started)),
         ..result(sel, success, String::new())
     };
 
@@ -164,7 +165,7 @@ pub(crate) fn update(
             .map(|k| format!(":attr(scripts, [{k}])"))
             .collect::<Vec<_>>()
             .join(", ");
-        let skipped = crate::run_cmd(npm, &["query", "-g", &selector])
+        let skipped = crate::process::run_cmd(npm, &["query", "-g", &selector])
             .map_or_default(|json| skipped_scripts_in(&json, name));
         if !skipped.is_empty() {
             output = format!(
@@ -185,6 +186,7 @@ pub(crate) fn update(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::model::Kind;
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -280,7 +282,7 @@ mod tests {
                 "#!/bin/bash\necho \"$*\" >> '{d}/calls'\ncase \"$1\" in\n  view) cat '{d}/view.json' ;;\n  query) cat '{d}/query.json' ;;\nesac\nexit 0\n",
                 d = dir.display()
             );
-            crate::write_private(&dir.join("npm"), &script, true).unwrap();
+            crate::store::write_private(&dir.join("npm"), &script, true).unwrap();
             Self { dir }
         }
         fn program(&self) -> String {
@@ -303,7 +305,7 @@ mod tests {
 
     fn sel(id: &str) -> UpdateSelection {
         UpdateSelection {
-            kind: "npm".into(),
+            kind: Kind::Npm,
             id: id.into(),
             name: id.into(),
         }
@@ -422,10 +424,10 @@ mod tests {
     #[test]
     #[ignore = "queries the npm registry and the real global install"]
     fn npm_live_scripts_visible_before_and_after() {
-        let latest = crate::run_cmd("npm", &["view", "pnpm", "version"]).unwrap();
+        let latest = crate::process::run_cmd("npm", &["view", "pnpm", "version"]).unwrap();
         let spec = format!("pnpm@{}", latest.trim());
         let declared = parse_install_scripts(
-            &crate::run_cmd("npm", &["view", &spec, "scripts", "--json"]).unwrap(),
+            &crate::process::run_cmd("npm", &["view", &spec, "scripts", "--json"]).unwrap(),
         );
         eprintln!("{spec} declares: {declared:?}");
         assert!(
@@ -435,7 +437,7 @@ mod tests {
         let selector = INSTALL_SCRIPTS
             .map(|k| format!(":attr(scripts, [{k}])"))
             .join(", ");
-        let query = crate::run_cmd("npm", &["query", "-g", &selector]).unwrap();
+        let query = crate::process::run_cmd("npm", &["query", "-g", &selector]).unwrap();
         eprintln!(
             "installed pnpm tree scripts: {:?}",
             skipped_scripts_in(&query, "pnpm")

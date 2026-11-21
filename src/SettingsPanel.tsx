@@ -3,8 +3,12 @@
 import type { ReactNode } from "react";
 import { useEffect, useState } from "react";
 import {
+  dayPeriodLabel,
   formatClock,
-  hourLabel,
+  joinHour,
+  minuteOptions,
+  splitHour,
+  uses12HourClock,
   lastRunText,
   nextRunText,
   parseSkipped,
@@ -294,6 +298,9 @@ export function SettingsPanel(p: SettingsPanelProps) {
     return () => window.clearInterval(timer);
   }, []);
   const skipped = parseSkipped(p.ignored);
+  // The time picker follows the user's clock: "2 : 45 PM" or "14 : 45".
+  const twelveHour = uses12HourClock();
+  const { hour12, pm } = splitHour(p.hour);
   const lastRunNeedsYou =
     p.lastRun !== null &&
     (p.lastRun.failed.length > 0 || p.lastRun.needs_admin.length > 0 || p.lastRun.signer_changed.length > 0);
@@ -350,14 +357,23 @@ export function SettingsPanel(p: SettingsPanelProps) {
             <div className="time-select">
               <select
                 aria-label="Hour"
-                value={p.hour}
-                onChange={(e) => p.onChangeTime(parseInt(e.target.value, 10), p.minute)}
+                value={twelveHour ? hour12 : p.hour}
+                onChange={(e) => {
+                  const h = parseInt(e.target.value, 10);
+                  p.onChangeTime(twelveHour ? joinHour(h, pm) : h, p.minute);
+                }}
               >
-                {Array.from({ length: 24 }, (_, i) => (
-                  <option key={i} value={i}>
-                    {hourLabel(i)}
-                  </option>
-                ))}
+                {twelveHour
+                  ? [12, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11].map((h) => (
+                      <option key={h} value={h}>
+                        {h}
+                      </option>
+                    ))
+                  : Array.from({ length: 24 }, (_, i) => (
+                      <option key={i} value={i}>
+                        {pad(i)}
+                      </option>
+                    ))}
               </select>
               <span className="time-colon">:</span>
               <select
@@ -365,12 +381,23 @@ export function SettingsPanel(p: SettingsPanelProps) {
                 value={p.minute}
                 onChange={(e) => p.onChangeTime(p.hour, parseInt(e.target.value, 10))}
               >
-                {Array.from({ length: 12 }, (_, i) => i * 5).map((m) => (
+                {minuteOptions(p.minute).map((m) => (
                   <option key={m} value={m}>
                     {pad(m)}
                   </option>
                 ))}
               </select>
+              {twelveHour && (
+                <select
+                  aria-label="AM or PM"
+                  className="time-period"
+                  value={pm ? "pm" : "am"}
+                  onChange={(e) => p.onChangeTime(joinHour(hour12, e.target.value === "pm"), p.minute)}
+                >
+                  <option value="am">{dayPeriodLabel(false)}</option>
+                  <option value="pm">{dayPeriodLabel(true)}</option>
+                </select>
+              )}
             </div>
           </div>
 

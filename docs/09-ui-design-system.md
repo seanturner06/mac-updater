@@ -35,6 +35,18 @@ replacing that one block — which is exactly how the palette has been iterated.
 | `--ok` / `--warn` / `--err` | Semantic foregrounds |
 | `--ok-bg` / `--warn-bg` / `--err-bg` / `--err-border` | Their low-alpha surfaces |
 | `--font-display` / `--font-body` / `--font-mono` | Type roles |
+| `--r-sm` / `--r-md` / `--r-lg` | The only corner radii (6 / 8 / 12px), plus `50%` circles and `999px` pills |
+
+### Radii and outlines
+
+Three radii, chosen so nesting works: an outer corner should be the inner corner plus the padding
+between them, so a 12px card holding 8px rows at 6px padding looks concentric. Nine near-identical
+radii (5, 7, 8, 9, 10, 12…) made adjacent corners almost-but-not-quite match, which reads as sloppy.
+
+**Surfaces separate by fill, not outline.** A border is drawn only where it carries meaning: the
+window edge, the filter input, a failed result, a clickable CVE chip, the keyboard cursor.
+Category cards, monograms, badges, the progress card and secondary buttons have no outline. Boxes
+inside outlined boxes inside outlined boxes was the other half of the "busy" feeling.
 
 ### The surface-tinting rule
 
@@ -47,8 +59,17 @@ surfaces carry the palette's tone. `.title` also uses `var(--accent)` globally. 
 older palette needs the same treatment to feel like a theme rather than a button colour.
 
 Current palette — **Gothic Noir**: black `#000000` → bg, brown-gray `#5c4e4e` → surfaces, silver
-`#d1d0d0` → text, mauve-gray `#988686` → accent and dim text. `--err` is a crimson `#c46666`,
-the only colour outside the brand palette, because failure has to be legible as failure.
+`#d1d0d0` → text, mauve-gray `#988686` → dim text. The accent is a lifted, more saturated rose
+`#d4a5a5`: the palette's own mauve as a button fill read as disabled, and the primary action has
+to be the most obvious thing in the window. `--err` is a crimson `#c46666`, the only colour
+outside the brand palette, because failure has to be legible as failure.
+
+**Faint text stays near 4.5:1.** `--text-faint` is the footer, version "from" lines and hints:
+at ~3:1 on near-black, everything read as equally unimportant. Each theme's faint step is
+≈0.5 alpha (Noir 0.78 of its mauve), not 0.4.
+
+The demo film shows Graphite (`FILM_THEME` in `demo/film.html`) and takes its headline gradient,
+glows and key highlights from Graphite's accent; change them together.
 
 Several alternate palettes (Cobalt Sky, Sage & Stone, Slate & Sky, Pine & Mist, Lavender,
 Obsidian & Electric Blue) are recorded as complete token blocks in the project's design notes and
@@ -62,15 +83,20 @@ external requests entirely ([06 — Security](06-security.md)).
 
 | Role | Face | Used for |
 |---|---|---|
-| Display | **Fraunces** (`opsz 144`) | The "Freshet" title, 21px, `--accent` |
-| Body | **Inter Tight** | All UI text, 13px base |
-| Mono | **JetBrains Mono** | Versions, counts, package names, logs |
+| Display | **Fraunces** (`opsz 144`) | The "Freshet" wordmark, 21px, `--accent`. Nothing else |
+| Body | **Inter Tight** | All UI text, 13px base: names, counts, times, panel titles, badges |
+| Mono | **JetBrains Mono** | Version strings, CVE ids, and terminal output (step logs, the live run) |
 
-Instrument Serif is bundled as a kept revert option for the display face.
+**One voice per row.** An earlier pass put all three faces in a single package row (serif
+monogram, sans name, mono version and badge), which read as busy without anyone being able to
+say why. The rules now:
 
-**Mono for identifiers is a functional choice.** Version strings and package names are compared
-character by character (`4.36.140` → `4.36.141`), and proportional digits make that harder.
-Category bodies are mono at 11px for exactly this reason.
+- **The serif is a wordmark, not a type role.** Panel titles ("Update results", "Everything's
+  current") are Inter Tight at 600, not Fraunces.
+- **Mono is for things compared character by character**: `2.37.12_2` → `2.38.5`, CVE ids, and
+  Homebrew's own output. Package names are read, not diffed, so they're sans.
+- **Numbers in sans use `font-variant-numeric: tabular-nums`** (counts, durations, the time
+  picker), which gives aligned digits without switching face.
 
 ### Scale
 
@@ -141,7 +167,7 @@ web page in a frameless box.
 |---|---|
 | Status | A glowing 8px dot: `ok` (accent), `warn`, `idle` (faint), with `box-shadow: 0 0 12px currentColor` |
 | Count per category | A mono pill, `pill-ok` at zero / `pill-warn` above |
-| Version change | `4.36.140` struck through in `--text-faint` → `→` → `4.36.141` in `--warn` |
+| Version change | New version on top in `--text`, `from <old>` under it in `--text-faint`, both mono and never truncated below 16 characters (the lines carry no `overflow`; only the column clips: see `.pkg-ver`) |
 | Disabled | `opacity: 0.4` + `cursor: not-allowed`; the primary button also drops to `--bg-elev` |
 | In-flight rows | `.item-locked` — 0.55 opacity, `not-allowed`, checkbox disabled |
 | Partial selection | A tri-state checkbox with a custom `:indeterminate` dash |

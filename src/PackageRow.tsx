@@ -1,12 +1,12 @@
 // One outdated package in the main list: icon, name + description, version change, and an
 // expandable detail card explaining what it is before you update it.
 import { invoke } from "@tauri-apps/api/core";
-import { versionBump, type OutdatedItem, type PackageInfo, type VulnReport } from "./logic";
+import { versionBump, type Kind, type OutdatedItem, type PackageInfo, type VulnReport } from "./logic";
 
 const openUrl = (url: string) => void invoke("open_url", { url });
 
 // Category glyphs, drawn at 16px on a 16-unit grid with the same stroke weight as the header icons.
-export function KindIcon({ kind }: { kind: string }) {
+export function KindIcon({ kind }: { kind: Kind }) {
   const common = {
     viewBox: "0 0 16 16",
     width: 16,
@@ -75,7 +75,7 @@ function PackageIcon({ name, icon, dim }: { name: string; icon?: string | null; 
 }
 
 type RowProps = {
-  kind: string;
+  kind: Kind;
   item: OutdatedItem;
   info?: PackageInfo;
   vuln?: VulnReport;
@@ -199,7 +199,7 @@ function PackageDetail({
   bump,
   onSkip,
 }: {
-  kind: string;
+  kind: Kind;
   item: OutdatedItem;
   info?: PackageInfo;
   vuln?: VulnReport;

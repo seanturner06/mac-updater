@@ -107,7 +107,8 @@ a known UX gap for long batches; see [12 — Roadmap](12-roadmap.md).
 
 ## Backend layering
 
-`src-tauri/src/main.rs` is one file, but it is three strictly separated layers. This separation
+`src-tauri/src/` is split into modules by concern ([04 — Backend](04-backend.md)), and within
+each the code is three strictly separated layers. This separation
 is the project's primary testing strategy, not an aesthetic preference.
 
 ```
@@ -246,7 +247,5 @@ freshet.app. It is not part of the app build and is excluded from ESLint.
   until it completes.
 - **`plist_path()` and `script_path()` call `.expect("home dir")`** and will panic on a machine
   with no resolvable home directory. Everything else in the codebase degrades gracefully.
-- **The header comment in `main.rs` names `run_updates`**, a command that no longer exists; the
-  real one is `run_selected_updates`.
 - **`is_valid_cask_token` is also used to validate brew *formula* names.** The rule set happens to
   be correct for both, but the name misleads.

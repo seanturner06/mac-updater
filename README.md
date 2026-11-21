@@ -29,7 +29,7 @@ The full audit write-up lives in [`tests/security-audit.txt`](tests/security-aud
 
 ## Architecture
 
-- **Backend** — Rust + Tauri 2 ([`src-tauri/src/main.rs`](src-tauri/src/main.rs)). Every parser and validator is a pure function (no I/O) with unit tests grounded in real CLI output; thin command wrappers do the process spawning. Checks run concurrently; the network-bound Sparkle scan is a separate command so a slow appcast can't stall the local results.
+- **Backend** — Rust + Tauri 2 ([`src-tauri/src/`](src-tauri/src), one module per concern). Every parser and validator is a pure function (no I/O) with unit tests grounded in real CLI output; thin command wrappers do the process spawning. Checks run concurrently; the network-bound Sparkle scan is a separate command so a slow appcast can't stall the local results.
 - **Frontend** — React 19 + TypeScript ([`src/App.tsx`](src/App.tsx)). UI decision logic is extracted into [`src/logic.ts`](src/logic.ts) as pure functions, tested with Vitest without rendering.
 - **Why Tauri** — a menu-bar utility should be small and native-feeling; the webview ships with macOS and the backend is a single static binary.
 

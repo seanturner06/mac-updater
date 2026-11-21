@@ -17,6 +17,7 @@ function actionLabel(a: ResultAction): string {
   if (a.type === "trust_signer") return "Trust new publisher";
   if (a.type === "quit_and_update") return `Quit & update`;
   if (a.type === "allow_npm_scripts") return "Allow install scripts";
+  if (a.type === "allow_app_management") return "Open App Management";
   return "Roll back";
 }
 
@@ -24,6 +25,7 @@ function busyLabel(a: ResultAction): string {
   if (a.type === "trust_signer") return "Trusting…";
   if (a.type === "quit_and_update") return "Quitting & updating…";
   if (a.type === "allow_npm_scripts") return "Installing…";
+  if (a.type === "allow_app_management") return "Opening…";
   return "Restoring…";
 }
 
@@ -32,6 +34,7 @@ function actionHint(a: ResultAction): string {
   if (a.type === "quit_and_update") return `${a.app.replace(/\.app$/, "")} will be asked to quit, as with ⌘Q.`;
   if (a.type === "allow_npm_scripts")
     return `Only if you trust ${a.name} ${a.version}: its scripts run with your account's full access.`;
+  if (a.type === "allow_app_management") return `Turn Freshet on there so it can update ${a.app.replace(/\.app$/, "")}.`;
   return "The previous version was saved before updating.";
 }
 
@@ -121,7 +124,7 @@ export function ResultsPanel({
         {results.map((r, i) => {
           const open = openLogs[i] ?? false;
           const state = actions[i] as ActionState | undefined;
-          const warn = r.action?.type === "trust_signer";
+          const warn = r.action?.type === "trust_signer" || r.blocked === true;
           const tone = r.success ? "ok" : r.skipped ? "skip" : warn ? "warn" : "fail";
           return (
             <div key={i} className={`result-row ${tone}`}>

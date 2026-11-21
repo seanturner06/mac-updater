@@ -304,7 +304,7 @@ new scripts asks again. The frontend can't overwrite them.
   post-update publisher-change check.
 
 ### Trust on first use → pinned publishers
-`PINNED_PUBLISHERS` (main.rs) maps 17 widely used apps' bundle IDs to their publisher's Team ID.
+`PINNED_PUBLISHERS` (signing.rs) maps 17 widely used apps' bundle IDs to their publisher's Team ID.
 A pin applies from the first sighting, so a copy that was already wrong when Freshet was
 installed is flagged ("Not signed by Slack Technologies…"). Each pin was confirmed two ways: the
 app's real signature on a development Mac and the publisher's known identity. Precedence:
@@ -323,4 +323,65 @@ These raise the bar; malware already running as the user remains out of scope.
 
 Remaining: Developer ID signing + notarization of Freshet itself, and a password on the updater
 signing key (docs/14-release-signing.md).
+
+
+## Hardening added 2026-11-14
+
+From a full review of the backend and the window.
+
+### One operation at a time, enforced in the backend
+An update, an adoption, a rollback and Freshet's self-update share `STOP_REQUESTED` and
+`RUNNING_CHILD`, and must not overlap. The window disabled its own buttons, but nothing in the
+backend refused a second operation, and `install_app_update` only checked `RUNNING_CHILD` — which
+is zero between brew invocations (cask downloads, publisher checks, npm and App Store installs),
+so the app could restart itself mid-update. The commands now take a single `BUSY` guard
+(`begin_operation`), and manual updates and the self-update also refuse while a scheduled run's
+pid marker is live.
+
+### Trust baseline can't be half-read
+`signing.json` was written in place. The app and the scheduled run both read and write it; a
+reader that caught a half-written file parsed it as "no baseline" and saved that back, silently
+re-trusting whatever was installed. It is now written to a temp file and renamed
+(`write_private_atomic`), and temp names are unique per writer, so two writers can't rename each
+other's partial file into place. `settings.json`'s read-modify-write is serialized
+(`SETTINGS_LOCK`).
+
+### Smaller items
+- **npm names:** a `/` is only accepted between a scope and a name. Unscoped `owner/repo` is npm's
+  GitHub shorthand (an install from an arbitrary repository) and is now rejected.
+- **App icons:** `CFBundleIconFile` comes from the app's own `Info.plist`; a value with a path
+  separator (`../../…`, `/Users/…`) is refused, so it can't point the icon reader outside the
+  bundle.
+- **System tools by absolute path:** the askpass helper calls `/usr/bin/osascript` (a fake
+  `osascript` earlier on `PATH` would have been handed the password dialog), and `curl`, `open`
+  and `defaults` are run from `/usr/bin`.
+- **Feed fetches** follow at most 5 redirects.
+- **Pre-install scratch directories** are unique per call and created with `create_dir`, which
+  refuses a directory that already exists.
+
+### Later the same day: the pre-install check proves the publisher
+
+- **Proof, not a claim.** The check used to compare the Team ID a download's signature *states*
+  (`codesign -dvv`). It now also verifies the bundle against a code requirement naming that team
+  (`signing.rs: signature_proves_team`): the signature must chain to Apple and the leaf
+  certificate must be that team's (or Apple's App Store certificate, whose signature covers the
+  stated team). A signature that only says the right thing is **Invalid** and blocks the
+  install. Measured: 40ms–3s per app by size; 0.5s for a real Discord DMG including the mount.
+- **Installer packages.** `pkgutil --check-signature`'s own verdict now decides whether the named
+  team counts: only an Apple-issued certificate does. "Signed by untrusted certificate" with the
+  right *name* is Invalid.
+- **Pinned publishers fail closed.** When a download can't be inspected at all, an ordinary app
+  still installs with a note; an app in `PINNED_PUBLISHERS` is blocked, because there Freshet
+  knows who must have signed it. The only ways past are a download Freshet can check, or
+  updating from the app itself.
+- **Every block is reported as one.** `UpdateResult.blocked` marks a result refused by the
+  check, so an unsigned or forged download (which has no "Trust new publisher" action) shows as
+  *blocked before install* in the results, the history, the scheduled summary and the menu-bar
+  icon, instead of an ordinary failure.
+- **`mas` runs as root only from a Homebrew bin directory** (`/opt/homebrew/bin`,
+  `/usr/local/bin`; owned by the user or root, not writable by others), never "first on PATH" —
+  a global npm package shipping a binary called `mas` would otherwise have been run as root.
+  A `mas` installed elsewhere is not elevated.
+- **Stop ends the download phase at once** (`brew fetch` runs as the tracked child); nothing is
+  installed during it, so there is no package boundary to wait for.
 
