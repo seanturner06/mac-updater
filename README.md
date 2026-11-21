@@ -4,6 +4,10 @@ A macOS menu-bar app that keeps *everything* on your Mac up to date from one pla
 
 Freshet doesn't build its own version database (the trap that killed MacUpdater). It orchestrates the registries your Mac already trusts — `brew`, `mas`, `npm`, and each app's own Sparkle appcast — so coverage stays current without a team curating versions by hand.
 
+# Demo
+
+https://github.com/user-attachments/assets/abb4378d-5bf3-4b4d-84ed-c0b7c89fca0c
+
 ## Features
 
 - **One list for every source.** Outdated Homebrew formulae, casks, App Store apps, npm globals, and self-updating Sparkle apps, checked in parallel and streamed into a single menu-bar window.
