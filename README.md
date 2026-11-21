@@ -6,7 +6,7 @@ Freshet doesn't build its own version database (the trap that killed MacUpdater)
 
 # Demo
 
-https://github.com/user-attachments/assets/abb4378d-5bf3-4b4d-84ed-c0b7c89fca0c
+https://github.com/user-attachments/assets/78888ce0-8758-41ca-b6e9-aad2dfa32a0a
 
 ## Features
 
