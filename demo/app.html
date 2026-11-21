@@ -1,0 +1,22 @@
+<!doctype html>
+<!-- One frame of the demo film: the real Freshet UI (src/main.tsx) on the stand-in backend in
+     mock.js, which must load first. -->
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Freshet (demo frame)</title>
+    <style>
+      html, body { margin: 0; background: transparent; overflow: hidden; }
+      #root { width: 420px; height: 680px; }
+      /* In a scaled iframe, WebKit draws a panel's backdrop-filter wrong and the list under it
+         shows through (the security and schedule scenes). The panels are 0.96 opaque, so the blur
+         is invisible here anyway. */
+      .results-overlay, .help-card { -webkit-backdrop-filter: none !important; backdrop-filter: none !important; }
+    </style>
+    <script src="/demo/mock.js"></script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

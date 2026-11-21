@@ -2,12 +2,28 @@
 
 ```
 src/
-  main.tsx        mount
-  App.tsx         946 lines — 4 components, all state, all JSX
-  logic.ts        110 lines — pure decision logic, zero React imports
-  logic.test.ts   173 lines — 24 tests, no rendering
-  App.css         713 lines — tokens + every style
+  main.tsx            mount
+  App.tsx             the window: the list, selection, the update run, keyboard, panel routing
+  PackageRow.tsx      one row of the list and its detail card
+  SettingsPanel.tsx   ResultsPanel.tsx   HistoryPanel.tsx   AdoptPanel.tsx   LiveRun.tsx
+  useSchedule.ts      the daily launchd schedule: installed?, time, changing either
+  useScheduledRun.ts  notices scheduled runs (30s poll) and when one finishes
+  useAppUpdate.ts     Freshet's own version and updates
+  useAdoption.ts      Homebrew adoption: suggestions, search, the adoption run
+  localSettings.ts    localStorage seed for settings (settings.json is the source of truth)
+  theme.ts            the colour theme
+  logic.ts            pure decision logic and the IPC types, zero React imports
+  logic.test.ts       unit tests, no rendering
+  App.test.tsx        the whole window against a fake IPC
+  App.css             tokens + every style
 ```
+
+(Layout as of 2026-11-14, when the schedule, scheduled-run watcher, self-update and adoption
+state were moved out of `App.tsx` into hooks, and `AdoptPanel` / `LiveRun` into their own
+files. Sizes and counts quoted further down this page predate that.)
+
+The package kind is the `Kind` union in `logic.ts` (`"brew" | "cask" | "mas" | "npm" |
+"sparkle"`), mirroring the Rust `Kind` enum; a misspelt kind is a type error.
 
 ## What isn't here, and why
 

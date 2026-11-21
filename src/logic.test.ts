@@ -10,6 +10,7 @@ import {
   toggleSelected,
   toggleCategorySelected,
   prunedSelfUpdating,
+  keepSelection,
   allDisplayedSelections,
   toSettings,
   scheduledSelections,
@@ -21,7 +22,11 @@ import {
   nextRunText,
   parseSkipped,
   formatClock,
-  hourLabel,
+  uses12HourClock,
+  splitHour,
+  joinHour,
+  dayPeriodLabel,
+  minuteOptions,
   formatDuration,
   advanceSteps,
   liveView,
@@ -50,6 +55,8 @@ import {
   type HistoryEntry,
   progressText,
   type CategoryStatus,
+  type Kind,
+  type UpdateResult,
   type PackageInfo,
   type OutdatedItem,
   type ScheduledRunSummary,
@@ -64,7 +71,7 @@ const item = (id: string, self_updating = false, latest = "2.0"): OutdatedItem =
   self_updating,
   notes_url: "",
 });
-const cat = (kind: string, items: OutdatedItem[]): CategoryStatus => ({
+const cat = (kind: Kind, items: OutdatedItem[]): CategoryStatus => ({
   category: kind,
   kind,
   items,
@@ -207,7 +214,7 @@ describe("edge cases", () => {
     expect(countDisplayed([], false, new Set())).toBe(0);
   });
   it("isReadOnly is false for every normal kind, true for sparkle/notify", () => {
-    for (const k of ["brew", "cask", "mas", "npm"]) expect(isReadOnly(k, false)).toBe(false);
+    for (const k of ["brew", "cask", "mas", "npm"] as const) expect(isReadOnly(k, false)).toBe(false);
     expect(isReadOnly("sparkle", false)).toBe(true);
     expect(isReadOnly("brew", true)).toBe(true);
   });
@@ -256,6 +263,13 @@ describe("scheduled run", () => {
     expect(
       lastRunText(summary({ updated: ["a", "b"], needs_admin: ["zoom"], failed: ["x"] }))
     ).toBe("2 updated · 1 needs your password: zoom · 1 failed");
+  });
+
+  it("lastRunText reports apps skipped because they were open, without calling them failures", () => {
+    expect(lastRunText(summary({ updated: ["git"], skipped_open: ["slack", "zoom"] }))).toBe(
+      "1 updated · skipped (open): slack, zoom"
+    );
+    expect(needsAttention({ vulns: {}, checkVulns: false, results: null, lastRun: summary({ skipped_open: ["slack"] }) })).toBe(false);
   });
 });
 
@@ -456,9 +470,34 @@ describe("clock formatting", () => {
     expect(formatClock(0, 5)).toBe(checkedStyle(0, 5));
   });
 
-  it("hourLabel shows just the hour in the same style", () => {
-    expect(formatClock(14, 0).startsWith(hourLabel(14).replace(/\s?[AP]M$/i, ""))).toBe(true);
-    expect(hourLabel(9)).not.toContain(":");
+  it("the picker follows the locale's clock", () => {
+    expect(uses12HourClock("en-US")).toBe(true);
+    expect(uses12HourClock("en-GB")).toBe(false);
+    expect(uses12HourClock("de-DE")).toBe(false);
+    expect(dayPeriodLabel(false, "en-US")).toBe("AM");
+    expect(dayPeriodLabel(true, "en-US")).toBe("PM");
+  });
+
+  it("splits a 24-hour hour into what a 12-hour picker shows", () => {
+    expect(splitHour(0)).toEqual({ hour12: 12, pm: false }); // midnight is 12 AM
+    expect(splitHour(9)).toEqual({ hour12: 9, pm: false });
+    expect(splitHour(12)).toEqual({ hour12: 12, pm: true }); // noon is 12 PM
+    expect(splitHour(14)).toEqual({ hour12: 2, pm: true });
+    expect(splitHour(23)).toEqual({ hour12: 11, pm: true });
+  });
+
+  it("every hour survives the trip through the 12-hour picker", () => {
+    for (let h = 0; h < 24; h++) {
+      const { hour12, pm } = splitHour(h);
+      expect(hour12).toBeGreaterThanOrEqual(1);
+      expect(hour12).toBeLessThanOrEqual(12);
+      expect(joinHour(hour12, pm)).toBe(h);
+    }
+  });
+
+  it("the minute menu keeps an off-grid minute visible", () => {
+    expect(minuteOptions(45)).toEqual([0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55]);
+    expect(minuteOptions(7)).toEqual([0, 5, 7, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55]);
   });
 });
 
@@ -477,7 +516,7 @@ describe("blocked builds in the last run", () => {
   it("lastRunText reports provenance blocks", () => {
     expect(
       lastRunText({ finished_at: 0, notify_only: false, available: 2, updated: ["git"], needs_admin: [], failed: [], signer_changed: [], blocked: ["xz"] })
-    ).toBe("blocked (failed build verification): xz · 1 updated");
+    ).toBe("blocked before install: xz · 1 updated");
   });
 });
 
@@ -567,10 +606,14 @@ describe("run view, menu bar, keyboard and themes", () => {
       expect(needsAttention({ ...quiet, vulns: { x: { current: [], fixed: [] } } })).toBe(false);
     });
     it("flags publisher changes and scheduled-run problems", () => {
-      const flagged = [
+      const flagged: UpdateResult[] = [
         { kind: "cask", name: "zoom", success: false, output: "", action: { type: "trust_signer" as const, bundle_id: "b", team: "T" } },
       ];
       expect(needsAttention({ ...quiet, results: flagged })).toBe(true);
+      // A block with nobody to trust (an unsigned or forged download) counts just the same.
+      const blocked: UpdateResult[] = [{ kind: "cask", name: "zoom", success: false, output: "", blocked: true }];
+      expect(needsAttention({ ...quiet, results: blocked })).toBe(true);
+      expect(needsAttention({ ...quiet, results: [{ ...blocked[0], blocked: false }] })).toBe(false);
       expect(needsAttention({ ...quiet, lastRun: { ...run, failed: ["x"] } })).toBe(true);
       expect(needsAttention({ ...quiet, lastRun: { ...run, signer_changed: ["x"] } })).toBe(true);
       expect(needsAttention({ ...quiet, lastRun: { ...run, blocked: ["x"] } })).toBe(true);
@@ -655,6 +698,23 @@ describe("run view, menu bar, keyboard and themes", () => {
       expect(block, t.id).toBeDefined();
       for (const token of colourTokens) expect(block, `${t.id} ${token}`).toContain(`${token}:`);
     }
+  });
+
+  it("the serif is the wordmark only", () => {
+    const users = [...css.matchAll(/([^{}]+)\{[^}]*var\(--font-display\)/g)].map((m) => m[1].trim());
+    expect(users).toEqual([".title"]);
+  });
+
+  it("corners use the three radius tokens (plus circles, pills and hairline-small literals)", () => {
+    const radii = [...css.matchAll(/border-radius:\s*([^;]+);/g)].map((m) => m[1].trim());
+    const allowed = /^(var\(--r-(sm|md|lg)\)|50%|999px|[2-4]px)$/;
+    expect(radii.filter((r) => !allowed.test(r))).toEqual([]);
+  });
+
+  it("only loading states animate forever (the spinner and skeleton shimmer), nothing pulses or glows", () => {
+    const looping = [...css.matchAll(/animation:\s*([\w-]+)[^;]*infinite/g)].map((m) => m[1]);
+    expect(looping.sort()).toEqual(["shimmer", "spin"]);
+    expect(css).not.toMatch(/box-shadow:\s*0 0 \d+px currentColor/);
   });
 });
 
@@ -778,5 +838,31 @@ describe("keyboard cursor", () => {
     expect(parseNavId(rowNavId("npm", "@scope/pkg"))).toEqual({ type: "row", key: "npm::@scope/pkg" });
     expect(parseNavId(catNavId("a:b"))).toEqual({ type: "cat", cat: "a:b" });
     expect(parseNavId("bogus")).toBeNull();
+  });
+});
+
+describe("keepSelection", () => {
+  const cats: CategoryStatus[] = [
+    {
+      category: "Homebrew",
+      kind: "brew",
+      error: null,
+      items: [{ id: "git", name: "git", current: "1", latest: "2", self_updating: false, notes_url: "" }],
+    },
+  ];
+  const git: Selection = { kind: "brew", id: "git", name: "git" };
+  const gone: Selection = { kind: "brew", id: "wget", name: "wget" };
+
+  it("keeps items still on the list and drops the rest", () => {
+    expect(keepSelection({ "brew::git": git, "brew::wget": gone }, cats)).toEqual({ "brew::git": git });
+  });
+
+  it("matches on kind as well as id", () => {
+    expect(keepSelection({ "cask::git": { ...git, kind: "cask" as const } }, cats)).toEqual({});
+  });
+
+  it("returns the same object when nothing changed, so nothing re-renders", () => {
+    const selected = { "brew::git": git };
+    expect(keepSelection(selected, cats)).toBe(selected);
   });
 });

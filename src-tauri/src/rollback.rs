@@ -29,7 +29,7 @@ pub(crate) struct Snapshot {
 }
 
 fn root() -> Option<PathBuf> {
-    crate::freshet_dir().map(|d| d.join("rollback"))
+    crate::store::freshet_dir().map(|d| d.join("rollback"))
 }
 
 // --- path-parameterized core (unit-tested against temp dirs) ---
@@ -72,7 +72,7 @@ pub(crate) fn restore_from(
 ) -> Result<Snapshot, String> {
     let meta = read_meta(snapshot_dir).ok_or("this snapshot is missing or damaged")?;
     for app in &meta.apps {
-        if !crate::is_valid_app_name(app) {
+        if !crate::validate::is_valid_app_name(app) {
             return Err(format!(
                 "refusing to restore unexpected bundle name {app:?}"
             ));
@@ -80,7 +80,7 @@ pub(crate) fn restore_from(
         verify(&snapshot_dir.join(app), &apps_dir.join(app))?;
     }
     for app in &meta.apps {
-        if !crate::is_valid_app_name(app) {
+        if !crate::validate::is_valid_app_name(app) {
             return Err(format!(
                 "refusing to restore unexpected bundle name {app:?}"
             ));
@@ -133,11 +133,11 @@ pub(crate) fn list_in(root: &Path, apps_dir: &Path, now: u64) -> Vec<Snapshot> {
             // The app inside the snapshot is the truth about its version (older snapshots were
             // labelled from Homebrew's record, which can disagree).
             if let Some(first) = meta.apps.first() {
-                if let Some(v) = crate::bundle_version(&dir.join(first)) {
+                if let Some(v) = crate::apps::bundle_version(&dir.join(first)) {
                     meta.version = v;
                 }
                 meta.in_use = !meta.version.is_empty()
-                    && crate::bundle_version(&apps_dir.join(first)).as_deref()
+                    && crate::apps::bundle_version(&apps_dir.join(first)).as_deref()
                         == Some(&meta.version);
             }
             Some(meta)
@@ -151,7 +151,7 @@ pub(crate) fn list_in(root: &Path, apps_dir: &Path, now: u64) -> Vec<Snapshot> {
 
 // Installed version from the Caskroom (`<prefix>/Caskroom/<token>/<version>/`).
 fn installed_version(token: &str) -> String {
-    crate::find_brew()
+    crate::process::find_brew()
         .and_then(|brew| {
             brew.parent()?
                 .parent()
@@ -169,7 +169,7 @@ fn installed_version(token: &str) -> String {
 
 // `apps`: this cask's bundles currently in /Applications (see installed_cask_apps).
 pub(crate) fn snapshot_cask(token: &str, apps: &[PathBuf]) -> bool {
-    if !crate::is_valid_cask_token(token) {
+    if !crate::validate::is_valid_cask_token(token) {
         return false;
     }
     let Some(root) = root() else { return false };
@@ -180,9 +180,9 @@ pub(crate) fn snapshot_cask(token: &str, apps: &[PathBuf]) -> bool {
         token: token.to_string(),
         version: apps
             .first()
-            .and_then(|a| crate::bundle_version(a))
+            .and_then(|a| crate::apps::bundle_version(a))
             .unwrap_or_else(|| installed_version(token)),
-        created_at: crate::unix_now(),
+        created_at: crate::store::unix_now(),
         apps: apps
             .iter()
             .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
@@ -194,23 +194,27 @@ pub(crate) fn snapshot_cask(token: &str, apps: &[PathBuf]) -> bool {
     tracing::info!(
         cask = token,
         ok,
-        elapsed_ms = crate::elapsed_ms(started),
+        elapsed_ms = crate::process::elapsed_ms(started),
         "rollback snapshot"
     );
     ok
 }
 
-#[tauri::command]
+// `(async)`: reads each snapshot's version with `defaults` and prunes old ones, so off the main
+// thread.
+#[tauri::command(async)]
 pub(crate) fn list_snapshots() -> Vec<Snapshot> {
-    root().map_or_default(|r| list_in(&r, Path::new("/Applications"), crate::unix_now()))
+    root().map_or_default(|r| list_in(&r, Path::new("/Applications"), crate::store::unix_now()))
 }
 
 #[tauri::command]
 pub(crate) async fn restore_snapshot(token: String) -> Result<String, String> {
-    if !crate::is_valid_cask_token(&token) {
+    if !crate::validate::is_valid_cask_token(&token) {
         return Err("invalid cask token".into());
     }
     tauri::async_runtime::spawn_blocking(move || {
+        // Not while an update could be replacing the same app.
+        let _busy = crate::process::begin_operation().ok_or(crate::process::BUSY_MESSAGE)?;
         let dir = root().ok_or("could not resolve ~/.freshet")?.join(&token);
         let meta = restore_from(&dir, Path::new("/Applications"), &verify_snapshot)?;
         Ok(format!(
@@ -243,12 +247,12 @@ fn verify_snapshot(snapshot_app: &Path, installed_app: &Path) -> Result<(), Stri
              been modified. The current version was left in place."
         ));
     }
-    let snapshot = crate::read_signer(snapshot_app);
+    let snapshot = crate::signing::read_signer(snapshot_app);
     let expected = snapshot
         .bundle_id
         .as_deref()
-        .and_then(crate::trusted_team)
-        .or_else(|| crate::read_signer(installed_app).team);
+        .and_then(crate::signing::trusted_team)
+        .or_else(|| crate::signing::read_signer(installed_app).team);
     if snapshot_team_ok(snapshot.team.as_deref(), expected.as_deref()) {
         Ok(())
     } else {

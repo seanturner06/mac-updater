@@ -1,13 +1,6 @@
 /* Freshet — refined dark menu bar aesthetic */
 /* Self-hosted fonts (no external requests) so the Content-Security-Policy can stay strict. */
 @font-face {
-  font-family: "Instrument Serif";
-  font-style: normal;
-  font-weight: 400;
-  font-display: swap;
-  src: url("./assets/fonts/instrument-serif.woff2") format("woff2");
-}
-@font-face {
   font-family: "Inter Tight";
   font-style: normal;
   font-weight: 400 600;
@@ -39,15 +32,15 @@
   --bg-hover: rgba(94, 80, 80, 0.54);
   --border: rgba(160, 142, 142, 0.38);
   --text: rgba(230, 229, 229, 0.98);
-  --text-dim: #a08e8e;
-  --text-faint: rgba(160, 142, 142, 0.55);
-  --accent: #b6a0a0;
-  --on-accent: #141010;
-  --warn: #cbb6b6;
-  --ok: #b6a0a0;
+  --text-dim: #b4a3a3;
+  --text-faint: rgba(176, 158, 158, 0.78);
+  --accent: #d4a5a5;
+  --on-accent: #1c1111;
+  --warn: #dcc2c2;
+  --ok: #d4a5a5;
   --err: #c46666;
-  --ok-bg: rgba(182, 160, 160, 0.14);
-  --warn-bg: rgba(203, 182, 182, 0.15);
+  --ok-bg: rgba(212, 165, 165, 0.14);
+  --warn-bg: rgba(220, 194, 194, 0.15);
   --err-bg: rgba(196, 102, 102, 0.17);
   --err-border: rgba(196, 102, 102, 0.36);
   /* Caution (major-version updates): the one other semantic, non-palette hue. Crimson already
@@ -56,8 +49,11 @@
   --caution-bg: rgba(214, 168, 120, 0.14);
   --surface: rgba(94, 80, 80, 0.24);
   --shadow: 0 1px 0 rgba(255, 255, 255, 0.03) inset, 0 8px 24px rgba(0, 0, 0, 0.25);
-  --radius: 10px;
-  --font-display: "Fraunces", Georgia, serif;
+  /* Three radii. Nested corners follow outer = inner + padding, so a card's 12 holds 8px rows. */
+  --r-sm: 6px;
+  --r-md: 8px;
+  --r-lg: 12px;
+  --font-display: "Fraunces", Georgia, serif; /* the "Freshet" wordmark only */
   --font-body: "Inter Tight", -apple-system, sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, monospace;
 }
@@ -79,7 +75,7 @@
 :root[data-theme="obsidian"] {
   --bg: rgba(7, 8, 11, 0.96);
   --bg-elev: rgba(91, 158, 255, 0.16); --bg-hover: rgba(91, 158, 255, 0.27); --border: rgba(91, 158, 255, 0.32);
-  --text: rgba(228, 233, 242, 0.95); --text-dim: rgba(228, 233, 242, 0.62); --text-faint: rgba(228, 233, 242, 0.4);
+  --text: rgba(228, 233, 242, 0.95); --text-dim: rgba(228, 233, 242, 0.62); --text-faint: rgba(228, 233, 242, 0.5);
   --accent: #5b9eff; --on-accent: #08111f; --warn: #e0b574; --ok: #5fc28a; --err: #e07a7a;
   --ok-bg: rgba(95, 194, 138, 0.13); --warn-bg: rgba(224, 181, 116, 0.15);
   --err-bg: rgba(224, 122, 122, 0.14); --err-border: rgba(224, 122, 122, 0.32);
@@ -88,7 +84,7 @@
 :root[data-theme="sage"] {
   --bg: rgba(13, 13, 11, 0.96);
   --bg-elev: rgba(156, 175, 136, 0.18); --bg-hover: rgba(156, 175, 136, 0.28); --border: rgba(156, 175, 136, 0.34);
-  --text: rgba(240, 238, 232, 0.95); --text-dim: rgba(240, 238, 232, 0.62); --text-faint: rgba(240, 238, 232, 0.4);
+  --text: rgba(240, 238, 232, 0.95); --text-dim: rgba(240, 238, 232, 0.62); --text-faint: rgba(240, 238, 232, 0.5);
   --accent: #9caf88; --on-accent: #1c2116; --warn: #c9a87c; --ok: #93ad77; --err: #c0897c;
   --ok-bg: rgba(147, 173, 119, 0.14); --warn-bg: rgba(201, 168, 124, 0.16);
   --err-bg: rgba(192, 137, 124, 0.16); --err-border: rgba(192, 137, 124, 0.34);
@@ -97,7 +93,7 @@
 :root[data-theme="pine"] {
   --bg: rgba(9, 11, 11, 0.96);
   --bg-elev: rgba(108, 174, 157, 0.18); --bg-hover: rgba(108, 174, 157, 0.28); --border: rgba(108, 174, 157, 0.34);
-  --text: rgba(231, 237, 235, 0.95); --text-dim: rgba(231, 237, 235, 0.62); --text-faint: rgba(231, 237, 235, 0.4);
+  --text: rgba(231, 237, 235, 0.95); --text-dim: rgba(231, 237, 235, 0.62); --text-faint: rgba(231, 237, 235, 0.5);
   --accent: #6cae9d; --on-accent: #0f1a17; --warn: #d6b182; --ok: #82b48f; --err: #d28f8f;
   --ok-bg: rgba(130, 180, 143, 0.14); --warn-bg: rgba(214, 177, 130, 0.16);
   --err-bg: rgba(210, 143, 143, 0.16); --err-border: rgba(210, 143, 143, 0.34);
@@ -107,7 +103,7 @@
 :root[data-theme="ink"] {
   --bg: rgba(5, 7, 10, 0.96);
   --bg-elev: rgba(194, 168, 106, 0.16); --bg-hover: rgba(194, 168, 106, 0.27); --border: rgba(194, 168, 106, 0.35);
-  --text: rgba(236, 232, 222, 0.96); --text-dim: rgba(214, 205, 184, 0.68); --text-faint: rgba(214, 205, 184, 0.44);
+  --text: rgba(236, 232, 222, 0.96); --text-dim: rgba(214, 205, 184, 0.68); --text-faint: rgba(214, 205, 184, 0.54);
   --accent: #c2a86a; --on-accent: #1a1508; --warn: #d9b46e; --ok: #8fb98a; --err: #d77f74;
   --ok-bg: rgba(143, 185, 138, 0.14); --warn-bg: rgba(217, 180, 110, 0.15);
   --err-bg: rgba(215, 127, 116, 0.15); --err-border: rgba(215, 127, 116, 0.34);
@@ -117,7 +113,7 @@
 :root[data-theme="graphite"] {
   --bg: rgba(8, 8, 8, 0.96);
   --bg-elev: rgba(255, 255, 255, 0.11); --bg-hover: rgba(255, 255, 255, 0.18); --border: rgba(255, 255, 255, 0.22);
-  --text: rgba(240, 240, 240, 0.96); --text-dim: rgba(240, 240, 240, 0.62); --text-faint: rgba(240, 240, 240, 0.4);
+  --text: rgba(240, 240, 240, 0.96); --text-dim: rgba(240, 240, 240, 0.62); --text-faint: rgba(240, 240, 240, 0.5);
   --accent: #7fd49a; --on-accent: #0b1a10; --warn: #e3c07a; --ok: #7fd49a; --err: #ef8578;
   --ok-bg: rgba(127, 212, 154, 0.13); --warn-bg: rgba(227, 192, 122, 0.15);
   --err-bg: rgba(239, 133, 120, 0.14); --err-border: rgba(239, 133, 120, 0.32);
@@ -139,13 +135,15 @@ html, body, #root {
   background: var(--bg);
   backdrop-filter: blur(40px) saturate(180%);
   -webkit-backdrop-filter: blur(40px) saturate(180%);
-  border-radius: 12px;
+  border-radius: var(--r-lg);
   border: 1px solid var(--border);
   overflow: hidden;
   display: flex;
   flex-direction: column;
   max-height: 680px; /* golden ratio: 420px width × 1.618 ≈ 680 */
 }
+/* Panels (Settings, History, Results) fill the window, not just the list's height. */
+.app.panel-open { height: 680px; }
 
 /* ---------------- header ---------------- */
 .header {
@@ -159,15 +157,13 @@ html, body, #root {
 .header-actions { display: flex; align-items: center; gap: 2px; }
 .circ-progress { width: 28px; height: 28px; display: grid; place-items: center; }
 
-.status-dot {
-  width: 8px; height: 8px;
-  border-radius: 50%;
-  flex-shrink: 0;
-  box-shadow: 0 0 12px currentColor;
-}
-.status-dot.ok   { background: var(--ok);   color: var(--ok); }
-.status-dot.warn { background: var(--warn); color: var(--warn); }
-.status-dot.idle { background: var(--text-faint); color: transparent; }
+/* The status mark: the app icon's drop (see StatusMark.tsx). Flat, no glow. */
+.status-mark { flex-shrink: 0; overflow: visible; }
+.status-drop { stroke-width: 1.3; stroke-linejoin: round; }
+.status-mark.ok .status-drop { fill: var(--accent); stroke: var(--accent); }
+.status-mark.warn .status-drop { fill: var(--warn); stroke: var(--warn); }
+.status-mark.idle .status-drop { fill: none; stroke: var(--text-faint); }
+.status-chevron { fill: none; stroke: var(--bg); stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
 
 .title {
   font-family: var(--font-display);
@@ -190,7 +186,7 @@ html, body, #root {
   border: 1px solid transparent;
   color: var(--text-dim);
   width: 30px; height: 30px;
-  border-radius: 8px;
+  border-radius: var(--r-md);
   display: grid; place-items: center;
   cursor: pointer;
   transition: background 0.15s, color 0.15s;
@@ -209,12 +205,11 @@ html, body, #root {
 
 .cat {
   margin-top: 8px;
-  border-radius: var(--radius);
+  border-radius: var(--r-lg);
   background: var(--surface);
-  border: 1px solid transparent;
-  transition: border-color 0.15s, background 0.15s;
+  transition: background 0.15s;
 }
-.cat.open { border-color: var(--border); background: var(--bg-elev); }
+.cat.open { background: var(--bg-elev); }
 .cat.empty .cat-name { color: var(--text-dim); }
 
 .cat-head { display: flex; align-items: center; padding-right: 8px; }
@@ -231,7 +226,7 @@ html, body, #root {
   font-family: inherit;
   text-align: left;
   cursor: pointer;
-  border-radius: var(--radius);
+  border-radius: var(--r-lg);
 }
 .cat-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .cat-toggle .chevron { margin-left: 2px; }
@@ -241,7 +236,7 @@ html, body, #root {
   width: 30px; height: 30px;
   flex-shrink: 0;
   display: grid; place-items: center;
-  border-radius: 8px;
+  border-radius: var(--r-md);
   color: var(--accent);
   background: var(--bg-hover);
 }
@@ -258,9 +253,9 @@ html, body, #root {
 }
 
 .count {
-  font-family: var(--font-mono);
-  font-size: 10.5px;
-  font-weight: 500;
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
   min-width: 24px;
   padding: 2px 7px;
   border-radius: 999px;
@@ -324,7 +319,7 @@ html, body, #root {
 .check:disabled { cursor: not-allowed; opacity: 0.5; }
 
 /* ---------------- package rows ---------------- */
-.pkg { border-radius: 8px; transition: background 0.12s; }
+.pkg { border-radius: var(--r-md); transition: background 0.12s; }
 .pkg + .pkg { margin-top: 1px; }
 .pkg.open { background: var(--bg-hover); }
 .pkg.locked { opacity: 0.55; }
@@ -334,7 +329,7 @@ html, body, #root {
   align-items: center;
   gap: 10px;
   padding: 7px 6px 7px 7px;
-  border-radius: 8px;
+  border-radius: var(--r-md);
   cursor: pointer;
 }
 .pkg-row:hover { background: var(--bg-hover); }
@@ -348,18 +343,16 @@ html, body, #root {
 .pkg-icon {
   width: 28px; height: 28px;
   flex-shrink: 0;
-  border-radius: 7px;
+  border-radius: var(--r-md);
   object-fit: contain;
 }
 .pkg-monogram {
   display: grid;
   place-items: center;
-  font-family: var(--font-display);
-  font-size: 14px;
-  font-weight: 560;
-  color: var(--accent);
-  background: var(--bg-elev);
-  border: 1px solid var(--border);
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-dim);
+  background: var(--bg-hover);
 }
 .pkg-monogram.dim { color: var(--text-faint); background: transparent; }
 
@@ -369,7 +362,7 @@ html, body, #root {
   align-items: center;
   gap: 6px;
   min-width: 0;
-  font-size: 12.5px;
+  font-size: 13px;
   font-weight: 500;
   color: var(--text);
 }
@@ -388,18 +381,21 @@ html, body, #root {
   background: var(--surface);
 }
 
+/* A block of right-aligned lines, not a column flexbox: WebKit sized the flex column to its
+   shorter line, which cut "from 2.37.12_2" to "from 2.…". A block's width is its widest line.
+   It clips only past 132px (a 16-character version); the row's title has the full change. */
 .pkg-ver {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-end;
-  gap: 2px;
-  max-width: 96px;
-  font-family: var(--font-mono);
   flex-shrink: 0;
+  max-width: 132px;
+  overflow: hidden;
+  text-align: right;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
 }
-.pkg-ver > span { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.pkg-ver-new { font-size: 11px; color: var(--text); }
-.pkg-ver-old { font-size: 9.5px; color: var(--text-faint); }
+.pkg-ver > span { display: block; white-space: nowrap; }
+.pkg-ver-old { margin-top: 3px; }
+.pkg-ver-new { font-size: 11px; font-weight: 500; color: var(--text); }
+.pkg-ver-old { font-size: 10px; color: var(--text-faint); }
 
 .pkg-info {
   width: 26px; height: 26px;
@@ -407,7 +403,7 @@ html, body, #root {
   display: grid; place-items: center;
   background: transparent;
   border: none;
-  border-radius: 7px;
+  border-radius: var(--r-sm);
   color: var(--text-faint);
   cursor: pointer;
   transition: color 0.12s, background 0.12s;
@@ -417,19 +413,18 @@ html, body, #root {
 
 .chip {
   flex-shrink: 0;
-  font-family: var(--font-mono);
-  font-size: 9.5px;
-  font-weight: 500;
-  letter-spacing: 0.02em;
-  padding: 1px 6px;
+  font-size: 10px;
+  font-weight: 550;
+  padding: 1px 7px;
   border-radius: 999px;
   color: var(--text-dim);
-  background: var(--surface);
-  border: 1px solid var(--border);
+  background: var(--bg-hover);
+  border: 1px solid transparent;
 }
-.chip-major { color: var(--caution); background: var(--caution-bg); border-color: transparent; }
-.chip-vuln { color: var(--err); background: var(--err-bg); border-color: transparent; }
-.chip-link { cursor: pointer; font-family: var(--font-mono); }
+.chip-major { color: var(--caution); background: var(--caution-bg); }
+.chip-vuln { color: var(--err); background: var(--err-bg); }
+/* CVE ids are identifiers, and clickable: mono, with an outline to say so. */
+.chip-link { cursor: pointer; font-family: var(--font-mono); font-size: 9.5px; border-color: var(--border); }
 .chip-link:hover { color: var(--text); border-color: var(--text-faint); }
 .chip-link.fixed { color: var(--err); border-color: var(--err-border); }
 .pkg-vulns { margin-bottom: 8px; }
@@ -469,9 +464,8 @@ html, body, #root {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 2px 7px 8px;
+  padding: 2px 7px 6px;
   margin-bottom: 2px;
-  border-bottom: 1px solid var(--border);
   font-size: 11px;
   color: var(--text-dim);
   cursor: pointer;
@@ -510,18 +504,18 @@ html, body, #root {
   gap: 11px;
   padding: 11px;
   margin-bottom: 8px;
-  border-radius: var(--radius);
+  border-radius: var(--r-lg);
   background: var(--surface);
 }
 .skeleton-lines { flex: 1; display: flex; flex-direction: column; gap: 6px; }
 .skeleton {
   display: block;
-  border-radius: 5px;
+  border-radius: var(--r-sm);
   background: linear-gradient(90deg, var(--surface) 0%, var(--bg-hover) 50%, var(--surface) 100%);
   background-size: 200% 100%;
   animation: shimmer 1.3s ease-in-out infinite;
 }
-.skeleton-icon { width: 30px; height: 30px; border-radius: 8px; flex-shrink: 0; }
+.skeleton-icon { width: 30px; height: 30px; border-radius: var(--r-md); flex-shrink: 0; }
 .skeleton-line { height: 9px; }
 .skeleton-line.short { height: 7px; opacity: 0.7; }
 @keyframes shimmer {
@@ -546,9 +540,9 @@ html, body, #root {
 }
 .all-current-title {
   margin-top: 18px;
-  font-family: var(--font-display);
-  font-size: 19px;
-  font-weight: 520;
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
   color: var(--text);
 }
 .all-current-sub { margin-top: 6px; font-size: 11.5px; color: var(--text-dim); max-width: 240px; line-height: 1.45; }
@@ -571,7 +565,7 @@ html, body, #root {
   color: var(--on-accent);
   border: none;
   padding: 10px;
-  border-radius: 9px;
+  border-radius: var(--r-md);
   font-family: inherit;
   font-size: 13px;
   font-weight: 600;
@@ -594,9 +588,9 @@ html, body, #root {
   width: 100%;
   background: var(--bg-elev);
   color: var(--text);
-  border: 1px solid var(--border);
+  border: none;
   padding: 9px;
-  border-radius: 8px;
+  border-radius: var(--r-md);
   font-family: inherit;
   font-size: 12.5px;
   font-weight: 500;
@@ -611,7 +605,7 @@ html, body, #root {
   padding: 0 14px;
   background: transparent;
   border: 1px solid var(--border);
-  border-radius: 9px;
+  border-radius: var(--r-md);
   color: var(--text-dim);
   font-family: inherit;
   font-size: 12.5px;
@@ -626,14 +620,13 @@ html, body, #root {
   flex-direction: column;
   gap: 8px;
   padding: 9px 12px 10px;
-  border-radius: 9px;
+  border-radius: var(--r-md);
   background: var(--bg-elev);
-  border: 1px solid var(--border);
 }
 .update-progress-text { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text); }
 .update-progress-text .spinner { width: 11px; height: 11px; color: var(--accent); }
 .update-progress-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.update-progress-count { font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); flex-shrink: 0; }
+.update-progress-count { font-variant-numeric: tabular-nums; font-size: 11.5px; color: var(--text-dim); flex-shrink: 0; }
 .update-progress-track { height: 4px; border-radius: 999px; background: var(--surface); overflow: hidden; }
 .update-progress-bar { height: 100%; border-radius: 999px; background: var(--accent); transition: width 0.4s ease; }
 .spinner {
@@ -718,7 +711,7 @@ html, body, #root {
   background: var(--bg);
   backdrop-filter: blur(40px) saturate(180%);
   -webkit-backdrop-filter: blur(40px) saturate(180%);
-  border-radius: 12px;
+  border-radius: var(--r-lg);
   display: flex;
   flex-direction: column;
   z-index: 20;
@@ -737,19 +730,17 @@ html, body, #root {
   border-bottom: 1px solid var(--border);
 }
 .results-title {
-  font-family: var(--font-display);
-  font-size: 21px;
-  font-weight: 540;
-  font-variation-settings: "opsz" 144; /* match the main title's display treatment */
-  line-height: 1;
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.2;
   letter-spacing: -0.01em;
 }
 .results-summary {
   display: flex;
   gap: 12px;
-  margin-top: 5px;
-  font-size: 11px;
-  font-family: var(--font-mono);
+  margin-top: 4px;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
 }
 .ok-text { color: var(--ok); }
 .fail-text { color: var(--err); }
@@ -761,7 +752,7 @@ html, body, #root {
 }
 
 .result-row {
-  border-radius: 8px;
+  border-radius: var(--r-md);
   margin: 4px 0;
   background: var(--bg-elev);
   border: 1px solid transparent;
@@ -770,7 +761,7 @@ html, body, #root {
 .result-row.fail { border-color: var(--err-border); }
 .result-row.warn { border-color: var(--caution); background: var(--caution-bg); }
 .result-badge.warn { background: var(--caution-bg); color: var(--caution); }
-.result-time { font-size: 10.5px; color: var(--text-faint); flex-shrink: 0; }
+.result-time { font-size: 11px; font-weight: 400; color: var(--text-faint); flex-shrink: 0; font-variant-numeric: tabular-nums; }
 .result-action {
   display: flex;
   align-items: center;
@@ -794,10 +785,11 @@ html, body, #root {
   gap: 10px;
   padding: 9px 11px;
   cursor: pointer;
-  font-family: var(--font-mono);
-  font-size: 11.5px;
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 500;
   text-align: left;
-  border-radius: 8px;
+  border-radius: var(--r-md);
 }
 .result-head:hover:not(:disabled) { background: var(--bg-hover); }
 .result-head:disabled { cursor: default; }
@@ -821,8 +813,7 @@ html, body, #root {
 .result-sub {
   padding: 0 11px 9px 39px;
   margin-top: -4px;
-  font-family: var(--font-mono);
-  font-size: 10.5px;
+  font-size: 11px;
   color: var(--text-faint);
 }
 .step-times { padding: 2px 11px 8px 39px; display: grid; gap: 3px; }
@@ -862,7 +853,7 @@ html, body, #root {
   margin: 0 11px 10px;
   padding: 10px;
   background: rgba(0, 0, 0, 0.28);
-  border-radius: 6px;
+  border-radius: var(--r-sm);
   font-family: var(--font-mono);
   font-size: 10.5px;
   line-height: 1.5;
@@ -920,7 +911,7 @@ html, body, #root {
 /* Schedule hero card */
 .schedule-card {
   padding: 14px;
-  border-radius: 12px;
+  border-radius: var(--r-lg);
   background: var(--surface);
   border: 1px solid var(--border);
   transition: background 0.2s, border-color 0.2s;
@@ -934,7 +925,7 @@ html, body, #root {
   width: 36px; height: 36px;
   flex-shrink: 0;
   display: grid; place-items: center;
-  border-radius: 10px;
+  border-radius: var(--r-md);
   color: var(--text-dim);
   background: var(--bg-elev);
 }
@@ -979,25 +970,26 @@ html, body, #root {
   align-items: center;
   gap: 2px;
   padding: 3px;
-  border-radius: 8px;
+  border-radius: var(--r-md);
   background: var(--bg-elev);
-  border: 1px solid var(--border);
 }
 .time-select select {
   background: transparent;
   border: none;
   color: var(--text);
-  font-family: var(--font-mono);
+  font-family: inherit;
   font-size: 13px;
+  font-variant-numeric: tabular-nums;
   padding: 3px 7px;
-  border-radius: 5px;
+  border-radius: var(--r-sm);
   cursor: pointer;
   appearance: none;
   text-align: center;
 }
 .time-select select:hover { background: var(--bg-hover); }
 .time-select select:focus-visible { outline: 2px solid var(--accent); outline-offset: 0; }
-.time-colon { color: var(--text-faint); font-family: var(--font-mono); }
+.time-colon { color: var(--text-faint); }
+.time-select .time-period { margin-left: 2px; }
 
 .last-run {
   display: flex;
@@ -1005,7 +997,7 @@ html, body, #root {
   gap: 9px;
   margin-top: 12px;
   padding: 9px 11px;
-  border-radius: 8px;
+  border-radius: var(--r-md);
   background: var(--bg-elev);
   font-size: 11.5px;
   line-height: 1.45;
@@ -1019,9 +1011,8 @@ html, body, #root {
 .schedule-confirm {
   margin-top: 12px;
   padding: 11px 12px;
-  border-radius: 8px;
+  border-radius: var(--r-md);
   background: var(--bg-elev);
-  border: 1px solid var(--border);
   font-size: 11.5px;
   line-height: 1.5;
   color: var(--text-dim);
@@ -1034,7 +1025,7 @@ html, body, #root {
 
 /* Grouped list (one card, hairline-separated rows) */
 .sgroup {
-  border-radius: 12px;
+  border-radius: var(--r-lg);
   background: var(--surface);
   border: 1px solid var(--border);
   overflow: hidden;
@@ -1060,7 +1051,7 @@ html, body, #root {
   width: 28px; height: 28px;
   flex-shrink: 0;
   display: grid; place-items: center;
-  border-radius: 8px;
+  border-radius: var(--r-md);
   color: var(--accent);
   background: var(--bg-hover);
 }
@@ -1122,7 +1113,7 @@ html, body, #root {
   font-family: var(--font-body);
   font-size: 12.5px;
   padding: 7px 10px;
-  border-radius: 7px;
+  border-radius: var(--r-sm);
   outline: none;
 }
 .adopt-input:focus { border-color: var(--accent); }
@@ -1135,7 +1126,7 @@ html, body, #root {
   gap: 10px;
   padding: 8px 11px;
   margin: 4px 0;
-  border-radius: 8px;
+  border-radius: var(--r-md);
   background: var(--bg-elev);
 }
 .adopt-token {
@@ -1145,12 +1136,12 @@ html, body, #root {
   word-break: break-all;
 }
 .adopt-badge {
-  font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: 10.5px;
+  font-weight: 550;
   color: var(--ok);
   background: var(--ok-bg);
   padding: 3px 8px;
-  border-radius: 10px;
+  border-radius: 999px;
   flex-shrink: 0;
 }
 .adopt-btn { width: auto; padding: 5px 12px; font-size: 11.5px; flex-shrink: 0; }
@@ -1168,7 +1159,7 @@ html, body, #root {
   display: grid;
   place-items: center;
   width: 22px; height: 22px;
-  border-radius: 5px;
+  border-radius: var(--r-sm);
   cursor: pointer;
   transition: all 0.12s;
 }
@@ -1211,7 +1202,7 @@ html, body, #root {
   gap: 10px;
   margin: 10px 10px 0;
   padding: 9px 10px 9px 12px;
-  border-radius: var(--radius);
+  border-radius: var(--r-lg);
   background: var(--ok-bg);
   border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
   font-size: 12px;
@@ -1249,7 +1240,7 @@ html, body, #root {
   font-size: 11px;
   color: var(--text-dim);
 }
-.history-took { font-family: var(--font-mono); font-size: 9.5px; color: var(--text-faint); }
+.history-took { font-variant-numeric: tabular-nums; font-size: 10.5px; color: var(--text-faint); }
 
 /* ---------------- adoption status, rollback note ---------------- */
 .adopt-status { margin-left: auto; font-size: 11px; color: var(--text-dim); text-align: right; flex-shrink: 1; min-width: 0; }
@@ -1276,17 +1267,9 @@ html, body, #root {
 .live-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .live-time { font-variant-numeric: tabular-nums; color: var(--text-faint); }
 .live-step.running .live-time { color: var(--accent); }
-.live-pulse {
-  width: 6px; height: 6px;
-  justify-self: center;
-  border-radius: 50%;
-  background: var(--accent);
-  animation: live-pulse 1.4s ease-in-out infinite;
-}
-@keyframes live-pulse {
-  0%, 100% { opacity: 1; transform: scale(1); }
-  50% { opacity: 0.35; transform: scale(0.7); }
-}
+/* The running step's mark: a static prompt caret. The ticking clock beside it already shows the
+   step is alive, and the spinner above shows the run is; a third moving thing would be noise. */
+.live-step.running .live-mark { color: var(--accent); font-size: 11px; font-weight: 600; }
 @keyframes live-in {
   from { opacity: 0; transform: translateY(3px); }
 }
@@ -1299,7 +1282,7 @@ html, body, #root {
   margin: 0 14px 6px;
   padding: 0 10px;
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: var(--r-md);
   background: var(--bg-elev);
 }
 .filter-bar:focus-within { border-color: color-mix(in srgb, var(--accent) 55%, transparent); }
@@ -1315,7 +1298,7 @@ html, body, #root {
   font-size: 12px;
 }
 .filter-input::placeholder { color: var(--text-faint); }
-.filter-count { font-family: var(--font-mono); font-size: 10.5px; color: var(--text-faint); white-space: nowrap; }
+.filter-count { font-variant-numeric: tabular-nums; font-size: 11px; color: var(--text-faint); white-space: nowrap; }
 .icon-btn.active { color: var(--accent); }
 
 /* The row the keyboard cursor is on (App state, not browser focus; see stepCursor in logic.ts). */
@@ -1343,20 +1326,20 @@ html, body, #root {
   display: grid;
   place-items: center;
   background: rgba(0, 0, 0, 0.35);
-  border-radius: 12px;
+  border-radius: var(--r-lg);
   animation: results-in 0.15s ease-out;
 }
 .help-card {
   width: min(300px, calc(100% - 40px));
   padding: 14px 16px;
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: var(--r-lg);
   background: var(--bg);
   box-shadow: 0 12px 32px rgba(0, 0, 0, 0.4);
   -webkit-backdrop-filter: blur(40px);
   backdrop-filter: blur(40px);
 }
-.help-title { font-family: var(--font-display); font-size: 16px; margin-bottom: 8px; }
+.help-title { font-size: 13px; font-weight: 600; margin-bottom: 8px; }
 .help-row { display: flex; align-items: baseline; gap: 10px; padding: 3px 0; font-size: 11.5px; color: var(--text-dim); }
 .help-row kbd {
   flex: 0 0 96px;
@@ -1372,8 +1355,8 @@ html, body, #root {
   align-items: center;
   gap: 9px;
   padding: 8px 10px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
+  border: none;
+  border-radius: var(--r-md);
   background: var(--bg-elev);
   color: var(--text-dim);
   font: inherit;
@@ -1382,7 +1365,7 @@ html, body, #root {
   cursor: pointer;
 }
 .theme-swatch:hover { background: var(--bg-hover); color: var(--text); }
-.theme-swatch.on { border-color: var(--accent); color: var(--text); box-shadow: inset 0 0 0 1px var(--accent); }
+.theme-swatch.on { color: var(--text); box-shadow: inset 0 0 0 1.5px var(--accent); }
 .theme-chips { display: flex; flex-shrink: 0; }
 .theme-chips > span {
   width: 13px; height: 13px;

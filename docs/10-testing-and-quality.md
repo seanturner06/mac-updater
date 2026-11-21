@@ -42,7 +42,7 @@ gets fixed; a 4-minute failure gets argued with.** The latency difference is the
 highest-value missing piece. When you add a new check, wire it into **both** the hook and
 `ci.yml`, or the inner loop drifts from the gate.
 
-## Backend tests — 50, in `src-tauri/src/main.rs`
+## Backend tests — beside the code, in each module of `src-tauri/src/`
 
 They live in the same file as the code, in `#[cfg(test)] mod tests`, with a module-level
 `#[allow(clippy::unwrap_used, clippy::needless_raw_string_hashes)]` — test code gets its own

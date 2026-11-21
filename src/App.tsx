@@ -10,6 +10,7 @@ import {
   toggleSelected,
   toggleCategorySelected,
   prunedSelfUpdating,
+  keepSelection,
   allDisplayedSelections,
   toSettings,
   scheduledSelections,
@@ -17,27 +18,21 @@ import {
   iconAppName,
   categorySummary,
   type CategoryStatus,
+  type Kind,
   type OutdatedItem,
   type PackageInfo,
   type Selection,
   type Settings,
-  type ScheduledRunSummary,
   type UpdateResult,
   type ResultAction,
   type VulnReport,
   type Snapshot,
   type UpdateProgress,
-  type AdoptProgress,
-  adoptStatusText,
   type HistoryEntry,
   formatClock,
-  type AppUpdate,
   isStale,
   progressText,
   advanceSteps,
-  liveView,
-  formatElapsed,
-  formatDuration,
   needsAttention,
   keyAction,
   routeKey,
@@ -55,68 +50,25 @@ import { KindIcon, PackageRow, SkeletonRows } from "./PackageRow";
 import { SettingsPanel } from "./SettingsPanel";
 import { ResultsPanel } from "./ResultsPanel";
 import { HistoryPanel } from "./HistoryPanel";
+import { AdoptPanel } from "./AdoptPanel";
+import { StatusMark } from "./StatusMark";
+import { LiveRun } from "./LiveRun";
 import { loadTheme, saveTheme } from "./theme";
+import { GREEDY_STORE, NOTIFY_STORE, loadFlag, loadIgnored, saveFlag, saveIgnored } from "./localSettings";
+import { useAdoption } from "./useAdoption";
+import { useAppUpdate } from "./useAppUpdate";
+import { useSchedule } from "./useSchedule";
+import { useScheduledRun } from "./useScheduledRun";
 import "./App.css";
-
-const IGNORE_STORE = "freshet.skipped";
-const GREEDY_STORE = "freshet.greedy";
-const NOTIFY_STORE = "freshet.notifyOnly";
-
-function loadFlag(key: string): boolean {
-  try {
-    return localStorage.getItem(key) === "1";
-  } catch {
-    return false;
-  }
-}
-function saveFlag(key: string, value: boolean) {
-  try {
-    localStorage.setItem(key, value ? "1" : "0");
-  } catch {
-    // Storage unavailable — the toggle still works, it just won't survive a relaunch.
-  }
-}
-function loadIgnored(): Set<string> {
-  try {
-    const parsed: unknown = JSON.parse(localStorage.getItem(IGNORE_STORE) ?? "[]");
-    if (Array.isArray(parsed)) {
-      return new Set((parsed as unknown[]).filter((v): v is string => typeof v === "string"));
-    }
-    return new Set();
-  } catch {
-    return new Set();
-  }
-}
-
-type ScheduleStatus = { installed: boolean; hour: number | null; minute: number | null };
-type CaskSuggestion = { token: string; installed: boolean };
-type AdoptableApp = { name: string; token: string };
-type CaskInfo = {
-  token: string;
-  name: string;
-  desc: string;
-  homepage: string;
-  version: string;
-  auto_updates: boolean;
-};
 
 export default function App() {
   const [categories, setCategories] = useState<CategoryStatus[]>([]);
   const [loading, setLoading] = useState(false);
   const [updating, setUpdating] = useState(false);
   const [lastChecked, setLastChecked] = useState<Date | null>(null);
-  const [scheduleEnabled, setScheduleEnabled] = useState(false);
-  const [scheduleError, setScheduleError] = useState<string | null>(null);
-  const [scheduleConfirm, setScheduleConfirm] = useState(false);
-  const [lastRun, setLastRun] = useState<ScheduledRunSummary | null>(null);
-  // A scheduled (launchd) run is in progress right now.
-  const [scheduledRunning, setScheduledRunning] = useState(false);
-  // finished_at of the newest scheduled run this window has already refreshed for.
-  const lastRunSeen = useRef<number | null>(null);
-  const checkNowRef = useRef<() => Promise<void>>(() => Promise.resolve());
-  const saveTimer = useRef<number | undefined>(undefined);
-  const [hour, setHour] = useState(10);
-  const [minute, setMinute] = useState(0);
+  const refreshIfOlderThanRef = useRef<(maxAgeMs: number) => void>(() => undefined);
+  // Counts checks, so only the newest one's answer is shown (see checkNow).
+  const checkSeq = useRef(0);
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [selected, setSelected] = useState<Record<string, Selection>>({});
   const [results, setResults] = useState<UpdateResult[] | null>(null);
@@ -128,12 +80,6 @@ export default function App() {
   const [showHistory, setShowHistory] = useState(false);
   const [launchAtLogin, setLaunchAtLogin] = useState(false);
   const [provenanceActive, setProvenanceActive] = useState<boolean | null>(null);
-  const [appVersion, setAppVersion] = useState("");
-  const [appUpdate, setAppUpdate] = useState<AppUpdate | null>(null);
-  const [appUpdateState, setAppUpdateState] = useState<{ busy: boolean; error: string | null }>({
-    busy: false,
-    error: null,
-  });
   const [checkVulns, setCheckVulns] = useState(false);
   // npm package name → known vulnerabilities (only fetched when the user opted in).
   const [vulns, setVulns] = useState<Record<string, VulnReport>>({});
@@ -159,15 +105,6 @@ export default function App() {
   const [showDeps, setShowDeps] = useState<Record<string, boolean>>({});
   const [showAdopt, setShowAdopt] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
-  const [adoptQuery, setAdoptQuery] = useState("");
-  const [adoptResults, setAdoptResults] = useState<CaskSuggestion[]>([]);
-  const [adoptSearching, setAdoptSearching] = useState(false);
-  // Casks being adopted right now, and the live status of the current one.
-  const [adopting, setAdopting] = useState<string[]>([]);
-  const [adoptProgress, setAdoptProgress] = useState<AdoptProgress | null>(null);
-  const [suggestions, setSuggestions] = useState<AdoptableApp[]>([]);
-  const [suggestLoading, setSuggestLoading] = useState(false);
-  const [adoptSelected, setAdoptSelected] = useState<Record<string, boolean>>({});
   // Live run view: the running update's steps, and a clock that ticks once a second meanwhile.
   const [liveSteps, setLiveSteps] = useState<LiveStep[]>([]);
   const [now, setNow] = useState(() => performance.now());
@@ -180,6 +117,42 @@ export default function App() {
   // used, but remembered, so the keyboard picks up from the last clicked row.
   const [cursor, setCursor] = useState<string | null>(null);
   const [kbMode, setKbMode] = useState(false);
+
+  // What the daily scheduled run would install right now.
+  const scheduledCount = scheduledSelections(categories, greedy, ignored).length;
+  const {
+    scheduleEnabled,
+    scheduleError,
+    scheduleConfirm,
+    hour,
+    minute,
+    toggleSchedule,
+    changeScheduleTime,
+    cancelScheduleConfirm,
+  } = useSchedule(!notifyOnly && scheduledCount > 0);
+  // When a scheduled run finishes, refresh, so the window never lists what it already installed.
+  const { lastRun, scheduledRunning } = useScheduledRun(() => void checkNow());
+  const { appVersion, appUpdate, appUpdateState, checkAppUpdate, installAppUpdate } = useAppUpdate();
+  const {
+    adoptQuery,
+    setAdoptQuery,
+    adoptResults,
+    adoptSearching,
+    adopting,
+    adoptProgress,
+    suggestions,
+    suggestLoading,
+    adoptSelected,
+    searchCasks,
+    adopt,
+    adoptSelectedApps,
+    cancelAdoption,
+    toggleAdoptSelect,
+  } = useAdoption(showAdopt, async (res) => {
+    setShowAdopt(false);
+    showResults("Homebrew adoption", res);
+    await checkNow();
+  });
 
   useEffect(() => {
     // Show the last check immediately (stale-while-revalidate); checkNow replaces it.
@@ -194,24 +167,9 @@ export default function App() {
         // No cache yet.
       });
     void refreshSnapshots();
-    void invoke<string>("app_version").then(setAppVersion).catch(() => undefined);
     void invoke<boolean>("get_launch_at_login").then(setLaunchAtLogin).catch(() => undefined);
     void invoke<boolean>("homebrew_provenance_active").then(setProvenanceActive).catch(() => undefined);
-    void checkAppUpdate().catch(() => undefined);
     void checkNow();
-    // Reflect the schedule that's actually installed (launchd plist), not defaults.
-    void invoke<ScheduleStatus>("get_schedule")
-      .then((s) => {
-        setScheduleEnabled(s.installed);
-        if (s.hour !== null) setHour(s.hour);
-        if (s.minute !== null) setMinute(s.minute);
-      })
-      .catch(() => {
-        setScheduleEnabled(false);
-      });
-    void invoke<ScheduledRunSummary | null>("get_last_scheduled_run")
-      .then(setLastRun)
-      .catch(() => setLastRun(null));
     // ~/.freshet/settings.json is the source of truth (the scheduled run reads it). localStorage
     // only seeds the first paint, and is migrated into the file the first time it's missing.
     void invoke<Settings | null>("get_settings")
@@ -232,31 +190,11 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Scan for adoptable apps each time the adopt panel opens.
-  useEffect(() => {
-    if (!showAdopt) return;
-    // The selection is kept: closing and reopening the panel mid-adoption must not lose track
-    // of what's being adopted. It's cleared when an adoption finishes.
-    setSuggestLoading(true);
-    void invoke<AdoptableApp[]>("suggest_adoptions")
-      .then(setSuggestions)
-      .catch(() => {
-        setSuggestions([]);
-      })
-      .finally(() => {
-        setSuggestLoading(false);
-      });
-  }, [showAdopt]);
-
   // Takes every value explicitly: state set in the same handler isn't visible yet.
   function saveSettings(g: boolean, n: boolean, ig: Set<string>, cv: boolean = checkVulns) {
     saveFlag(GREEDY_STORE, g);
     saveFlag(NOTIFY_STORE, n);
-    try {
-      localStorage.setItem(IGNORE_STORE, JSON.stringify([...ig]));
-    } catch {
-      // Storage unavailable — the settings file below is what matters.
-    }
+    saveIgnored(ig);
     void invoke("save_settings", { settings: toSettings(g, n, ig, cv) }).catch(() => {
       // Not fatal for the app itself; the scheduled run falls back to its last-saved settings.
     });
@@ -266,7 +204,7 @@ export default function App() {
     setIgnored(next);
     saveSettings(greedy, notifyOnly, next);
   }
-  function skipVersion(kind: string, id: string, latest: string) {
+  function skipVersion(kind: Kind, id: string, latest: string) {
     const next = new Set(ignored);
     next.add(ignoreKey(kind, id, latest));
     persistIgnored(next);
@@ -281,26 +219,36 @@ export default function App() {
   }
 
   async function checkNow() {
+    // Checks can overlap: startup, a scheduled run ending, the window regaining focus, the end of
+    // an update. Only the newest one's answer is shown, so an older, slower check can't land
+    // last and put a stale list (say, from before an update) back on screen.
+    const seq = ++checkSeq.current;
+    const newest = () => seq === checkSeq.current;
     setLoading(true);
     // Sparkle is network-bound — load it in the background so it never blocks the local list.
     setSparkleLoading(true);
     invoke<CategoryStatus>("check_sparkle_apps")
-      .then(setSparkle)
-      .catch(() =>
-        setSparkle({ category: "Other apps", kind: "sparkle", items: [], error: "check failed" })
-      )
-      .finally(() => setSparkleLoading(false));
+      .then((s) => {
+        if (newest()) setSparkle(s);
+      })
+      .catch(() => {
+        if (newest()) setSparkle({ category: "Other apps", kind: "sparkle", items: [], error: "check failed" });
+      })
+      .finally(() => {
+        if (newest()) setSparkleLoading(false);
+      });
     try {
       const result = await invoke<CategoryStatus[]>("check_outdated");
+      if (!newest()) return;
       setCategories(result);
-      setSelected({});
+      setSelected((prev) => keepSelection(prev, result));
       setLastChecked(new Date());
       void loadDetails(result);
     } catch {
       // IPC failure (should be rare — the command itself never rejects). Keep the
       // previous list rather than blanking the window.
     } finally {
-      setLoading(false);
+      if (newest()) setLoading(false);
     }
   }
 
@@ -328,6 +276,10 @@ export default function App() {
       const mine = res.find((r) => r.name === action.name);
       if (mine?.success) return `Installed ${action.name} ${action.version} with its install scripts.`;
       throw new Error(mine?.output.split("\n")[0] ?? "The install didn't run.");
+    }
+    if (action.type === "allow_app_management") {
+      await invoke("open_app_management_settings");
+      return "Opened System Settings. Turn Freshet on, then try again.";
     }
     if (action.type === "quit_and_update") {
       const res = await invoke<UpdateResult[]>("quit_and_update", {
@@ -370,27 +322,6 @@ export default function App() {
     }
   }
 
-  // Resolves to a status line for the Settings footer.
-  async function checkAppUpdate(): Promise<string> {
-    try {
-      const update = await invoke<AppUpdate | null>("check_app_update");
-      setAppUpdate(update);
-      return update ? `${update.version} available` : "Freshet is up to date";
-    } catch {
-      // No release published yet, offline, or a dev build: nothing to offer.
-      return "Couldn't check right now";
-    }
-  }
-
-  async function installAppUpdate() {
-    setAppUpdateState({ busy: true, error: null });
-    try {
-      await invoke("install_app_update"); // restarts the app on success
-    } catch (e) {
-      setAppUpdateState({ busy: false, error: String(e) });
-    }
-  }
-
   function applyCheckVulns(next: boolean) {
     setCheckVulns(next);
     saveSettings(greedy, notifyOnly, ignored, next);
@@ -414,7 +345,7 @@ export default function App() {
 
   // One bulk `brew info` per kind — descriptions, homepages, release notes, dependency flags.
   async function loadDetails(cats: CategoryStatus[]) {
-    const ids = (kind: string) => cats.find((c) => c.kind === kind)?.items.map((i) => i.id) ?? [];
+    const ids = (kind: Kind) => cats.find((c) => c.kind === kind)?.items.map((i) => i.id) ?? [];
     const formulae = ids("brew");
     const casks = ids("cask");
     if (formulae.length === 0 && casks.length === 0) return;
@@ -444,7 +375,7 @@ export default function App() {
     saveSettings(greedy, next, ignored);
   }
 
-  function toggleItem(kind: string, id: string, name: string) {
+  function toggleItem(kind: Kind, id: string, name: string) {
     setSelected((prev) => toggleSelected(prev, kind, id, name));
   }
 
@@ -545,65 +476,6 @@ export default function App() {
     }
   }
 
-  async function searchCasks() {
-    if (!adoptQuery.trim()) {
-      setAdoptResults([]);
-      return;
-    }
-    setAdoptSearching(true);
-    try {
-      setAdoptResults(await invoke<CaskSuggestion[]>("search_casks", { query: adoptQuery }));
-    } finally {
-      setAdoptSearching(false);
-    }
-  }
-
-  // Runs at the App level (not in the panel), so leaving the panel doesn't lose the adoption:
-  // progress keeps arriving and the header shows it.
-  async function runAdoption(tokens: string[]) {
-    if (tokens.length === 0 || adopting.length > 0) return;
-    setAdopting(tokens);
-    setAdoptProgress(null);
-    let unlisten: (() => void) | null = null;
-    try {
-      unlisten = await listen<AdoptProgress>("adopt-progress", (e) => setAdoptProgress(e.payload));
-    } catch {
-      // No live status; the adoption still runs.
-    }
-    try {
-      const res = await invoke<UpdateResult[]>("adopt_casks", { tokens });
-      setShowAdopt(false);
-      setAdoptSelected({});
-      showResults("Homebrew adoption", res);
-      await checkNow();
-    } finally {
-      unlisten?.();
-      setAdopting([]);
-      setAdoptProgress(null);
-    }
-  }
-
-  async function adopt(token: string) {
-    await runAdoption([token]);
-  }
-
-  async function cancelAdoption() {
-    await invoke("cancel_adoption");
-  }
-
-  function toggleAdoptSelect(token: string) {
-    setAdoptSelected((prev) => {
-      const next = { ...prev };
-      if (next[token]) delete next[token];
-      else next[token] = true;
-      return next;
-    });
-  }
-
-  async function adoptSelectedApps() {
-    await runAdoption(Object.keys(adoptSelected));
-  }
-
   // "Update all" = update exactly what's displayed. Runs per-item selections (not a blanket
   // `brew upgrade`) so skipped versions and hidden self-updating casks stay untouched.
   // While filtering, "all" means everything the filter shows: what you see is what updates.
@@ -631,46 +503,6 @@ export default function App() {
     );
   }
 
-  // Enabling is confirmed first when the first run would install something, so nobody is
-  // surprised by dozens of upgrades the next morning.
-  async function toggleSchedule(enabled: boolean, confirmed = false) {
-    if (enabled && !confirmed && !notifyOnly && scheduledCount > 0) {
-      setScheduleConfirm(true);
-      return;
-    }
-    setScheduleConfirm(false);
-    try {
-      if (enabled) {
-        await invoke("install_schedule", { hour, minute });
-      } else {
-        await invoke("uninstall_schedule");
-      }
-      setScheduleEnabled(enabled);
-      setScheduleError(null);
-    } catch (e) {
-      // launchctl failed — leave the toggle reflecting the real (unchanged) state, and say why.
-      setScheduleError(String(e));
-    }
-  }
-
-  // Takes the new time explicitly: reading `hour`/`minute` state here would see the values
-  // from the render the handler was created in (stale closure), installing the old time.
-  function changeScheduleTime(h: number, m: number) {
-    setHour(h);
-    setMinute(m);
-    if (scheduleEnabled) {
-      // Save once the user stops adjusting. Picking the hour and then the minute shouldn't
-      // install the in-between time (e.g. 2:00 PM when 2:45 PM is coming).
-      window.clearTimeout(saveTimer.current);
-      saveTimer.current = window.setTimeout(() => {
-        // Keep the picker values on failure; the next successful toggle rewrites the plist.
-        invoke("install_schedule", { hour: h, minute: m })
-          .then(() => setScheduleError(null))
-          .catch((e: unknown) => setScheduleError(String(e)));
-      }, 800);
-    }
-  }
-
   // The 4 local categories plus the separately-loaded "Other apps" (Sparkle) section. We always
   // show an "Other apps" entry so the user sees it loading; it's a placeholder until the fetch lands.
   const sparkleCategory: CategoryStatus =
@@ -686,7 +518,6 @@ export default function App() {
     (n, c) => n + filterItems(displayItems(c, greedy, ignored), filter).length,
     0
   );
-  const scheduledCount = scheduledSelections(categories, greedy, ignored).length;
   const selectedCount = Object.keys(selected).length;
   const allCurrent = !loading && !sparkleLoading && totalOutdated === 0;
   const verifyPct =
@@ -708,57 +539,18 @@ export default function App() {
 
   // Keep the list fresh without being asked: every 3 hours while open, and whenever the window
   // comes back into view after 30+ minutes. Never mid-check or mid-update.
+  // The timer is set up once and reads the latest state through a ref. Set up in an effect that
+  // re-ran on every render, it was torn down and restarted each time the window re-rendered —
+  // at least every 30s, by the scheduled-run poll below — so its 10 minutes never elapsed.
   useEffect(() => {
-    const refreshIfOlderThan = (maxAgeMs: number) => {
+    refreshIfOlderThanRef.current = (maxAgeMs: number) => {
       if (!loading && !updating && isStale(lastChecked, new Date(), maxAgeMs)) void checkNow();
     };
-    const timer = window.setInterval(() => refreshIfOlderThan(3 * 3_600_000), 10 * 60_000);
-    const onShow = () => {
-      if (document.visibilityState === "visible") refreshIfOlderThan(30 * 60_000);
-    };
-    document.addEventListener("visibilitychange", onShow);
-    window.addEventListener("focus", onShow);
-    return () => {
-      window.clearInterval(timer);
-      document.removeEventListener("visibilitychange", onShow);
-      window.removeEventListener("focus", onShow);
-    };
-  });
-
-  // A menu-bar app stays open for days: look for a newer Freshet once a day, not just at launch.
-  useEffect(() => {
-    const timer = window.setInterval(() => {
-      invoke<AppUpdate | null>("check_app_update")
-        .then(setAppUpdate)
-        .catch(() => undefined);
-    }, 24 * 3_600_000);
-    return () => window.clearInterval(timer);
-  }, []);
-
-  // Notice scheduled runs: poll a tiny status file every 30s and whenever the window is shown.
-  // While one runs, say so (and hold off manual updates); when it finishes, refresh the list —
-  // so the window never shows updates the schedule already installed.
-  useEffect(() => {
-    checkNowRef.current = checkNow;
   });
   useEffect(() => {
-    const poll = () => {
-      invoke<{ running: boolean; last: ScheduledRunSummary | null }>("get_scheduled_state")
-        .then(({ running, last }) => {
-          setScheduledRunning(running);
-          if (!last) return;
-          if (lastRunSeen.current !== null && last.finished_at > lastRunSeen.current) {
-            void checkNowRef.current();
-          }
-          lastRunSeen.current = last.finished_at;
-          setLastRun(last);
-        })
-        .catch(() => undefined);
-    };
-    poll();
-    const timer = window.setInterval(poll, 30_000);
+    const timer = window.setInterval(() => refreshIfOlderThanRef.current(3 * 3_600_000), 10 * 60_000);
     const onShow = () => {
-      if (document.visibilityState === "visible") poll();
+      if (document.visibilityState === "visible") refreshIfOlderThanRef.current(30 * 60_000);
     };
     document.addEventListener("visibilitychange", onShow);
     window.addEventListener("focus", onShow);
@@ -1037,11 +829,15 @@ export default function App() {
     );
   }
 
+  // A panel covers the whole window, not just the list: with every section collapsed the list is
+  // short, and Settings was squashed into the top half of the window.
+  const panelOpen = showSettings || showHistory || showAdopt || results !== null;
+
   return (
-    <div className="app">
+    <div className={`app${panelOpen ? " panel-open" : ""}`}>
       <div className="header" data-tauri-drag-region>
         <div className="header-left">
-          <div className={`status-dot ${allCurrent ? "ok" : totalOutdated > 0 ? "warn" : "idle"}`} />
+          <StatusMark state={allCurrent ? "ok" : totalOutdated > 0 ? "warn" : "idle"} />
           <div>
             <div className="title">Freshet</div>
             <div className="subtitle">
@@ -1260,7 +1056,7 @@ export default function App() {
           scheduleConfirm={scheduleConfirm}
           scheduledCount={scheduledCount}
           onConfirmSchedule={() => void toggleSchedule(true, true)}
-          onCancelSchedule={() => setScheduleConfirm(false)}
+          onCancelSchedule={cancelScheduleConfirm}
           lastRun={lastRun}
           ignored={ignored}
           onUnskip={unskip}
@@ -1331,230 +1127,4 @@ export default function App() {
   );
 }
 
-function AdoptPanel({
-  query,
-  setQuery,
-  results,
-  searching,
-  suggestions,
-  suggestLoading,
-  adoptSelected,
-  onToggleSelect,
-  onAdoptSelected,
-  adopting,
-  adoptProgress,
-  onCancelAdoption,
-  onSearch,
-  onAdopt,
-  onClose,
-}: {
-  query: string;
-  setQuery: (q: string) => void;
-  results: CaskSuggestion[];
-  searching: boolean;
-  suggestions: AdoptableApp[];
-  suggestLoading: boolean;
-  adoptSelected: Record<string, boolean>;
-  onToggleSelect: (token: string) => void;
-  onAdoptSelected: () => void;
-  adopting: string[];
-  adoptProgress: AdoptProgress | null;
-  onCancelAdoption: () => void;
-  onSearch: () => void;
-  onAdopt: (token: string) => void;
-  onClose: () => void;
-}) {
-  const selectedCount = Object.keys(adoptSelected).length;
-  const busy = adopting.length > 0;
-  const [infoOpen, setInfoOpen] = useState<string | null>(null);
-  const [infoData, setInfoData] = useState<Record<string, CaskInfo>>({});
-  const [infoLoading, setInfoLoading] = useState<string | null>(null);
-
-  async function toggleInfo(token: string) {
-    if (infoOpen === token) {
-      setInfoOpen(null);
-      return;
-    }
-    setInfoOpen(token);
-    if (!(token in infoData)) {
-      setInfoLoading(token);
-      try {
-        const info = await invoke<CaskInfo | null>("cask_info", { token });
-        if (info) setInfoData((d) => ({ ...d, [token]: info }));
-      } finally {
-        setInfoLoading(null);
-      }
-    }
-  }
-  return (
-    <div className="results-overlay">
-      <div className="results-header" data-tauri-drag-region>
-        <div>
-          <div className="results-title">Adopt into Homebrew</div>
-          <div className="results-summary">
-            <span>bring a manually-installed app under brew, so it can update here</span>
-          </div>
-        </div>
-        <button className="icon-btn" onClick={onClose} title="Done" data-tauri-drag-region="false">
-          <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.6">
-            <path d="M4 4l8 8M12 4l-8 8" strokeLinecap="round" />
-          </svg>
-        </button>
-      </div>
-
-      <div className="results-body">
-        <div className="adopt-section-label">Suggested — installed apps Homebrew can manage</div>
-        {suggestLoading && <div className="empty-msg">scanning /Applications…</div>}
-        {!suggestLoading && suggestions.length === 0 && (
-          <div className="empty-msg">no adoptable apps found</div>
-        )}
-        {suggestions.map((s) => (
-          <label key={s.token} className="adopt-row adopt-row-select">
-            <input
-              type="checkbox"
-              className="check"
-              checked={adoptSelected[s.token] ?? false}
-              onChange={() => onToggleSelect(s.token)}
-              disabled={busy}
-            />
-            <span className="adopt-token">
-              {s.name} <span className="adopt-token-sub">{s.token}</span>
-            </span>
-            {adopting.includes(s.token) && (
-              <span className={`adopt-status${adoptProgress?.token === s.token && adoptProgress.stalled ? " stalled" : ""}`}>
-                {adoptProgress?.token === s.token ? adoptStatusText(adoptProgress) : "Waiting…"}
-              </span>
-            )}
-          </label>
-        ))}
-        {suggestions.length > 0 && (
-          busy ? (
-            <button className="btn-secondary adopt-selected-btn" onClick={onCancelAdoption}>
-              Cancel adoption
-            </button>
-          ) : (
-            <button
-              className="btn-primary adopt-selected-btn"
-              onClick={onAdoptSelected}
-              disabled={selectedCount === 0}
-            >
-              {selectedCount > 0 ? `Adopt selected (${selectedCount})` : "Adopt selected"}
-            </button>
-          )
-        )}
-
-        <div className="adopt-section-label">Or search all casks</div>
-        <form
-          className="adopt-search"
-          onSubmit={(e) => {
-            e.preventDefault();
-            onSearch();
-          }}
-        >
-          <input
-            className="adopt-input"
-            placeholder="Search casks (e.g. chrome, slack, docker)…"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-          />
-          <button className="btn-secondary adopt-go" type="submit" disabled={searching}>
-            {searching ? "…" : "Search"}
-          </button>
-        </form>
-        {searching && <div className="empty-msg">searching…</div>}
-        {!searching && results.length === 0 && query.trim() !== "" && (
-          <div className="empty-msg">no matching casks</div>
-        )}
-        {results.map((r) => (
-          <div key={r.token} className="adopt-item">
-            <div className="adopt-row">
-              <span className="adopt-token">{r.token}</span>
-              <div className="adopt-actions">
-                <button
-                  className={`info-btn ${infoOpen === r.token ? "active" : ""}`}
-                  onClick={() => toggleInfo(r.token)}
-                  title="Details"
-                  aria-label="Details"
-                >
-                  <svg viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="1.4">
-                    <circle cx="8" cy="8" r="6.5" />
-                    <path d="M8 7.2v3.4" strokeLinecap="round" />
-                    <circle cx="8" cy="5" r="0.6" fill="currentColor" stroke="none" />
-                  </svg>
-                </button>
-                {r.installed ? (
-                  <span className="adopt-badge">managed</span>
-                ) : (
-                  <button
-                    className="btn-secondary adopt-btn"
-                    onClick={() => onAdopt(r.token)}
-                    disabled={busy}
-                  >
-                    {adopting.includes(r.token) ? "Adopting…" : "Adopt"}
-                  </button>
-                )}
-              </div>
-            </div>
-            {adopting.includes(r.token) && (
-              <div className={`adopt-status adopt-status-row${adoptProgress?.token === r.token && adoptProgress.stalled ? " stalled" : ""}`}>
-                {adoptProgress?.token === r.token ? adoptStatusText(adoptProgress) : "Waiting…"}
-                <button className="link-btn" onClick={onCancelAdoption}>
-                  Cancel
-                </button>
-              </div>
-            )}
-            {infoOpen === r.token && (
-              <CaskDetail info={infoData[r.token]} loading={infoLoading === r.token} />
-            )}
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-// What the running update is doing now: the current step with a ticking clock, and the last few
-// finished steps above it with how long each took — so a 2-minute dependency install reads as
-// progress, not a hang.
-function LiveRun({ steps, now }: { steps: LiveStep[]; now: number }) {
-  const { done, running } = liveView(steps, 3);
-  if (!running && done.length === 0) return null;
-  return (
-    <div className="live-run">
-      {done.map((s, i) => (
-        <div key={`${s.key}-${s.startedAt}`} className="live-step done" style={{ opacity: 0.45 + 0.18 * i }}>
-          <span className="live-mark">✓</span>
-          <span className="live-label">{s.label}</span>
-          <span className="live-time">{formatDuration(s.ms ?? 0)}</span>
-        </div>
-      ))}
-      {running && (
-        <div className="live-step running">
-          <span className="live-mark live-pulse" />
-          <span className="live-label">{running.label}</span>
-          <span className="live-time">{formatElapsed(now - running.startedAt)}</span>
-        </div>
-      )}
-    </div>
-  );
-}
-
-function CaskDetail({ info, loading }: { info?: CaskInfo; loading: boolean }) {
-  if (loading) return <div className="cask-detail">loading…</div>;
-  if (!info) return <div className="cask-detail">no details available</div>;
-  return (
-    <div className="cask-detail">
-      {info.desc && <div className="cask-desc">{info.desc}</div>}
-      <div className="cask-meta">
-        <span>v{info.version}</span>
-        {info.auto_updates && <span>· self-updates</span>}
-        {/^https?:\/\//.test(info.homepage) && (
-          <button className="cask-link" onClick={() => invoke("open_url", { url: info.homepage })}>
-            homepage ↗
-          </button>
-        )}
-      </div>
-    </div>
-  );
-}
 

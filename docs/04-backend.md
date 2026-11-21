@@ -1,47 +1,44 @@
 # 04 — Backend Design (Rust)
 
-Everything lives in `src-tauri/src/main.rs` (~2,550 lines including ~870 lines of tests).
+The backend is `src-tauri/src/`, one module per concern (split out of a single `main.rs` on
+2026-11-14, as a mechanical move: the code and its tests are unchanged, only where they live).
 
-## Why one file
-
-It is a legitimate question and the honest answer is: it has not yet hurt. The file is
-strictly ordered by concern, the pure/IO split does the work that module boundaries usually do,
-and a single file keeps the pure functions and their tests visible to each other without `pub`
-plumbing. The `[lints.rust] unreachable_pub` setting exists partly to keep that honest.
-
-The point at which to split is when a **second contributor is regularly editing a different
-concern** — the merge-conflict cost then exceeds the navigation benefit. The natural seams are
-already visible as comment banners and map cleanly to modules:
+## Module layout
 
 ```
-parsers.rs     the pure Layer-1 parsers
-validate.rs    the pure Layer-1 validators
-sources/       brew.rs, cask.rs, mas.rs, npm.rs, sparkle.rs
-adopt.rs       the cask index and adoption
-provenance.rs  codesign/spctl, the signing store, drift
-schedule.rs    launchd
-tray.rs        setup() and the tray wiring
+main.rs        wiring only: the tray, the window, the command list
+model.rs       data that crosses to the window: Kind, OutdatedItem, CategoryStatus,
+               UpdateSelection, UpdateResult, Step, ResultAction
+check.rs       what is outdated (brew, casks, mas, npm), the hourly `brew update`, the cached check
+sparkle.rs     apps with a Sparkle appcast (detection only)
+details.rs     descriptions, homepages, release notes
+update.rs      installing selected updates: batches, progress, Stop, quit-and-update
+npm.rs         npm globals without install scripts by default
+adopt.rs       Homebrew adoption
+signing.rs     reading and proving signatures, the trust baseline and pins, publisher-change checks
+preverify.rs   the publisher check on a cask download before install
+rollback.rs    app snapshots and restore
+vulns.rs       osv.dev lookups (opt-in)
+scheduled.rs   `freshet --run-scheduled`: plan, run, summary, notification
+launchd.rs     the launchd job
+settings.rs    ~/.freshet/settings.json
+history.rs     ~/.freshet/history.jsonl
+apps.rs        app bundles on disk: versions, icons, running processes, cask → app
+process.rs     running programs: trusted brew/mas, askpass, streaming, Stop, the one-at-a-time guard
+shell_path.rs  PATH for child processes
+store.rs       ~/.freshet and private/atomic file writes
+validate.rs    validators for everything the window sends
+tray.rs        the menu-bar icon
+self_update.rs Freshet's own updater, version, launch at login
+test_support.rs  fixtures shared by more than one module's tests (test builds only)
 ```
 
-Do this as a mechanical move with no behaviour change, in its own commit, when the pain arrives.
+Each module keeps its tests beside the code (`#[cfg(test)] mod tests`). An item is `pub(crate)`
+only when another module uses it; `unreachable_pub` keeps plain `pub` out.
 
-## File layout as it stands
-
-```
-  1– 62   Types: OutdatedItem, CategoryStatus, UpdateSelection, UpdateResult
- 64–156   Process + fs helpers: run_cmd, freshet_dir, write_private, askpass_program,
-          maybe_append_mas_hint, combine_output, run_update_cmd
-158–371   Pure parsers (Layer 1)
-373–534   Pure validators + the JWS/cask index (Layer 1)
-536–720   Check functions (Layer 2) + Sparkle
-722–753   check_outdated / check_sparkle_apps commands
-755–988   Adoption: search, suggest, info, adopt
-990–1104  Update execution: build_update_command, fetch_batches, prefetch, the install loop
-1106–1448 Provenance: inspect, signing store, drift, verify commands
-1450–1601 launchd schedule
-1603–1672 main(): tray, window, handler registration
-1674–end  #[cfg(test)] mod tests — 50 tests
-```
+The package kind is the `Kind` enum (`model.rs`), not a string: it serializes as the same
+lowercase word (`"brew"`, `"cask"`, …), and a kind the backend doesn't know deserializes to
+`Kind::Unknown` and is refused per item.
 
 ## Types
 
@@ -76,8 +73,8 @@ unit tested.** If you are adding logic, this is where it goes.
 | `parse_casks` | same, `--cask --greedy` | Tags `self_updating` = in greedy but not normal |
 | `parse_mas_outdated` | `mas outdated` (plain text) | Id, then last `(old -> new)`; see [03](03-update-sources.md) |
 | `parse_npm_outdated` | `npm outdated -g --json` | Drops items where installed ≥ latest (semver) |
-| `parse_appcast_latest` | Sparkle XML | Both element and attribute forms; takes the max |
-| `parse_appcast_notes` | Sparkle XML | First `releaseNotesLink`, **validated** before returning |
+| `parse_appcast_items` | Sparkle XML | Per `<item>`: version (element or `<enclosure>` attribute), channel, min/max macOS, **validated** notes link |
+| `newest_offer` | items + installed + macOS | The newest release this Mac would be offered: skips opt-in channels (beta, nightly…) and beta versions unless already on one, and releases outside its macOS range |
 | `parse_cask_tokens` | `brew list/search --cask` | Skips `==>` headers and prose (real tokens have no whitespace) |
 | `parse_cask_info` | `brew info --cask --json=v2` | `name` is an array in brew's schema |
 | `parse_signing` | `codesign -dvv` | `(team_id, authority)`; treats `"not set"` as absent |
@@ -276,6 +273,15 @@ loosening the project.
 - **`list_applications()` only scans `/Applications`.** Apps in `~/Applications`, `/System/
   Applications`, or nested subdirectories are invisible to both Sparkle detection and signature
   verification.
+- **macOS App Management can refuse a cask install or adoption.** Since macOS 13, changing another
+  developer's app bundle needs the user's permission (Privacy & Security › App Management), and
+  sudo doesn't get round it; Homebrew's `chgrp -hR admin` during `--adopt` is the usual trigger.
+  `apps::explain_app_management` recognises the "Operation not permitted" wall, replaces it with
+  an explanation and offers `open_app_management_settings`. A dev build's permission belongs to
+  the terminal that launched it, not to Freshet.
+- **Sparkle apps installed by a Homebrew cask are left to Homebrew** (its greedy check already
+  sees them), so they aren't listed twice. Apps that set their feed URL in code rather than in
+  `Info.plist` (`SUFeedURL`) aren't detected at all.
 - **The signing store is keyed by app *name*.** Renaming an app loses its baseline (a silent
   re-seed, not a false alarm); two apps with the same file stem in different locations would
   collide.
@@ -285,5 +291,3 @@ loosening the project.
   fetching it, so this is a considered choice, but it is a looser rule than `is_safe_feed_url`.
 - **Cross-process races on `signing.json`** are last-writer-wins. The in-process mutex does not
   help if a future scheduled run writes from a second process.
-- **The stale header comment** at the top of `main.rs` names `run_updates` and
-  `is_schedule_installed`, neither of which exists.

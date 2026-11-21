@@ -1,0 +1,434 @@
+<!doctype html>
+<!--
+  Freshet demo film. A 1920×1080 stage whose every animation is driven by one clock, window.__seek(t),
+  so render.swift can step through it frame by frame. The product shots are the real app
+  (app.html → src/main.tsx) on a stand-in backend (mock.js), steered by the cues below.
+  Preview live: open http://localhost:1499/demo/film.html?play
+-->
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Freshet — demo film</title>
+<!-- The app frames' theme (read by mock.js). The film's own colours (--water, .glow, key presses)
+     are this theme's accent; change them together. -->
+<script>window.FILM_THEME = "graphite";</script>
+<style>
+  @font-face { font-family: "Inter Tight"; font-weight: 400 600; src: url("/src/assets/fonts/inter-tight.woff2") format("woff2"); }
+  @font-face { font-family: "Fraunces"; font-weight: 400 600; src: url("/src/assets/fonts/fraunces.woff2") format("woff2"); }
+
+  :root {
+    --gray: #86868b;
+    --water: linear-gradient(100deg, #e9f7ed 0%, #b4e6c3 45%, #7fd49a 100%); /* Graphite's accent: the theme the film shows (FILM_THEME) */
+  }
+  html, body { margin: 0; background: #000; overflow: hidden; }
+  #stage {
+    position: relative;
+    width: 1920px; height: 1080px;
+    background: #000;
+    color: #f5f5f7;
+    font-family: "Inter Tight", -apple-system, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    overflow: hidden;
+  }
+  .scene { position: absolute; inset: 0; opacity: 0; }
+  .abs { position: absolute; }
+  .center-x { left: 0; right: 0; text-align: center; }
+
+  .headline { font-size: 84px; font-weight: 600; letter-spacing: -0.035em; line-height: 1.05; }
+  .huge { font-size: 112px; font-weight: 600; letter-spacing: -0.04em; line-height: 1; }
+  .sub { font-size: 30px; font-weight: 400; color: var(--gray); letter-spacing: -0.01em; line-height: 1.35; }
+  .grad { background: var(--water); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .wordmark { font-family: "Fraunces", Georgia, serif; font-variation-settings: "opsz" 144; font-weight: 500; letter-spacing: -0.02em; }
+
+  /* The product: the real app window, floating on a soft spotlight. */
+  .device {
+    position: absolute;
+    width: 420px; height: 680px;
+    scale: var(--s, 1.25); /* the individual property, so it composes with animated transforms */
+    transform-origin: 50% 0;
+    border-radius: 12px;
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.07), 0 50px 140px rgba(0, 0, 0, 0.85), 0 18px 40px rgba(0, 0, 0, 0.6);
+  }
+  .device iframe { width: 420px; height: 680px; border: 0; border-radius: 12px; background: transparent; display: block; }
+  .glow {
+    position: absolute;
+    width: 1100px; height: 900px;
+    border-radius: 50%;
+    background: radial-gradient(closest-side, rgba(127, 212, 154, 0.13), rgba(127, 212, 154, 0.04) 55%, transparent);
+    filter: blur(20px);
+  }
+
+  /* A plain menu bar (no system branding). */
+  .menubar {
+    position: absolute; left: 0; right: 0; top: 0; height: 40px;
+    background: rgba(40, 40, 44, 0.92);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    display: flex; align-items: center; gap: 28px; padding: 0 26px;
+    font-size: 17px; font-weight: 500; color: rgba(255, 255, 255, 0.88);
+  }
+  .menubar .spacer { flex: 1; }
+  .tray { display: flex; align-items: center; gap: 6px; padding: 3px 9px; border-radius: 6px; }
+  .tray svg { width: 18px; height: 18px; }
+  .menubar .status { width: 22px; height: 22px; }
+  .menubar .dim { color: rgba(255, 255, 255, 0.7); font-weight: 400; }
+
+  .keys { display: flex; gap: 22px; }
+  .key {
+    min-width: 92px; height: 92px; padding: 0 22px; box-sizing: border-box;
+    display: grid; place-items: center;
+    border-radius: 18px;
+    background: linear-gradient(#2c2c2e, #1c1c1e);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12), 0 6px 0 #0b0b0c, 0 10px 24px rgba(0, 0, 0, 0.6);
+    font-size: 38px; font-weight: 500; color: #d1d1d6;
+  }
+  .key.wide { min-width: 220px; font-size: 26px; }
+  .key-label { text-align: center; font-size: 20px; color: var(--gray); margin-top: 18px; }
+
+  .swatches { display: flex; gap: 16px; justify-content: center; }
+  .swatch { width: 26px; height: 26px; border-radius: 50%; box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.18); }
+</style>
+</head>
+<body>
+<div id="stage">
+
+  <!-- 1 · Cold open -->
+  <section class="scene" id="s1">
+    <img class="abs" id="s1-icon" src="/src-tauri/icons/source/app-icon.svg" style="left:860px; top:250px; width:200px; height:200px;" alt="" />
+    <div class="abs center-x wordmark" id="s1-word" style="top:500px; font-size:132px;">Freshet</div>
+    <div class="abs center-x sub" id="s1-tag" style="top:680px; font-size:40px;">Updates, handled.</div>
+  </section>
+
+  <!-- 2 · Everything you have to keep current -->
+  <section class="scene" id="s2">
+    <div class="abs center-x huge" id="s2-a" style="top:250px;">Homebrew.</div>
+    <div class="abs center-x huge" id="s2-b" style="top:390px;">App Store.</div>
+    <div class="abs center-x huge" id="s2-c" style="top:530px;">npm.</div>
+    <div class="abs center-x huge grad" id="s2-d" style="top:670px;">Every app.</div>
+    <div class="abs center-x huge" id="s2-e" style="top:420px; font-size:150px;">One <span class="grad">menu bar.</span></div>
+  </section>
+
+  <!-- 3 · Lives in the menu bar -->
+  <section class="scene" id="s3">
+    <div class="menubar" id="s3-bar">
+      <span style="font-weight:600">Finder</span><span>File</span><span>Edit</span><span>View</span><span>Go</span><span>Window</span>
+      <span class="spacer"></span>
+      <span class="tray" id="s3-tray">
+        <svg viewBox="0 0 32 32"><mask id="cut"><rect width="32" height="32" fill="#fff"/><path d="M10.9 20.9 L16 15.8 L21.1 20.9" fill="none" stroke="#000" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/></mask><path mask="url(#cut)" fill="#fff" d="M16 3.5 C16 3.5 7 13.3 7 19.6 C7 24.6 11 28.5 16 28.5 C21 28.5 25 24.6 25 19.6 C25 13.3 16 3.5 16 3.5 Z"/></svg>
+        <span>12</span>
+      </span>
+      <svg class="status" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" opacity=".85"><path d="M2.5 9a14 14 0 0 1 19 0M5.5 12.5a9.5 9.5 0 0 1 13 0M8.6 16a5 5 0 0 1 6.8 0"/><circle cx="12" cy="19.3" r="1.1" fill="#fff" stroke="none"/></svg>
+      <svg class="status" viewBox="0 0 30 16" opacity=".85"><rect x="1" y="2" width="24" height="12" rx="3.5" fill="none" stroke="#fff" stroke-width="1.6"/><rect x="3.4" y="4.4" width="16" height="7.2" rx="1.6" fill="#fff"/><rect x="26.4" y="6" width="2" height="4" rx="1" fill="#fff"/></svg>
+      <svg class="status" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" opacity=".85"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.5 15.5 21 21"/></svg>
+      <span class="dim">Sat Nov 14&nbsp;&nbsp;10:00</span>
+    </div>
+    <div class="glow" id="s3-glow" style="left:820px; top:-60px;"></div>
+    <div class="device" id="s3-dev" style="left:1160px; top:52px; --s:1.18;"><iframe src="/demo/app.html?p=hero" id="f-hero"></iframe></div>
+    <div class="abs headline" id="s3-head" style="left:190px; top:380px; width:820px;">Right where<br />you need it.</div>
+    <div class="abs sub" id="s3-sub" style="left:192px; top:600px; width:760px;">Freshet lives in your menu bar and keeps count of everything that’s out of date — Homebrew, apps, the App Store and npm.</div>
+  </section>
+
+  <!-- 4 · Know what you're updating -->
+  <section class="scene" id="s4">
+    <div class="abs center-x headline" id="s4-head" style="top:56px;">Know what you’re updating.</div>
+    <div class="abs center-x sub" id="s4-sub" style="top:164px;">Plain-language descriptions, release notes, and a heads-up before major versions.</div>
+    <div class="glow" style="left:410px; top:260px;"></div>
+    <div class="device" id="s4-dev" style="left:750px; top:236px; --s:1.2;"><iframe src="/demo/app.html?p=explain" id="f-explain"></iframe></div>
+  </section>
+
+  <!-- 5 · Watch it work / where the time went -->
+  <section class="scene" id="s5">
+    <div class="abs center-x headline" id="s5-head" style="top:56px;">Watch it work.</div>
+    <div class="abs center-x headline" id="s5-head2" style="top:56px;">See where the <span class="grad">time</span> went.</div>
+    <div class="abs center-x sub" id="s5-sub" style="top:164px;">Every step, live — then a breakdown of what took longest.</div>
+    <div class="glow" style="left:410px; top:260px;"></div>
+    <div class="device" id="s5-dev" style="left:750px; top:236px; --s:1.2;"><iframe src="/demo/app.html?p=live" id="f-live"></iframe></div>
+  </section>
+
+  <!-- 6 · Security -->
+  <section class="scene" id="s6">
+    <div class="abs headline" id="s6-head" style="left:190px; top:360px; width:820px;">Trust,<br /><span class="grad">verified.</span></div>
+    <div class="abs sub" id="s6-sub" style="left:192px; top:580px; width:720px;">If an update arrives signed by someone new, Freshet stops before installing and asks you first.</div>
+    <div class="glow" style="left:800px; top:100px;"></div>
+    <div class="device" id="s6-dev" style="left:1180px; top:120px;"><iframe src="/demo/app.html?p=security" id="f-security"></iframe></div>
+  </section>
+
+  <!-- 7 · Keyboard -->
+  <section class="scene" id="s7">
+    <div class="abs headline" id="s7-head" style="left:190px; top:250px; width:820px;">Made for<br />the keyboard.</div>
+    <div class="abs" id="s7-keys" style="left:192px; top:560px;">
+      <div class="keys">
+        <div><div class="key" id="k-down">↓</div><div class="key-label">move</div></div>
+        <div><div class="key" id="k-right">→</div><div class="key-label">open</div></div>
+        <div><div class="key wide" id="k-space">space</div><div class="key-label">select</div></div>
+        <div><div class="key" id="k-help">?</div><div class="key-label">shortcuts</div></div>
+      </div>
+    </div>
+    <div class="glow" style="left:800px; top:100px;"></div>
+    <div class="device" id="s7-dev" style="left:1180px; top:120px;"><iframe src="/demo/app.html?p=keys" id="f-keys"></iframe></div>
+  </section>
+
+  <!-- 8 · Themes -->
+  <section class="scene" id="s8">
+    <div class="abs center-x headline" id="s8-head" style="top:56px;">Seven themes. <span class="grad">Pick yours.</span></div>
+    <div class="glow" id="s8-glow" style="left:410px; top:240px;"></div>
+    <div class="device" id="s8-dev" style="left:750px; top:272px; --s:1.14;"><iframe src="/demo/app.html?p=themes" id="f-themes"></iframe></div>
+    <div class="abs center-x sub" id="s8-name" style="top:160px; color:#f5f5f7;">Graphite</div>
+    <div class="abs center-x" style="top:214px;"><div class="swatches" id="s8-swatches"></div></div>
+  </section>
+
+  <!-- 9 · Schedule -->
+  <section class="scene" id="s9">
+    <div class="abs headline" id="s9-head" style="left:190px; top:360px; width:820px;">Set it.<br /><span class="grad">Forget it.</span></div>
+    <div class="abs sub" id="s9-sub" style="left:192px; top:580px; width:720px;">One quiet daily run on the efficiency cores, so updates happen while you work — not instead of it.</div>
+    <div class="glow" style="left:800px; top:100px;"></div>
+    <div class="device" id="s9-dev" style="left:1180px; top:120px;"><iframe src="/demo/app.html?p=schedule" id="f-schedule"></iframe></div>
+  </section>
+
+  <!-- 10 · End card -->
+  <section class="scene" id="s10">
+    <img class="abs" id="s10-icon" src="/src-tauri/icons/source/app-icon.svg" style="left:880px; top:270px; width:160px; height:160px;" alt="" />
+    <div class="abs center-x wordmark" id="s10-word" style="top:470px; font-size:120px;">Freshet</div>
+    <div class="abs center-x sub" id="s10-tag" style="top:640px; font-size:38px; color:#f5f5f7;">Open source. Made for Mac.</div>
+    <div class="abs center-x sub" id="s10-url" style="top:720px; font-size:24px;">github.com/seanturner06/mac-updater</div>
+  </section>
+
+</div>
+
+<script>
+  // ---------------- timeline ----------------
+  const $ = (id) => document.getElementById(id);
+  const EASE = "cubic-bezier(0.22, 0.8, 0.1, 1)";
+  const anims = []; // film animations, all seeked to film time
+  const cues = []; // { t, fn } actions on the app frames, run once as the clock passes them
+
+  function anim(el, keyframes, start, dur, easing = EASE) {
+    const a = (typeof el === "string" ? $(el) : el).animate(keyframes, {
+      duration: dur * 1000, delay: start * 1000, fill: "both", easing,
+    });
+    a.pause();
+    anims.push(a);
+  }
+  // Visible from t0 to t1, fading in and out — one animation per element, so nothing fights.
+  function span(el, t0, t1, fade = 0.6, extra = {}) {
+    const d = t1 - t0, f = Math.min(fade / d, 0.45);
+    anim(el, [
+      { opacity: 0, offset: 0, ...(extra.from || {}) },
+      { opacity: 1, offset: f, ...(extra.to || {}) },
+      { opacity: 1, offset: 1 - f, ...(extra.hold || extra.to || {}) },
+      { opacity: 0, offset: 1, ...(extra.out || extra.hold || extra.to || {}) },
+    ], t0, d, "linear");
+  }
+  const rise = (px = 30) => ({ from: { transform: `translateY(${px}px)` }, to: { transform: "translateY(0)" } });
+  const cue = (t, fn) => cues.push({ t, fn });
+  const app = (id) => $(id).contentWindow.__demo;
+
+  // 1 · Cold open (0–5)
+  span("s1", 0, 5, 0.5);
+  anim("s1-icon", [{ opacity: 0, transform: "scale(0.86)" }, { opacity: 1, transform: "scale(1)" }], 0.3, 1.4);
+  anim("s1-word", [{ opacity: 0, transform: "translateY(26px)" }, { opacity: 1, transform: "none" }], 1.1, 1.2);
+  anim("s1-tag", [{ opacity: 0, transform: "translateY(16px)" }, { opacity: 1, transform: "none" }], 2.1, 1.0);
+
+  // 2 · The problem, then the answer (5–11)
+  span("s2", 5, 11, 0.4);
+  ["s2-a", "s2-b", "s2-c", "s2-d"].forEach((id, i) => span(id, 5.3 + i * 0.55, 8.6, 0.5, rise(34)));
+  span("s2-e", 8.8, 11, 0.6, { from: { transform: "scale(0.94)" }, to: { transform: "scale(1)" }, hold: { transform: "scale(1.02)" }, out: { transform: "scale(1.03)" } });
+
+  // 3 · Menu bar (11–18.5)
+  span("s3", 11, 18.5, 0.5);
+  anim("s3-bar", [{ transform: "translateY(-42px)" }, { transform: "none" }], 11.2, 0.8);
+  anim("s3-tray", [{ background: "rgba(255,255,255,0)" }, { background: "rgba(255,255,255,0.2)" }], 12.3, 0.25, "linear");
+  anim("s3-dev", [
+    { opacity: 0, transform: "translateY(-18px) scale(0.94)", transformOrigin: "50% 0" },
+    { opacity: 1, transform: "none", transformOrigin: "50% 0" },
+  ], 12.5, 0.9);
+  anim("s3-glow", [{ opacity: 0 }, { opacity: 1 }], 12.6, 1.4);
+  anim("s3-head", [{ opacity: 0, transform: "translateY(24px)" }, { opacity: 1, transform: "none" }], 13.3, 1.0);
+  anim("s3-sub", [{ opacity: 0, transform: "translateY(16px)" }, { opacity: 1, transform: "none" }], 14.0, 1.0);
+  cue(9.0, () => { app("f-hero").click('[data-cat="Apps"]'); app("f-hero").click('[data-cat="Homebrew"]'); });
+
+  // 4 · Explained (18.5–25.5): open ffmpeg's details, then move in on them
+  span("s4", 18.5, 25.5, 0.5);
+  anim("s4-head", [{ opacity: 0, transform: "translateY(20px)" }, { opacity: 1, transform: "none" }, { opacity: 1, offset: 0.55 }, { opacity: 0 }], 18.6, 4.4);
+  anim("s4-sub", [{ opacity: 0 }, { opacity: 1, offset: 0.2 }, { opacity: 1, offset: 0.55 }, { opacity: 0 }], 18.9, 4.1);
+  anim("s4-dev", [
+    { transform: "translateY(30px)", transformOrigin: "50% 38%" },
+    { transform: "none", transformOrigin: "50% 38%", offset: 0.3 },
+    { transform: "none", transformOrigin: "50% 38%", offset: 0.45 },
+    { transform: "translateY(-170px) scale(1.32)", transformOrigin: "50% 38%" },
+  ], 18.5, 7);
+  cue(17.5, () => app("f-explain").click('[data-cat="Homebrew"]'));
+  cue(20.6, () => app("f-explain").click('[aria-label="About ffmpeg"]'));
+
+  // 5 · Live run (25.5–34.5)
+  span("s5", 25.5, 34.5, 0.5);
+  span("s5-head", 25.6, 31.6, 0.5, rise(18));
+  span("s5-head2", 31.8, 34.5, 0.5, rise(18));
+  anim("s5-sub", [{ opacity: 0 }, { opacity: 1 }], 26.2, 0.8);
+  anim("s5-dev", [{ transform: "translateY(26px)" }, { transform: "none" }], 25.5, 1.4);
+  const step = (t, current, done, label) =>
+    cue(t, () => app("f-live").emit("update-progress", { phase: "Upgrading", current, done, total: 12, step: label }));
+  cue(25.4, () => app("f-live").key("Enter", true));
+  step(25.9, null, 0, "Fetching downloads for: awscli, git and node");
+  step(27.1, "awscli", 0, "Upgrading awscli");
+  step(27.7, "awscli", 0, "Installing awscli dependency: python@3.15 (3.15.1)");
+  step(28.3, "awscli", 0, "Pouring python@3.15");
+  step(30.0, "awscli", 0, "Pouring awscli");
+  step(30.6, "awscli", 0, "Cleanup");
+  cue(31.0, () => app("f-live").release());
+  cue(32.2, () => {
+    const doc = $("f-live").contentDocument;
+    [...doc.querySelectorAll(".result-head")].find((b) => b.textContent.includes("awscli"))?.click();
+  });
+
+  // 6 · Security (34.5–42)
+  span("s6", 34.5, 42, 0.5);
+  anim("s6-head", [{ opacity: 0, transform: "translateY(24px)" }, { opacity: 1, transform: "none" }], 34.8, 1.0);
+  anim("s6-sub", [{ opacity: 0, transform: "translateY(16px)" }, { opacity: 1, transform: "none" }], 35.5, 1.0);
+  anim("s6-dev", [{ transform: "translateY(26px)" }, { transform: "none" }], 34.5, 1.4);
+  // On screen, not before: a panel that fades in while its scene is invisible stays stuck
+  // near-transparent in WebKit's compositor, and the list shows through it.
+  cue(35.1, () => app("f-security").key("Enter", true));
+
+  // 7 · Keyboard (42–49): each key lights as it's pressed in the app
+  span("s7", 42, 49, 0.5);
+  anim("s7-head", [{ opacity: 0, transform: "translateY(24px)" }, { opacity: 1, transform: "none" }], 42.2, 1.0);
+  anim("s7-keys", [{ opacity: 0, transform: "translateY(20px)" }, { opacity: 1, transform: "none" }], 42.7, 1.0);
+  anim("s7-dev", [{ transform: "translateY(26px)" }, { transform: "none" }], 42, 1.4);
+  const press = (t, keyId, key) => {
+    cue(t, () => app("f-keys").key(key));
+    anim(keyId, [
+      { transform: "translateY(0)", color: "#d1d1d6", boxShadow: "inset 0 1px 0 rgba(255,255,255,.12), 0 6px 0 #0b0b0c, 0 10px 24px rgba(0,0,0,.6)" },
+      { transform: "translateY(5px)", color: "#7fd49a", boxShadow: "inset 0 1px 0 rgba(255,255,255,.12), 0 1px 0 #0b0b0c, 0 0 34px rgba(127,212,154,.45)", offset: 0.25 },
+      { transform: "translateY(0)", color: "#d1d1d6", boxShadow: "inset 0 1px 0 rgba(255,255,255,.12), 0 6px 0 #0b0b0c, 0 10px 24px rgba(0,0,0,.6)" },
+    ], t, 0.5, "ease-out");
+  };
+  press(43.6, "k-down", "ArrowDown");
+  press(44.2, "k-right", "ArrowRight");
+  press(44.8, "k-down", "ArrowDown");
+  press(45.3, "k-down", "ArrowDown");
+  press(45.9, "k-space", " ");
+  press(46.4, "k-down", "ArrowDown");
+  press(46.9, "k-space", " ");
+  press(47.7, "k-help", "?");
+
+  // 8 · Themes (49–55.5)
+  // Starts on the film's own theme, so the cut into this scene doesn't change colour.
+  const THEMES = [
+    ["graphite", "Graphite", "#7fd49a"], ["noir", "Gothic Noir", "#d4a5a5"], ["cobalt", "Cobalt Sky", "#82c8e5"],
+    ["obsidian", "Obsidian", "#5b9eff"], ["sage", "Sage & Stone", "#9caf88"], ["pine", "Pine & Mist", "#6cae9d"],
+    ["ink", "Ink & Gold", "#c2a86a"],
+  ];
+  span("s8", 49, 55.5, 0.5);
+  anim("s8-head", [{ opacity: 0, transform: "translateY(20px)" }, { opacity: 1, transform: "none" }], 49.2, 1.0);
+  anim("s8-dev", [{ transform: "translateY(26px)" }, { transform: "none" }], 49, 1.4);
+  cue(47.0, () => app("f-themes").click('[data-cat="Apps"]'));
+  THEMES.forEach(([id, name, accent], i) => {
+    const sw = document.createElement("div");
+    sw.className = "swatch";
+    sw.style.background = accent;
+    $("s8-swatches").appendChild(sw);
+    const t = 49.7 + i * 0.78;
+    cue(t, () => {
+      app("f-themes").theme(id);
+      $("s8-name").textContent = name;
+      $("s8-glow").style.background = `radial-gradient(closest-side, ${accent}38, ${accent}10 55%, transparent)`;
+    });
+    anim(sw, [{ transform: "scale(1)" }, { transform: "scale(1.45)", offset: 0.15 }, { transform: "scale(1.45)", offset: 0.85 }, { transform: "scale(1)" }], t, 0.78, "linear");
+  });
+
+  // 9 · Schedule (55.5–61)
+  span("s9", 55.5, 61, 0.5);
+  anim("s9-head", [{ opacity: 0, transform: "translateY(24px)" }, { opacity: 1, transform: "none" }], 55.8, 1.0);
+  anim("s9-sub", [{ opacity: 0, transform: "translateY(16px)" }, { opacity: 1, transform: "none" }], 56.5, 1.0);
+  anim("s9-dev", [{ transform: "translateY(26px)" }, { transform: "none" }], 55.5, 1.4);
+  cue(56.0, () => app("f-schedule").click('[title="Settings"]')); // on screen; see the security cue
+
+  // 10 · End card (61–67)
+  span("s10", 61, 67, 0.7);
+  anim("s10-icon", [{ opacity: 0, transform: "scale(0.88)" }, { opacity: 1, transform: "scale(1)" }], 61.2, 1.2);
+  anim("s10-word", [{ opacity: 0, transform: "translateY(20px)" }, { opacity: 1, transform: "none" }], 61.7, 1.1);
+  anim("s10-tag", [{ opacity: 0 }, { opacity: 1 }], 62.6, 1.0);
+  anim("s10-url", [{ opacity: 0 }, { opacity: 1 }], 63.2, 1.0);
+
+  // The menu-bar window opens centred under its icon, as the real one does.
+  function placeUnderTray() {
+    const tray = $("s3-tray").getBoundingClientRect(), stage = $("stage").getBoundingClientRect();
+    const zoom = stage.width / 1920;
+    const centre = (tray.left + tray.width / 2 - stage.left) / zoom;
+    // Like a real menu-bar window near the screen edge: under its icon, but kept on screen.
+    $("s3-dev").style.left = `${Math.min(centre, 1920 - 40 - 248) - 210}px`;
+  }
+
+  const DURATION = 67;
+  cues.sort((a, b) => a.t - b.t);
+
+  // ---------------- the clock ----------------
+  window.__filmT = 0;
+  let nextCue = 0;
+  const started = new WeakMap(); // app-frame animation → film time it was first seen
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  function syncFrameAnimations(t) {
+    for (const f of document.querySelectorAll("iframe")) {
+      const doc = f.contentDocument;
+      if (!doc) continue;
+      for (const a of doc.getAnimations()) {
+        if (!started.has(a)) started.set(a, t);
+        const ms = (t - started.get(a)) * 1000;
+        // Done: cancel rather than park it at its end. A paused fade-in seeked to its end stays
+        // near-transparent in WebKit's compositor, and the list showed through the panel.
+        const end = a.effect.getComputedTiming().endTime;
+        if (Number.isFinite(end) && ms >= end && a.effect.getComputedTiming().iterations !== Infinity) {
+          a.cancel();
+          continue;
+        }
+        a.pause();
+        a.currentTime = ms;
+      }
+    }
+  }
+
+  // Move the whole film to time t (seconds). Forward-only for the cues, which act on the apps.
+  window.__seek = async (t) => {
+    window.__filmT = t;
+    let acted = false;
+    while (nextCue < cues.length && cues[nextCue].t <= t) {
+      cues[nextCue++].fn();
+      acted = true;
+    }
+    if (acted) await wait(60); // let React render what the cue changed
+    for (const a of anims) a.currentTime = t * 1000;
+    syncFrameAnimations(t);
+    await wait(20); // styles settle; the renderer's snapshot then waits for the screen update
+    return t;
+  };
+
+  // Ready once every app frame has drawn its list and fonts are in.
+  window.__ready = async () => {
+    await document.fonts.ready;
+    placeUnderTray();
+    for (const f of document.querySelectorAll("iframe")) {
+      for (let i = 0; i < 200; i++) {
+        if (f.contentDocument?.querySelector(".cat-toggle")) break;
+        await wait(50);
+      }
+    }
+    await wait(800); // icons and details arrive just after the list
+    return DURATION;
+  };
+
+  // ?play: watch it in a browser in real time.
+  if (location.search.includes("play")) {
+    __ready().then(() => {
+      const t0 = performance.now();
+      const loop = async () => {
+        const t = (performance.now() - t0) / 1000;
+        await __seek(Math.min(t, DURATION));
+        if (t < DURATION) requestAnimationFrame(loop);
+      };
+      loop();
+    });
+  }
+</script>
+</body>
+</html>
